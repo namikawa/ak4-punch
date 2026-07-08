@@ -1,0 +1,13 @@
+# 機密・ローカル設定（コミット厳禁）
+.env
+config/config.yml
+config/token.json
+*.log
+
+# Claude Code 用の作業指示（コミットしない）
+CLAUDE.md
+
+# Ruby
+/.bundle/
+/vendor/bundle/
+/tmp/

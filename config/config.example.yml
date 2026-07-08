@@ -1,0 +1,37 @@
+# 動作設定（機密でない項目）。このファイルを config/config.yml にコピーして使う。
+#   cp config/config.example.yml config/config.yml
+# 企業ID・トークン・エンドポイントは .env で設定します。
+
+work:
+  # 打刻を行う時刻。cron 設定例（punch crontab）の生成に使う。
+  # ※ AKASHI は打刻を「実行時刻」で記録するため、実際の記録時刻は
+  #    cron がこの時刻に punch を起動したタイミング（秒単位のブレあり）。
+  clock_in:  "09:30"
+  clock_out: "18:00"
+
+  # ランダム打刻: 
+  # 指定時刻から下記分数以内のランダムな時刻に打刻する。
+  #   0      = 指定時刻ちょうど（従来動作）
+  #   1..30  = 指定時刻〜+N分 のランダムな時刻（目安は 5）
+  # 仕組み: cron は上記 clock_in/clock_out（＝ウィンドウ先頭）に punch を起動し、
+  #         プロセスが 0〜N分のランダム秒だけ sleep してから打刻する。
+  #         例) 退勤を 18:20〜18:25 にしたい → clock_out: "18:20" / random_window_minutes: 5
+  random_window_minutes: 0       # in/out 共通の既定
+  # clock_in_window:  0          # 出勤だけ別のウィンドウにしたい場合（任意・上書き）
+  # clock_out_window: 5          # 退勤だけ別のウィンドウにしたい場合（任意・上書き）
+
+schedule:
+  weekdays_only: true            # 平日のみ打刻
+  skip_japanese_holidays: true   # 日本の祝日はスキップ
+  exclude_dates:                 # 出勤しない日（年末年始・有給等） YYYY-MM-DD
+    - "2026-12-29"
+    - "2026-12-30"
+    - "2026-12-31"
+  extra_workdays: []             # 週末/祝日でも出勤する日（最優先で対象化）
+
+idempotency:
+  check_existing: true           # 打刻前に GET で当日の同種打刻を確認し、あればスキップ
+
+token:
+  path: "config/token.json"      # 再発行トークンの保存先（.gitignore 済み）
+  refresh_threshold_days: 7      # 有効期限がこの日数以内になったら自動再発行

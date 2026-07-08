@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# プロジェクトの Gemfile に固定して bundler を有効化（cron からの起動でも安定）
+ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
+require "bundler/setup"
+
+require_relative "../lib/ak4_punch"
+
+Ak4Punch::CLI.start(ARGV)
