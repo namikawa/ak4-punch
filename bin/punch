@@ -1,6 +1,15 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+# cron 等 LANG/LC_* の無い最小環境では Ruby の既定エンコーディングが US-ASCII になり、
+# 日本語（.env / config.yml / 祝日名 / ログ出力）で
+# "invalid byte sequence in US-ASCII" を投げて打刻が失敗する。
+# 入口で UTF-8 に固定して回避する（他の require より前に行う）。
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+$stdout.set_encoding(Encoding::UTF_8)
+$stderr.set_encoding(Encoding::UTF_8)
+
 # プロジェクトの Gemfile に固定して bundler を有効化（cron からの起動でも安定）
 ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
 require "bundler/setup"
