@@ -3,7 +3,7 @@
 マネーフォワード クラウド勤怠Plus（旧AKASHI）に、平日の決まった時刻に出勤/退勤を自動打刻するCLIツール。
 
 ## 必要要件
-- Ruby 3.1+（開発は 3.4.9 で確認）、Bundler
+- Ruby 3.1+（開発は 3.4.10 で確認）、Bundler
 - 常時起動している端末（該当時刻に確実に cron が発火する環境）
 - AKASHI 側で「公開API利用可否」を「利用する」に設定し、マイページでアクセストークンを発行
 
@@ -77,7 +77,7 @@ crontab -e                      # 出力された PATH 行＋2行を貼り付け
 
 出力例（出勤 9:30 / 退勤 18:00・平日のみ。祝日/除外日/二重打刻はアプリ側でスキップ）:
 ```cron
-PATH=/Users/you/.rbenv/versions/3.4.9/bin:/usr/bin:/bin
+PATH=/Users/you/.rbenv/versions/3.4.10/bin:/usr/bin:/bin
 30 9 * * 1-5 cd /path/to/ak4-punch && bin/punch clock_in  >> /path/to/ak4-punch/punch.log 2>&1
 0 18 * * 1-5 cd /path/to/ak4-punch && bin/punch clock_out >> /path/to/ak4-punch/punch.log 2>&1
 ```
