@@ -13,12 +13,24 @@ module Ak4Punch
     MAX_WINDOW_MINUTES = 30
     DEFAULT_RANDOM_WINDOW_MINUTES = 5
 
+    # カレンダー連動デーモンの既定値。
+    DEFAULT_EXCLUDE_KEYWORDS = %w[会食 懇親会 飲み会 打ち上げ 歓迎会 送別会 忘年会 新年会].freeze
+    DEFAULT_REFRESH_INTERVAL_MINUTES = 15
+    DEFAULT_TICK_SECONDS = 30
+    DEFAULT_WAKE_LEAD_MINUTES = 1
+    DEFAULT_LATE_GRACE_MINUTES = 10
+    DEFAULT_SUKESAN_BASE_URL = "http://127.0.0.1:3000"
+
     attr_reader :base_url, :company_id, :timezone,
                 :clock_in_time, :clock_out_time,
                 :clock_in_window, :clock_out_window,
                 :weekdays_only, :skip_japanese_holidays,
                 :exclude_dates, :extra_workdays,
-                :check_existing, :token_path, :token_refresh_threshold_days
+                :check_existing, :token_path, :token_refresh_threshold_days,
+                :sukesan_base_url, :sukesan_api_key,
+                :calendar_enabled, :calendar_exclude_keywords, :calendar_refresh_interval_minutes,
+                :daemon_tick_seconds, :daemon_wake_lead_minutes,
+                :daemon_manage_wake, :daemon_late_grace_minutes
 
     def self.load(config_path:, root:)
       EnvFile.load(File.join(root, ".env"))
@@ -54,6 +66,27 @@ module Ak4Punch
       @token_path = File.expand_path(tok["path"] || "config/token.json", root)
       @token_refresh_threshold_days = tok.fetch("refresh_threshold_days", 7)
 
+      # sukesan 接続情報（機密）は .env から。BASE_URL は既定でループバック。
+      @sukesan_base_url = env_or(data, "SUKESAN_BASE_URL", "sukesan_base_url") || DEFAULT_SUKESAN_BASE_URL
+      @sukesan_api_key  = ENV["SUKESAN_API_KEY"]
+
+      # カレンダー連動（退勤時刻の動的決定）の振る舞い。
+      cal = data["calendar"] || {}
+      @calendar_enabled = cal.fetch("enabled", false)
+      kw = cal["exclude_keywords"]
+      @calendar_exclude_keywords = kw.nil? ? DEFAULT_EXCLUDE_KEYWORDS.dup : Array(kw).map(&:to_s)
+      @calendar_refresh_interval_minutes =
+        positive_int(cal.fetch("refresh_interval_minutes", DEFAULT_REFRESH_INTERVAL_MINUTES),
+                     DEFAULT_REFRESH_INTERVAL_MINUTES)
+
+      # 常駐デーモンの振る舞い。
+      dae = data["daemon"] || {}
+      @daemon_tick_seconds       = positive_int(dae.fetch("tick_seconds", DEFAULT_TICK_SECONDS), DEFAULT_TICK_SECONDS)
+      @daemon_wake_lead_minutes  = dae.fetch("wake_lead_minutes", DEFAULT_WAKE_LEAD_MINUTES).to_i.clamp(0, 60)
+      @daemon_manage_wake        = dae.fetch("manage_wake", true)
+      @daemon_late_grace_minutes = positive_int(dae.fetch("late_grace_minutes", DEFAULT_LATE_GRACE_MINUTES),
+                                                DEFAULT_LATE_GRACE_MINUTES)
+
       validate!
     end
 
@@ -78,5 +111,11 @@ module Ak4Punch
 
     # 分を 0..MAX_WINDOW_MINUTES に丸める（負値は0、上限超過は上限）。
     def clamp_window(value) = value.to_i.clamp(0, MAX_WINDOW_MINUTES)
+
+    # 正の整数に丸める（0以下や不正値は既定値にフォールバック）。
+    def positive_int(value, default)
+      n = value.to_i
+      n.positive? ? n : default
+    end
   end
 end

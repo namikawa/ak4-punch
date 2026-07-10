@@ -39,7 +39,11 @@ bundle exec bin/punch clock_out --window 5 # 指定時刻から0〜5分のラン
 bundle exec bin/punch clock_out --random   # ランダム打刻ON（分数は設定値／既定5分）
 bundle exec bin/punch status               # 本日の打刻状況を表示（--date=YYYY-MM-DD）
 bundle exec bin/punch refresh_token        # トークンを再発行して保存
-bundle exec bin/punch crontab              # cron 設定例を表示
+bundle exec bin/punch daemon               # カレンダー連動デーモンを起動（推奨・下記）
+bundle exec bin/punch plan                 # 当日の打刻計画をドライラン表示（--date=YYYY-MM-DD）
+bundle exec bin/punch launchd              # LaunchAgent の設定例を表示（推奨）
+bundle exec bin/punch sudoers              # pmset 自動起床の sudoers 設定例を表示
+bundle exec bin/punch crontab              # cron 設定例を表示（代替・レガシー）
 ```
 
 動作:
@@ -66,7 +70,51 @@ work:
 - `--force` は手動確認向けにその場で即時打刻します（待機なし）。
 - 待機中に Mac が再スリープしないよう、`crontab` 出力はウィンドウ有効時のみ `caffeinate -i` を前置します。
 
-## スケジューリング（cron + pmset）
+## カレンダー連動デーモン（推奨）
+
+常駐デーモン（`punch daemon`）が、出勤は所定時刻＋揺らぎで、退勤はローカルのカレンダー連携システム sukesan の当日イベントに合わせて動的に打刻します。cron の固定時刻運用に代わる推奨方式です。
+
+仕組み:
+- 出勤 = 所定時刻(`work.clock_in`) + 揺らぎ（従来のウィンドウ機構。日毎に1回だけ乱数秒を決めて固定）。
+- 退勤 = sukesan の「最後の業務イベントの終了時刻」に合わせる。末尾から会食・懇親会などの除外キーワードに一致するイベントを飛ばし、最後の業務イベントの終了時刻を採用。所定退勤時刻より早ければ所定時刻を採用（max 則）。ここにも退勤側の揺らぎを加算。
+- `calendar.refresh_interval_minutes`（既定15分）ごとに sukesan を再取得して退勤目標を再計算。会議が延びれば目標も後ろ倒しに追随します。
+- tick（`daemon.tick_seconds`）ごとに「目標時刻 <= 現在 <= 目標+`late_grace_minutes`」を判定して打刻。grace を過ぎた場合はスリープ寝過ごし等での誤時刻打刻を避けるため打刻せず警告します。
+- sukesan が停止・エラーのときは所定退勤時刻＋揺らぎへフォールバックし、復旧すれば次回再取得で追随します。
+- 対象日判定（平日/祝日/除外日/追加出勤日）・二重打刻の冪等チェックは従来どおりアプリ側で行います。
+
+### セットアップ
+
+```bash
+# 1) sukesan で APIキー（64文字）を発行し .env に設定
+#    SUKESAN_BASE_URL … 既定 http://127.0.0.1:3000（ループバック限定）
+#    SUKESAN_API_KEY  … 発行したキー（機密）
+
+# 2) config/config.yml の calendar: / daemon: を調整（除外キーワード等）
+
+# 3) 計画の確認（AKASHI には触らず sukesan への GET のみ。未起動でもフォールバック表示で落ちない）
+bundle exec bin/punch plan
+bundle exec bin/punch plan --date=2026-07-13
+
+# 4) スリープ自動起床を使うなら pmset を sudoers で許可（任意）
+bundle exec bin/punch sudoers    # 出力の1行を sudo visudo -f /etc/sudoers.d/ak4-punch で設置
+
+# 5) LaunchAgent として常駐登録
+bundle exec bin/punch launchd    # 出力の plist を ~/Library/LaunchAgents/ へ設置し launchctl load
+```
+
+`punch plan` の出力では、取得イベント一覧（時刻・タイトル・採用/除外/対象外の判定）と、決定した出勤・退勤の目標時刻、フォールバックの有無を確認できます。
+
+### スリープ対策（デーモンによる自動起床）
+
+`daemon.manage_wake: true` かつ `punch sudoers` の設定済みなら、デーモンが計画確定/変更のたびに残りの打刻予定について「目標時刻 - `wake_lead_minutes`」の一回限り pmset 起床を予約し直します（`sudo -n pmset schedule ...`）。sudoers 未設定でパスワードが要る場合は当日中は自動起床を無効化し、警告ログを出してデーモンは動作を続けます。
+
+- 自動起床を使わない場合は `manage_wake: false` にし、常時電源接続＋スリープ無効での運用を推奨します。
+
+---
+
+## スケジューリング（cron + pmset）（代替・レガシー）
+
+> 常駐デーモン（上記）の利用を推奨します。以下は cron による固定時刻運用（退勤のカレンダー連動なし）で、デーモンを使わない場合の代替手段です。
 
 打刻したい時刻に cron で起動します。`crontab` コマンドが PATH を自動解決した cron 行と、Mac を起こす pmset コマンドを出力します。
 
