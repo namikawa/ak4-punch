@@ -183,11 +183,67 @@ RSpec.describe Ak4Punch::Daemon do
   end
 
   describe "wake 予約" do
-    it "計画作成時に未来の打刻目標で wake を予約する" do
+    it "計画作成時に未来の打刻目標＋翌営業日朝のブートストラップで wake を予約する" do
       allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
-      expect(wake_scheduler).to receive(:reschedule).with([t("09:30"), t("18:30")])
+      # calendar.target? は常に true スタブ → 翌営業日 = 翌日(7/11) の所定出勤時刻（揺らぎなし）
+      expect(wake_scheduler).to receive(:reschedule).with([t("09:30"), t("18:30"), t("09:30", day: 11)])
       clock_time[:now] = t("08:00")
       daemon.tick
+    end
+
+    it "金曜: 当日の打刻が全て完了しても翌営業日(月曜)朝の予約を維持する" do
+      allow(calendar).to receive(:target?) { |d| !d.saturday? && !d.sunday? } # 土日のみ非対象
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画: 出勤09:30 / 退勤18:00（イベントなし→所定）
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻 → done
+
+      # 退勤完了後: 当日 targets は空になり、月曜(7/13)朝のブートストラップのみが残る
+      expect(wake_scheduler).to receive(:reschedule).with([t("09:30", day: 13)])
+      clock_time[:now] = t("18:00", 5)
+      daemon.tick
+    end
+
+    it "祝日跨ぎ: 連休明けの営業日朝をブートストラップ予約する" do
+      # 7/11〜7/14 は非対象（週末＋連休）、7/15(水) が次の営業日
+      allow(calendar).to receive(:target?) { |d| d >= Date.new(2026, 7, 15) }
+      allow(calendar_client).to receive(:events).and_return([])
+
+      expect(wake_scheduler).to receive(:reschedule).with([t("09:30"), t("18:00"), t("09:30", day: 15)])
+      clock_time[:now] = t("08:00")
+      daemon.tick
+    end
+
+    it "done へ遷移した tick で予約し直し、遷移が無い tick では予約しない" do
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成で1回
+      expect(wake_scheduler).to have_received(:reschedule).once
+
+      clock_time[:now] = t("08:05") # due なし・refresh 間隔前 → 遷移なし
+      daemon.tick
+      expect(wake_scheduler).to have_received(:reschedule).once # 増えない
+
+      clock_time[:now] = t("09:30", 5) # 出勤 due → done 遷移
+      daemon.tick
+      expect(wake_scheduler).to have_received(:reschedule).twice
+    end
+
+    it "graceスキップによる done 遷移でも予約し直す" do
+      allow(calendar_client).to receive(:events).and_return([])
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成で1回
+
+      clock_time[:now] = t("09:41") # 出勤 grace 超過 → スキップ（done 遷移）
+      daemon.tick
+      expect(wake_scheduler).to have_received(:reschedule).twice
     end
 
     context "manage_wake=false" do
@@ -217,9 +273,10 @@ RSpec.describe Ak4Punch::Daemon do
       end
     end
 
-    it "非対象日は manage_wake=true なら空 targets で予約をクリアする" do
+    it "非対象日でも manage_wake=true なら翌営業日朝のブートストラップ予約が入る" do
       allow(calendar).to receive(:reason).and_return("祝日")
-      expect(wake_scheduler).to receive(:reschedule).with([])
+      allow(calendar).to receive(:target?) { |d| d == Date.new(2026, 7, 13) } # 次の営業日 = 月曜
+      expect(wake_scheduler).to receive(:reschedule).with([t("09:30", day: 13)])
       daemon.tick
     end
   end

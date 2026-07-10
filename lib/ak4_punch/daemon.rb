@@ -161,6 +161,7 @@ module Ak4Punch
     # due（目標<=現在<=目標+grace）の打刻を実行。grace 超過は警告してスキップ扱いにする。
     def fire_due_punches(now)
       grace = @config.daemon_late_grace_minutes * 60
+      transitioned = false
       KINDS.each do |kind|
         pp = @punch_plans[kind]
         next if pp.nil? || pp.done?
@@ -170,12 +171,18 @@ module Ak4Punch
           @logger.warn("#{label(kind)}目標 #{fmt(pp.target_at)} を#{@config.daemon_late_grace_minutes}分超過（現在 #{fmt(now)}）。" \
                        "誤時刻打刻を避けるため打刻せずスキップします。")
           pp.done = true
+          transitioned = true
           next
         end
 
         execute_punch(kind, now)
         pp.done = true
+        transitioned = true
       end
+
+      # 打刻完了/graceスキップで done へ遷移したら、残り目標＋ブートストラップで予約し直す
+      # （当日分の縮小を反映しつつ、翌営業日朝の起床予約を維持する）。
+      reschedule_wakes(now) if transitioned
     end
 
     # 実際の打刻。トークン更新（CLI#run_punch 相当）→ Stamper#punch（window=0 で即時）。
@@ -191,12 +198,30 @@ module Ak4Punch
       @logger.error("#{label(kind)}の打刻に失敗: #{e.class}: #{e.message}")
     end
 
-    # 残っている（未実行の）当日打刻目標について wake を予約し直す。
+    # 残っている（未実行の）当日打刻目標＋ブートストラップ目標について wake を予約し直す。
     def reschedule_wakes(now)
       return unless @config.daemon_manage_wake
 
       targets = @punch_plans.values.reject(&:done?).map(&:target_at).select { |t| t > now }
+      # ブートストラップ起床: 当日の打刻が全て完了する（targets が空になる）と、
+      # スリープしたままでは翌営業日の計画を作れず朝に起きられない。
+      # そのため「次の営業日の所定出勤時刻」（揺らぎなし）を常に予約しておく。
+      # lead 分の前倒しは WakeScheduler 側で行われ、起床後最初の tick で
+      # 当日計画が作られて正確な打刻目標の wake が再予約される。
+      bootstrap = next_workday_clock_in(now)
+      targets << bootstrap if bootstrap
       @wake_scheduler.reschedule(targets)
+    end
+
+    # 翌日以降で最初の営業日の所定出勤時刻(Time)を返す。安全のため最大366日で打ち切り。
+    def next_workday_clock_in(now)
+      date = now.to_date + 1
+      366.times do
+        return clock_in_default_at(date) if @calendar.target?(date)
+
+        date += 1
+      end
+      nil
     end
 
     # 退勤の目標時刻を計算する。events==:fetch なら sukesan から取得（失敗時はフォールバック）。
