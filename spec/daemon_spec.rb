@@ -281,6 +281,119 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
+  describe "退勤直前の最終チェック" do
+    # 定期 refresh の干渉を避けるため間隔を大きくし、due 時の fetch が最終チェック由来であることを保証する
+    let(:config) do
+      Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
+          "calendar" => { "enabled" => true, "exclude_keywords" => ["会食"], "refresh_interval_minutes" => 999 },
+          "daemon" => { "tick_seconds" => 30, "late_grace_minutes" => 10, "manage_wake" => true, "wake_lead_minutes" => 1 },
+        },
+        root: Dir.pwd,
+      )
+    end
+
+    it "目標が延長されていたら打刻せず延期し、新目標到達時に打刻する" do
+      ends = { at: t("18:30") }
+      allow(calendar_client).to receive(:events) { [event(title: "実装", ends_at: ends[:at])] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画: 出勤09:30 / 退勤18:30
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      ends[:at] = t("19:00") # 直前に会議が延長された
+      clock_time[:now] = t("18:30", 10)
+      daemon.tick # due → 最終チェックで延長検出 → 延期
+
+      # 退勤はまだ打刻されず、目標更新ログと wake 再予約（新目標＋ブートストラップ）が行われる
+      expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+      expect(logger).to have_received(:info).with(/退勤直前チェック.*延期/)
+      expect(logger).to have_received(:info).with(/退勤目標を更新.*18:30.*19:00/)
+      expect(wake_scheduler).to have_received(:reschedule).with([t("19:00"), t("09:30", day: 11)])
+
+      clock_time[:now] = t("19:00", 5)
+      daemon.tick # 新目標 due → 最終チェック（不変）→ 打刻
+      expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+    end
+
+    it "目標が不変ならその tick で打刻する" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0)
+      clock_time[:now] = t("18:30", 10)
+      daemon.tick
+      # fetch は計画作成時＋最終チェックの2回（定期 refresh は間隔999分で走らない）
+      expect(calendar_client).to have_received(:events).twice
+    end
+
+    it "最終チェックの再取得が失敗したら警告つきで現在の目標のまま打刻する" do
+      calls = 0
+      allow(calendar_client).to receive(:events) do
+        calls += 1
+        raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if calls > 1
+
+        [event(title: "実装", ends_at: t("18:30"))]
+      end
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画: 退勤18:30
+
+      clock_time[:now] = t("18:30", 10)
+      daemon.tick # due → 最終チェック失敗 → 現在の目標のまま打刻
+      expect(logger).to have_received(:warn).with(/退勤直前チェック.*現在の目標のまま/)
+      expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+    end
+
+    it "出勤の due では再取得しない" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成で1回 fetch
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤 due → 打刻（最終チェックは走らない）
+      expect(calendar_client).to have_received(:events).once
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0)
+    end
+
+    it "calendar_enabled=false なら最終チェックなしで従来どおり打刻する" do
+      cfg = Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
+          "calendar" => { "enabled" => false },
+          "daemon" => { "manage_wake" => false },
+        },
+        root: Dir.pwd,
+      )
+      d = described_class.new(
+        config: cfg, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        clock: clock, sleeper: ->(_s) {},
+      )
+      expect(calendar_client).not_to receive(:events)
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      d.tick # 計画作成（fetch なし）
+
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0)
+      clock_time[:now] = t("18:00", 5)
+      d.tick # due → 最終チェックなし → そのまま打刻
+    end
+  end
+
   describe "calendar_enabled=false（連動OFF）" do
     let(:disabled_daemon) do
       cfg = Ak4Punch::Config.new(

@@ -175,6 +175,10 @@ module Ak4Punch
           next
         end
 
+        # 退勤は打刻直前にカレンダーを最終再取得し、直前の会議延長に追随する
+        # （再取得間隔を広げても直前の延長を取りこぼさないための最終チェック）。
+        next if kind == :out && postpone_out_by_final_check?(now)
+
         execute_punch(kind, now)
         pp.done = true
         transitioned = true
@@ -183,6 +187,31 @@ module Ak4Punch
       # 打刻完了/graceスキップで done へ遷移したら、残り目標＋ブートストラップで予約し直す
       # （当日分の縮小を反映しつつ、翌営業日朝の起床予約を維持する）。
       reschedule_wakes(now) if transitioned
+    end
+
+    # 退勤打刻の直前チェック。sukesan を強制再取得して退勤目標を再計算し、
+    # 目標が現在より後ろへ動いていたら計画を更新して打刻を延期する（done にしない。
+    # 新目標で改めて due になったら、その時も最終チェックが走る）。
+    # 戻り値: true = 延期（この tick では打刻しない） / false = このまま打刻してよい。
+    def postpone_out_by_final_check?(now)
+      return false unless @config.calendar_enabled # 連動OFFは最終チェックなし
+
+      out = plan_clock_out(date: now.to_date, events: :fetch)
+
+      # 再取得失敗は安全側（打刻機会を逃さない）に倒し、現在の目標のまま打刻する。
+      # 計画も更新しない（フォールバック値で目標を上書きしない）。
+      if out[:error]
+        @logger.warn("退勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します")
+        return false
+      end
+
+      # 目標が不変・前倒しなら、いま打刻するのが正しい（grace の再判定はしない）。
+      return false if out[:target] <= now
+
+      @logger.info("退勤直前チェック: 目標が後ろ倒しされたため打刻を延期します")
+      set_out_plan(out, now) # 「退勤目標を更新」ログが出る
+      reschedule_wakes(now)  # 起床予約も新目標で取り直す
+      true
     end
 
     # 実際の打刻。トークン更新（CLI#run_punch 相当）→ Stamper#punch（window=0 で即時）。
