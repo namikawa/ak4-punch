@@ -67,4 +67,65 @@ RSpec.describe Ak4Punch::Config do
       expect(cfg.clock_out_window).to eq 0
     end
   end
+
+  describe "カレンダー連動・デーモン設定" do
+    it "既定値を持つ（未設定時）" do
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.calendar_enabled).to be false
+      expect(cfg.calendar_exclude_keywords).to eq described_class::DEFAULT_EXCLUDE_KEYWORDS
+      expect(cfg.calendar_refresh_interval_minutes).to eq 15
+      expect(cfg.daemon_tick_seconds).to eq 30
+      expect(cfg.daemon_wake_lead_minutes).to eq 1
+      expect(cfg.daemon_manage_wake).to be true
+      expect(cfg.daemon_late_grace_minutes).to eq 10
+      expect(cfg.sukesan_base_url).to eq "http://127.0.0.1:3000"
+    end
+
+    it "config の値で上書きできる" do
+      cfg = described_class.new(
+        data: {
+          "company_id" => "x",
+          "calendar" => {
+            "enabled" => true,
+            "exclude_keywords" => %w[飲み会 打ち上げ],
+            "refresh_interval_minutes" => 5,
+          },
+          "daemon" => {
+            "tick_seconds" => 60, "wake_lead_minutes" => 2,
+            "manage_wake" => false, "late_grace_minutes" => 20,
+          },
+        },
+        root: Dir.pwd,
+      )
+      expect(cfg.calendar_enabled).to be true
+      expect(cfg.calendar_exclude_keywords).to eq %w[飲み会 打ち上げ]
+      expect(cfg.calendar_refresh_interval_minutes).to eq 5
+      expect(cfg.daemon_tick_seconds).to eq 60
+      expect(cfg.daemon_wake_lead_minutes).to eq 2
+      expect(cfg.daemon_manage_wake).to be false
+      expect(cfg.daemon_late_grace_minutes).to eq 20
+    end
+
+    it "不正な数値（0以下）は既定値へフォールバック" do
+      cfg = described_class.new(
+        data: {
+          "company_id" => "x",
+          "calendar" => { "refresh_interval_minutes" => 0 },
+          "daemon" => { "tick_seconds" => -1, "late_grace_minutes" => 0 },
+        },
+        root: Dir.pwd,
+      )
+      expect(cfg.calendar_refresh_interval_minutes).to eq 15
+      expect(cfg.daemon_tick_seconds).to eq 30
+      expect(cfg.daemon_late_grace_minutes).to eq 10
+    end
+
+    it "exclude_keywords を空配列にすると除外なしにできる" do
+      cfg = described_class.new(
+        data: { "company_id" => "x", "calendar" => { "exclude_keywords" => [] } },
+        root: Dir.pwd,
+      )
+      expect(cfg.calendar_exclude_keywords).to eq []
+    end
+  end
 end

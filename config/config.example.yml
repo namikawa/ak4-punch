@@ -35,3 +35,27 @@ idempotency:
 token:
   path: "config/token.json"      # 再発行トークンの保存先（.gitignore 済み）
   refresh_threshold_days: 7      # 有効期限がこの日数以内になったら自動再発行
+
+# ===== カレンダー連動デーモン（推奨）=====
+# デーモン(punch daemon / launchd)は退勤時刻を sukesan のカレンダーに合わせて動的に決めます。
+# 接続情報（SUKESAN_BASE_URL / SUKESAN_API_KEY）は .env で設定します。
+calendar:
+  enabled: true                  # false なら退勤は従来の固定時刻(work.clock_out)のみ
+  # 末尾イベント除外キーワード（タイトル部分一致）。
+  # カレンダー末尾から、これらに一致するイベントを飛ばして最後の「業務」イベントの終了時刻を採用します。
+  exclude_keywords:
+    - "会食"
+    - "懇親会"
+    - "飲み会"
+    - "打ち上げ"
+    - "歓迎会"
+    - "送別会"
+    - "忘年会"
+    - "新年会"
+  refresh_interval_minutes: 15   # デーモンがカレンダーを再取得する間隔（分）
+
+daemon:
+  tick_seconds: 30               # メインループの tick 間隔（秒）
+  wake_lead_minutes: 1           # 打刻の何分前に Mac を起こすか（pmset）
+  manage_wake: true              # sudoers 設定済みなら true。false なら pmset を触らない
+  late_grace_minutes: 10         # 目標時刻からこの分数を超えて遅延したら打刻せずスキップ（誤時刻打刻ガード）
