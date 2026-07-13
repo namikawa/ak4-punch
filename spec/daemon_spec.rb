@@ -392,6 +392,159 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("18:00", 5)
       d.tick # due → 最終チェックなし → そのまま打刻
     end
+
+    it "最終チェックで休暇イベントを検知したら打刻を中止する" do
+      evs = { list: [event(title: "実装", ends_at: t("18:30"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 通常計画（退勤18:30）
+
+      evs[:list] = [event(title: "午後休暇", ends_at: nil, all_day: true)] # 直前に休暇イベントが入った
+      clock_time[:now] = t("18:30", 10)
+      daemon.tick # due → 最終チェックで休暇検知 → 中止
+      expect(logger).to have_received(:warn).with(/休暇イベント『午後休暇』を検知したため、以降の打刻を中止します/)
+      expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+
+      # 以降の tick でも打刻されない（休暇日として保持）
+      clock_time[:now] = t("18:35")
+      daemon.tick
+      expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+    end
+  end
+
+  describe "休暇の自動検知" do
+    let(:leave_event) { event(title: "夏季休暇", ends_at: nil, all_day: true) }
+
+    it "計画時に休暇を検知したら打刻計画を作らず、以降のtickでも再取得・打刻しない" do
+      allow(calendar_client).to receive(:events).and_return([leave_event])
+      expect(stamper).not_to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画時に休暇検知
+      expect(logger).to have_received(:info).with(/休暇イベント『夏季休暇』を検知したため、本日は打刻しません/)
+      # 打刻計画なし＝翌営業日ブートストラップのみ予約される
+      expect(wake_scheduler).to have_received(:reschedule).with([t("09:30", day: 11)])
+
+      # 休暇日として保持中: refresh も due 判定も停止（fetch は計画時の1回だけ）
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+      clock_time[:now] = t("18:00", 5)
+      daemon.tick
+      expect(calendar_client).to have_received(:events).once
+    end
+
+    it "日中の再取得で休暇を検知したら残りの打刻を中止する（打刻済み分はそのまま）" do
+      evs = { list: [event(title: "実装", ends_at: t("18:30"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      evs[:list] = [leave_event] # 出勤後に休暇イベントが入った
+      clock_time[:now] = t("10:00")
+      daemon.tick # refresh 間隔経過 → 再取得で休暇検知
+      expect(logger).to have_received(:warn)
+        .with(/休暇イベント『夏季休暇』を検知したため、以降の打刻を中止します。打刻済みの分は手動で削除してください/)
+
+      clock_time[:now] = t("18:30", 5)
+      daemon.tick # 退勤は打刻されない
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0)
+      expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+    end
+
+    it "recheck 要求で再計画し、休暇イベントが消えていれば通常計画に復帰する" do
+      evs = { list: [event(title: "全休", ends_at: nil, all_day: true)] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 休暇日として計画なし
+
+      evs[:list] = [] # カレンダー修正（休暇イベントを削除）
+      daemon.request_recheck!
+      clock_time[:now] = t("08:05")
+      daemon.tick # 再計画 → 通常営業日に復帰
+      expect(logger).to have_received(:info).with(/再チェック要求を受け付けました。本日の計画を再作成します/)
+      expect(logger).to have_received(:info).with(/出勤目標を設定/)
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0)
+    end
+
+    it "取得失敗時は休暇判定せず通常営業日として計画する（所定時刻フォールバック）" do
+      allow(calendar_client).to receive(:events)
+        .and_raise(Ak4Punch::CalendarClient::ApiError, "接続拒否")
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      expect(logger).to have_received(:info).with(/出勤目標を設定/)
+      expect(logger).to have_received(:info).with(/退勤目標を設定.*フォールバック/)
+    end
+
+    it "calendar_enabled=false なら休暇検知しない（fetch もせず通常打刻）" do
+      cfg = Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
+          "calendar" => { "enabled" => false },
+          "daemon" => { "manage_wake" => false },
+        },
+        root: Dir.pwd,
+      )
+      d = described_class.new(
+        config: cfg, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        clock: clock, sleeper: ->(_s) {},
+      )
+      expect(calendar_client).not_to receive(:events)
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      d.tick
+
+      clock_time[:now] = t("09:30", 5)
+      d.tick
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0)
+    end
+
+    it "build_day_plan は検知した休暇イベントを leave_event として返す" do
+      allow(calendar_client).to receive(:events).and_return([leave_event])
+      day = daemon.build_day_plan(date: date)
+      expect(day[:leave_event]&.title).to eq "夏季休暇"
+    end
+
+    it "build_day_plan は休暇がなければ leave_event なし" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+      day = daemon.build_day_plan(date: date)
+      expect(day[:leave_event]).to be_nil
+    end
+  end
+
+  describe ".find_pid" do
+    it "pgrep 結果から生存しているデーモンの PID を返す" do
+      pid = described_class.find_pid(
+        pgrep: -> { "111\n222\n" },
+        alive: ->(p) { p == 222 },
+        own_pid: 999,
+      )
+      expect(pid).to eq 222
+    end
+
+    it "自プロセスは除外する" do
+      pid = described_class.find_pid(pgrep: -> { "111\n" }, alive: ->(_p) { true }, own_pid: 111)
+      expect(pid).to be_nil
+    end
+
+    it "見つからなければ nil" do
+      expect(described_class.find_pid(pgrep: -> { "" }, alive: ->(_p) { true }, own_pid: 1)).to be_nil
+    end
   end
 
   describe "calendar_enabled=false（連動OFF）" do

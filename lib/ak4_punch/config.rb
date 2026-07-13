@@ -21,6 +21,11 @@ module Ak4Punch
     DEFAULT_LATE_GRACE_MINUTES = 10
     DEFAULT_SUKESAN_BASE_URL = "http://127.0.0.1:3000"
 
+    # 休暇の自動検知の既定値（AKASHI は休暇申請日でも打刻を受理するため、
+    # カレンダー上の休暇イベント検知で打刻をスキップする）。
+    DEFAULT_LEAVE_KEYWORDS = %w[休暇 有給 年休 全休 休み].freeze
+    DEFAULT_LEAVE_MIN_DURATION_HOURS = 4
+
     attr_reader :base_url, :company_id, :timezone,
                 :clock_in_time, :clock_out_time,
                 :clock_in_window, :clock_out_window,
@@ -29,6 +34,7 @@ module Ak4Punch
                 :check_existing, :token_path, :token_refresh_threshold_days,
                 :sukesan_base_url, :sukesan_api_key,
                 :calendar_enabled, :calendar_exclude_keywords, :calendar_refresh_interval_minutes,
+                :calendar_leave_keywords, :calendar_leave_min_duration_hours,
                 :daemon_tick_seconds, :daemon_wake_lead_minutes,
                 :daemon_manage_wake, :daemon_late_grace_minutes
 
@@ -78,6 +84,13 @@ module Ak4Punch
       @calendar_refresh_interval_minutes =
         positive_int(cal.fetch("refresh_interval_minutes", DEFAULT_REFRESH_INTERVAL_MINUTES),
                      DEFAULT_REFRESH_INTERVAL_MINUTES)
+
+      # 休暇の自動検知（タイトル部分一致 + 終日または一定時間以上のイベント）。
+      lkw = cal["leave_keywords"]
+      @calendar_leave_keywords = lkw.nil? ? DEFAULT_LEAVE_KEYWORDS.dup : Array(lkw).map(&:to_s)
+      @calendar_leave_min_duration_hours =
+        positive_int(cal.fetch("leave_min_duration_hours", DEFAULT_LEAVE_MIN_DURATION_HOURS),
+                     DEFAULT_LEAVE_MIN_DURATION_HOURS)
 
       # 常駐デーモンの振る舞い。
       dae = data["daemon"] || {}
