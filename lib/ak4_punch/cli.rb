@@ -243,6 +243,19 @@ module Ak4Punch
       GUIDE
     end
 
+    desc "recheck", "稼働中デーモンに当日計画の再チェックを要求する（SIGUSR1送信）"
+    def recheck
+      # 用途: カレンダーに誤って休暇イベントを入れて打刻が止まった場合、
+      # イベントを修正してからこのコマンドで即時に再判定させる。
+      pid = Daemon.find_pid
+      abort "デーモンが起動していません" if pid.nil?
+
+      Process.kill("USR1", pid)
+      puts "デーモン(PID #{pid})に再チェックを要求しました。ログ(punch.log)で結果を確認してください。"
+    rescue StandardError => e
+      abort "エラー: #{e.message}"
+    end
+
     desc "version", "バージョン表示"
     def version = puts("ak4-punch #{Ak4Punch::VERSION}")
 
@@ -324,6 +337,17 @@ module Ak4Punch
       puts "==== #{day[:date]} の打刻計画 ===="
       unless day[:target?]
         puts "対象日ではありません（#{day[:reason]}）。打刻しません。"
+        return
+      end
+
+      if (leave = day[:leave_event])
+        duration =
+          if leave.all_day
+            "終日"
+          else
+            format("%g時間", (leave.ends_at - leave.starts_at) / 3600.0)
+          end
+        puts "休暇検知: イベント『#{leave.title}』（#{duration}）→ この日は打刻しません"
         return
       end
 

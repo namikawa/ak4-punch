@@ -54,6 +54,18 @@ calendar:
     - "新年会"
   refresh_interval_minutes: 15   # デーモンがカレンダーを再取得する間隔（分）
 
+  # 休暇の自動検知: タイトルが下記キーワードに部分一致し、かつ「終日」または
+  # 「leave_min_duration_hours 時間以上」のイベントがあれば、その日は打刻しない。
+  # AKASHI は休暇申請日でも打刻を受理するため、この検知が休暇日の誤打刻を防ぐ主手段。
+  # 誤検知時の復旧: カレンダーを修正して `punch recheck`。
+  leave_keywords:
+    - "休暇"
+    - "有給"
+    - "年休"
+    - "全休"
+    - "休み"
+  leave_min_duration_hours: 4    # 時間指定イベントを休暇と見なす最小継続時間（短時間の中抜け誤検知防止）
+
 daemon:
   tick_seconds: 30               # メインループの tick 間隔（秒）
   wake_lead_minutes: 1           # 打刻の何分前に Mac を起こすか（pmset）

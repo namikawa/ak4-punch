@@ -11,6 +11,8 @@ module Ak4Punch
   #   - 15分毎に sukesan を再取得して退勤目標を再計算し、変わったら再スケジュール
   #   - tick 毎に due（目標<=現在<=目標+grace）を判定し、範囲内なら打刻。
   #     grace 超過は打刻せず警告（スリープ寝過ごし時の誤時刻打刻ガード）。
+  #   - カレンダーに休暇イベント（キーワード部分一致＋終日 or 一定時間以上）を
+  #     検知したら、その日は打刻しない（AKASHI は休暇申請日でも打刻を受理するため）。
   #   - 長い sleep はせず tick で進める（Mac スリープ復帰後に正しく追随するため）。
   class Daemon
     KINDS = %i[in out].freeze
@@ -20,6 +22,24 @@ module Ak4Punch
     # 1日分の打刻計画（1 kind 分）。
     PunchPlan = Struct.new(:kind, :target_at, :done, :plan_detail, keyword_init: true) do
       def done? = done == true
+    end
+
+    # プロセス生存確認（シグナル0は送達せず存在チェックのみ）。
+    DEFAULT_ALIVE_CHECK = lambda do |pid|
+      Process.kill(0, pid)
+      true
+    rescue StandardError
+      false
+    end
+
+    # `punch recheck` 用: 稼働中デーモン（bin/punch daemon）の PID を返す。見つからなければ nil。
+    # pgrep で候補を挙げ、シグナル0で生存確認する。pgrep/生存確認は注入可能（テスト用）。
+    def self.find_pid(pgrep: -> { `pgrep -f "bin/punch daemon"` },
+                      alive: DEFAULT_ALIVE_CHECK,
+                      own_pid: Process.pid)
+      pgrep.call.split("\n").map(&:to_i)
+           .reject { |pid| pid.zero? || pid == own_pid }
+           .find { |pid| alive.call(pid) }
     end
 
     # 依存はすべて注入可能にしてテストで実時間 sleep なしに検証できるようにする。
@@ -41,7 +61,9 @@ module Ak4Punch
 
       @plan_date = nil          # 現在計画中の日付
       @punch_plans = {}         # kind => PunchPlan（対象日のみ）
+      @leave_event = nil        # 検知した休暇イベント（非nilの間、当日は「休暇日」として打刻しない）
       @last_refresh_at = nil    # 最後に sukesan を再取得した時刻
+      @recheck_requested = false # SIGUSR1（punch recheck）による再計画要求フラグ
       @running = false
     end
 
@@ -65,22 +87,33 @@ module Ak4Punch
     end
 
     # 1 tick 分の処理（テストから直接呼べる）:
-    #   日付変化 → 計画作成 / refresh 間隔 → 退勤再計算 / due 判定 → 打刻。
+    #   再チェック要求 → 日付変化 → 計画作成 / refresh 間隔 → 退勤再計算 / due 判定 → 打刻。
     def tick
       now = @clock.call
+      consume_recheck_request
       ensure_day_plan(now)
       refresh_if_due(now)
       fire_due_punches(now)
     end
 
+    # 再チェック要求（SIGUSR1 / punch recheck）。次の tick で当日を完全再計画する。
+    # 用途: カレンダーに誤って休暇イベントを入れて打刻が止まった場合、
+    #       イベントを修正してから `punch recheck` で即時に再判定させる。
+    def request_recheck!
+      @recheck_requested = true
+    end
+
     # 指定日の計画を組み立てて返す（`punch plan` のドライラン表示にも使う）。
-    # events を渡さなければ sukesan から取得（失敗時はフォールバック）。
-    def build_day_plan(date:, events: :fetch)
-      out_plan = plan_clock_out(date: date, events: events)
+    # sukesan の取得は1回だけ行い、休暇判定と退勤計画で共用する。
+    def build_day_plan(date:)
+      fetched = @config.calendar_enabled ? fetch_events(date) : { events: nil, error: nil }
+      leave = fetched[:events] ? detect_leave(fetched[:events]) : nil
+      out_plan = plan_clock_out(date: date, events: fetched[:events], error: fetched[:error])
       {
         date: date,
         target?: @calendar.target?(date),
         reason: @calendar.reason(date),
+        leave_event: leave,
         in_target: in_target_at(date),
         out_plan: out_plan[:plan],
         out_target: out_plan[:target],
@@ -96,15 +129,30 @@ module Ak4Punch
           @running = false
         end
       end
+      # 再チェック要求（punch recheck から送られる）。trap 内ではフラグ設定のみ行う。
+      Signal.trap("USR1") { @recheck_requested = true }
+    end
+
+    # SIGUSR1 のフラグを検知したら当日の計画を破棄して完全再計画する
+    # （休暇状態も破棄 → カレンダー再取得 → 再判定。冪等チェックは Stamper 側にあるため
+    #  打刻済みの分が二重打刻されることはない）。
+    def consume_recheck_request
+      return unless @recheck_requested
+
+      @recheck_requested = false
+      @plan_date = nil # ensure_day_plan が同一日でも再計画する
+      @logger.info("再チェック要求を受け付けました。本日の計画を再作成します")
     end
 
     # 起動時・日付変化時に当日計画を作る。非対象日は計画なし（翌日待ち）。
+    # カレンダーに休暇イベントを検知した日も計画なし（休暇日として保持）。
     def ensure_day_plan(now)
       today = now.to_date
       return if @plan_date == today
 
       @plan_date = today
       @punch_plans = {}
+      @leave_event = nil
       @last_refresh_at = nil
       @wake_scheduler.reset!
 
@@ -116,25 +164,41 @@ module Ak4Punch
         return
       end
 
+      # sukesan の取得は1回だけ行い、休暇判定と退勤計画で共用する（二重 fetch 回避）。
+      # 取得失敗時は休暇判定不能のため通常営業日として扱う（退勤は所定時刻フォールバック）。
+      fetched = @config.calendar_enabled ? fetch_events(today) : { events: nil, error: nil }
+      if fetched[:events] && (leave = detect_leave(fetched[:events]))
+        @leave_event = leave
+        @logger.info("休暇イベント『#{leave.title}』を検知したため、本日は打刻しません")
+        reschedule_wakes(now) # 計画なし＝翌営業日ブートストラップのみ予約される
+        return
+      end
+
       in_target = in_target_at(today)
       @punch_plans[:in] = PunchPlan.new(kind: :in, target_at: in_target, done: false,
                                         plan_detail: "所定#{@config.clock_in_time}+揺らぎ")
       @logger.info("出勤目標を設定: #{fmt(in_target)}")
 
-      out = plan_clock_out(date: today, events: :fetch)
+      out = plan_clock_out(date: today, events: fetched[:events], error: fetched[:error])
       set_out_plan(out, now)
       reschedule_wakes(now)
     end
 
     # refresh 間隔ごとに sukesan を再取得して退勤目標を再計算する。
+    # 再取得結果にまず休暇判定を適用し、検知したら残りの打刻を中止する。
     def refresh_if_due(now)
+      return if @leave_event # 休暇日は打刻計画がなく、再取得も停止する
+      return unless @config.calendar_enabled
       return unless @punch_plans.key?(:out)
       return if @punch_plans[:out].done? # 退勤済みなら再取得不要
 
       interval = @config.calendar_refresh_interval_minutes * 60
       return if @last_refresh_at && (now - @last_refresh_at) < interval
 
-      out = plan_clock_out(date: now.to_date, events: :fetch)
+      fetched = fetch_events(now.to_date)
+      return if switch_to_leave_day?(fetched[:events], now)
+
+      out = plan_clock_out(date: now.to_date, events: fetched[:events], error: fetched[:error])
       before = @punch_plans[:out].target_at
       set_out_plan(out, now)
       after = @punch_plans[:out].target_at
@@ -160,6 +224,8 @@ module Ak4Punch
 
     # due（目標<=現在<=目標+grace）の打刻を実行。grace 超過は警告してスキップ扱いにする。
     def fire_due_punches(now)
+      return if @leave_event # 休暇日は打刻しない
+
       grace = @config.daemon_late_grace_minutes * 60
       transitioned = false
       KINDS.each do |kind|
@@ -192,18 +258,24 @@ module Ak4Punch
     # 退勤打刻の直前チェック。sukesan を強制再取得して退勤目標を再計算し、
     # 目標が現在より後ろへ動いていたら計画を更新して打刻を延期する（done にしない。
     # 新目標で改めて due になったら、その時も最終チェックが走る）。
-    # 戻り値: true = 延期（この tick では打刻しない） / false = このまま打刻してよい。
+    # 直前に休暇イベントが入っていた場合は打刻を中止して休暇日に切り替える。
+    # 戻り値: true = 延期/中止（この tick では打刻しない） / false = このまま打刻してよい。
     def postpone_out_by_final_check?(now)
       return false unless @config.calendar_enabled # 連動OFFは最終チェックなし
 
-      out = plan_clock_out(date: now.to_date, events: :fetch)
+      fetched = fetch_events(now.to_date)
 
       # 再取得失敗は安全側（打刻機会を逃さない）に倒し、現在の目標のまま打刻する。
       # 計画も更新しない（フォールバック値で目標を上書きしない）。
-      if out[:error]
+      if fetched[:error]
         @logger.warn("退勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します")
         return false
       end
+
+      # まず休暇判定（検知したら以降の打刻を中止）。
+      return true if switch_to_leave_day?(fetched[:events], now)
+
+      out = plan_clock_out(date: now.to_date, events: fetched[:events])
 
       # 目標が不変・前倒しなら、いま打刻するのが正しい（grace の再判定はしない）。
       return false if out[:target] <= now
@@ -212,6 +284,36 @@ module Ak4Punch
       set_out_plan(out, now) # 「退勤目標を更新」ログが出る
       reschedule_wakes(now)  # 起床予約も新目標で取り直す
       true
+    end
+
+    # 取得済みイベントに休暇判定を適用し、検知したら未実行の打刻計画を破棄して
+    # 休暇日に切り替える。戻り値: true = 休暇日に切り替えた。
+    def switch_to_leave_day?(events, now)
+      return false if events.nil?
+
+      leave = detect_leave(events)
+      return false unless leave
+
+      @leave_event = leave
+      @punch_plans = {}
+      @logger.warn("休暇イベント『#{leave.title}』を検知したため、以降の打刻を中止します。" \
+                   "打刻済みの分は手動で削除してください")
+      reschedule_wakes(now) # 当日分の予約を整理（翌営業日ブートストラップのみ残る）
+      true
+    end
+
+    # sukesan から指定日のイベントを取得する。失敗時は events: nil + error(メッセージ)。
+    def fetch_events(date)
+      { events: @calendar_client.events(date: date), error: nil }
+    rescue CalendarClient::ApiError => e
+      { events: nil, error: e.message }
+    end
+
+    def detect_leave(events)
+      LeaveDetector.new(
+        keywords: @config.calendar_leave_keywords,
+        min_duration_hours: @config.calendar_leave_min_duration_hours,
+      ).detect(events)
     end
 
     # 実際の打刻。トークン更新（CLI#run_punch 相当）→ Stamper#punch（window=0 で即時）。
@@ -253,37 +355,26 @@ module Ak4Punch
       nil
     end
 
-    # 退勤の目標時刻を計算する。events==:fetch なら sukesan から取得（失敗時はフォールバック）。
+    # 退勤の目標時刻を計算する。events は取得済みイベント配列
+    # （nil は未取得＝連動OFF、または取得失敗。失敗時は error にメッセージ）。
+    # 取得自体は呼び出し側が fetch_events で行い、休暇判定と共用する。
     # 返り値: { target:, plan:(Plan or nil), summary:(String), error:(String or nil) }
-    def plan_clock_out(date:, events:)
+    def plan_clock_out(date:, events:, error: nil)
       default = clock_out_default_at(date)
 
-      # 連動OFFなら sukesan には一切アクセスせず所定時刻（+揺らぎ）を使う。
+      # 連動OFFなら所定時刻（+揺らぎ）を使う（sukesan にはアクセスしない前提）。
       unless @config.calendar_enabled
         return { target: apply_jitter(default, date, :out), plan: nil,
                  summary: "カレンダー連動OFF（所定時刻）", error: nil }
       end
 
-      error = nil
-      evs =
-        if events == :fetch
-          begin
-            @calendar_client.events(date: date)
-          rescue CalendarClient::ApiError => e
-            error = e.message
-            nil
-          end
-        else
-          events
-        end
-
-      if evs.nil?
+      if events.nil?
         @logger&.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定退勤時刻へフォールバックします。")
         summary = "sukesan 障害のため所定時刻へフォールバック"
         return { target: apply_jitter(default, date, :out), plan: nil, summary: summary, error: error }
       end
 
-      plan = build_out_plan(evs, date, default)
+      plan = build_out_plan(events, date, default)
       summary =
         if plan.source == :calendar
           "採用: #{event_label(plan.adopted_event)}"
