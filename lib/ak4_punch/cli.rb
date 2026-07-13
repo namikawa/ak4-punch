@@ -300,6 +300,8 @@ module Ak4Punch
         client: app[:client],
         wake_scheduler: WakeScheduler.new(lead_minutes: cfg.daemon_wake_lead_minutes, logger: app[:logger]),
         logger: app[:logger],
+        # URL 未設定なら no-op の通知器になる（異常時のみ Slack 通知）。
+        notifier: SlackNotifier.new(webhook_url: cfg.slack_webhook_url, logger: app[:logger]),
       )
     end
 

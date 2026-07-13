@@ -10,9 +10,12 @@ module Ak4Punch
   #   - 退勤 = ClockOutPlanner（カレンダー連動）+ 揺らぎ
   #   - 15分毎に sukesan を再取得して退勤目標を再計算し、変わったら再スケジュール
   #   - tick 毎に due（目標<=現在<=目標+grace）を判定し、範囲内なら打刻。
-  #     grace 超過は打刻せず警告（スリープ寝過ごし時の誤時刻打刻ガード）。
+  #     打刻失敗は grace 窓内で tick 毎にリトライし、窓超過で諦めて通知する。
+  #     due 到達時点で既に grace 超過（寝過ごし）なら打刻せず警告＋通知（誤時刻打刻ガード）。
   #   - カレンダーに休暇イベント（キーワード部分一致＋終日 or 一定時間以上）を
   #     検知したら、その日は打刻しない（AKASHI は休暇申請日でも打刻を受理するため）。
+  #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害）のみ
+  #     Slack に通知する。成功・休暇検知・目標変更は通知しない。
   #   - 長い sleep はせず tick で進める（Mac スリープ復帰後に正しく追随するため）。
   class Daemon
     KINDS = %i[in out].freeze
@@ -20,7 +23,11 @@ module Ak4Punch
     KIND_SALT = { in: 0x1111, out: 0x2222 }.freeze
 
     # 1日分の打刻計画（1 kind 分）。
-    PunchPlan = Struct.new(:kind, :target_at, :done, :plan_detail, keyword_init: true) do
+    #   attempted:     窓内で打刻を試行したか（寝過ごしスキップとリトライ枯渇の区別用）
+    #   last_error:    最後の打刻失敗のエラー内容（枯渇通知に含める）
+    #   final_checked: この目標に対して退勤直前チェックを実施済みか（リトライ中は再実行しない）
+    PunchPlan = Struct.new(:kind, :target_at, :done, :plan_detail,
+                           :attempted, :last_error, :final_checked, keyword_init: true) do
       def done? = done == true
     end
 
@@ -47,6 +54,7 @@ module Ak4Punch
     #   sleeper: ->(sec) 実際の待機（既定 Kernel#sleep）
     def initialize(config:, stamper:, calendar:, calendar_client:, token_store:, client:,
                    wake_scheduler:, logger:,
+                   notifier: SlackNotifier.new(webhook_url: nil),
                    clock: -> { Ak4Punch.now }, sleeper: Kernel.method(:sleep))
       @config = config
       @stamper = stamper
@@ -56,6 +64,7 @@ module Ak4Punch
       @client = client
       @wake_scheduler = wake_scheduler
       @logger = logger
+      @notifier = notifier
       @clock = clock
       @sleeper = sleeper
 
@@ -63,6 +72,7 @@ module Ak4Punch
       @punch_plans = {}         # kind => PunchPlan（対象日のみ）
       @leave_event = nil        # 検知した休暇イベント（非nilの間、当日は「休暇日」として打刻しない）
       @last_refresh_at = nil    # 最後に sukesan を再取得した時刻
+      @notified_keys = []       # 当日通知済みのイベント種別（同日デデュープ用。日付変化でリセット）
       @recheck_requested = false # SIGUSR1（punch recheck）による再計画要求フラグ
       @running = false
     end
@@ -154,6 +164,7 @@ module Ak4Punch
       @punch_plans = {}
       @leave_event = nil
       @last_refresh_at = nil
+      @notified_keys = [] # 同日デデュープを日付変化でリセット
       @wake_scheduler.reset!
 
       reason = @calendar.reason(today)
@@ -167,6 +178,7 @@ module Ak4Punch
       # sukesan の取得は1回だけ行い、休暇判定と退勤計画で共用する（二重 fetch 回避）。
       # 取得失敗時は休暇判定不能のため通常営業日として扱う（退勤は所定時刻フォールバック）。
       fetched = @config.calendar_enabled ? fetch_events(today) : { events: nil, error: nil }
+      notify_sukesan_fallback(fetched[:error]) if fetched[:error]
       if fetched[:events] && (leave = detect_leave(fetched[:events]))
         @leave_event = leave
         @logger.info("休暇イベント『#{leave.title}』を検知したため、本日は打刻しません")
@@ -196,6 +208,7 @@ module Ak4Punch
       return if @last_refresh_at && (now - @last_refresh_at) < interval
 
       fetched = fetch_events(now.to_date)
+      notify_sukesan_fallback(fetched[:error]) if fetched[:error]
       return if switch_to_leave_day?(fetched[:events], now)
 
       out = plan_clock_out(date: now.to_date, events: fetched[:events], error: fetched[:error])
@@ -207,22 +220,31 @@ module Ak4Punch
     end
 
     # 退勤計画を @punch_plans[:out] に反映する。
+    # 目標が同じならリトライ状態（attempted/last_error/final_checked）を引き継ぎ、
+    # 目標が変わったらリセットする（新目標では改めて最終チェック→打刻の順で進む）。
     def set_out_plan(out, now)
       @last_refresh_at = now
       target = out[:target]
       existing = @punch_plans[:out]
+      same_target = !existing.nil? && existing.target_at == target
 
-      if existing && existing.target_at != target
+      if existing && !same_target
         @logger.info("退勤目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{out[:summary]}）")
       elsif existing.nil?
         @logger.info("退勤目標を設定: #{fmt(target)}（#{out[:summary]}）")
       end
 
-      done = existing&.done? || false
-      @punch_plans[:out] = PunchPlan.new(kind: :out, target_at: target, done: done, plan_detail: out[:summary])
+      @punch_plans[:out] = PunchPlan.new(
+        kind: :out, target_at: target, done: existing&.done? || false, plan_detail: out[:summary],
+        attempted: same_target ? existing.attempted : false,
+        last_error: same_target ? existing.last_error : nil,
+        final_checked: same_target ? existing.final_checked : false,
+      )
     end
 
-    # due（目標<=現在<=目標+grace）の打刻を実行。grace 超過は警告してスキップ扱いにする。
+    # due（目標<=現在<=目標+grace）の打刻を実行。
+    # 失敗は grace 窓内で tick 毎にリトライし、窓超過で諦めて通知する。
+    # due 到達時点で既に窓超過（未試行＝寝過ごし）なら打刻せず警告＋通知する。
     def fire_due_punches(now)
       return if @leave_event # 休暇日は打刻しない
 
@@ -234,25 +256,51 @@ module Ak4Punch
         next if now < pp.target_at # まだ
 
         if now > pp.target_at + grace
-          @logger.warn("#{label(kind)}目標 #{fmt(pp.target_at)} を#{@config.daemon_late_grace_minutes}分超過（現在 #{fmt(now)}）。" \
-                       "誤時刻打刻を避けるため打刻せずスキップします。")
-          pp.done = true
+          give_up_punch(pp, now)
           transitioned = true
           next
         end
 
-        # 退勤は打刻直前にカレンダーを最終再取得し、直前の会議延長に追随する
-        # （再取得間隔を広げても直前の延長を取りこぼさないための最終チェック）。
-        next if kind == :out && postpone_out_by_final_check?(now)
+        # 退勤は打刻直前にカレンダーを最終再取得し、直前の会議延長に追随する。
+        # 同一目標に対しては初回 due 時のみ実施し、リトライ中は打刻だけを再試行する
+        # （30秒毎に sukesan を叩かない）。目標が変わったら新目標で改めて実施する。
+        if kind == :out && !pp.final_checked
+          next if postpone_out_by_final_check?(now)
 
-        execute_punch(kind, now)
-        pp.done = true
-        transitioned = true
+          pp.final_checked = true
+        end
+
+        ok, error = execute_punch(kind, now)
+        if ok
+          pp.done = true
+          transitioned = true
+        else
+          # done にせず次の tick で再試行（窓＝grace が自然な上限になる）。
+          pp.attempted = true
+          pp.last_error = error
+        end
       end
 
-      # 打刻完了/graceスキップで done へ遷移したら、残り目標＋ブートストラップで予約し直す
+      # 打刻完了/断念で done へ遷移したら、残り目標＋ブートストラップで予約し直す
       # （当日分の縮小を反映しつつ、翌営業日朝の起床予約を維持する）。
       reschedule_wakes(now) if transitioned
+    end
+
+    # grace 窓を超過した打刻を断念する。未試行（寝過ごし）とリトライ枯渇で文言を分けて通知する。
+    def give_up_punch(pp, now)
+      grace_min = @config.daemon_late_grace_minutes
+      if pp.attempted
+        @logger.warn("#{label(pp.kind)}打刻はリトライ上限（目標+#{grace_min}分）に達したため諦めます" \
+                     "（最後のエラー: #{pp.last_error}）。")
+        @notifier.notify("#{label(pp.kind)}打刻に失敗しました（最後のエラー: #{pp.last_error}）。" \
+                         "AKASHI で手動打刻してください")
+      else
+        @logger.warn("#{label(pp.kind)}目標 #{fmt(pp.target_at)} を#{grace_min}分超過（現在 #{fmt(now)}）。" \
+                     "誤時刻打刻を避けるため打刻せずスキップします。")
+        @notifier.notify("#{label(pp.kind)}打刻をスキップしました" \
+                         "（目標 #{pp.target_at.strftime('%H:%M')} を#{grace_min}分超過）。AKASHI で手動打刻してください")
+      end
+      pp.done = true
     end
 
     # 退勤打刻の直前チェック。sukesan を強制再取得して退勤目標を再計算し、
@@ -318,15 +366,43 @@ module Ak4Punch
 
     # 実際の打刻。トークン更新（CLI#run_punch 相当）→ Stamper#punch（window=0 で即時）。
     # 揺らぎは目標時刻に織込済みのため window は 0 で呼ぶ。冪等・対象日判定は Stamper に委ねる。
+    # 戻り値: [成功(true/false), エラー内容(String or nil)]。
+    # 成功には「打刻済みで冪等スキップ」も含む。失敗（例外）は呼び出し側がリトライする。
     def execute_punch(kind, now)
       if @token_store.needs_refresh?(now: now)
         @logger.info("トークンの有効期限が近いため再発行します")
-        @token_store.refresh!(@client)
+        begin
+          @token_store.refresh!(@client)
+        rescue StandardError => e
+          message = "トークン再発行失敗: #{e.class}: #{e.message}"
+          @logger.error("#{message}。次の tick で再試行します。")
+          # リトライ毎に鳴らさないよう同日1回だけ通知する。
+          notify_once(:token_refresh_failed,
+                      "トークンの再発行に失敗しました（#{e.message}）。マイページでの再発行が必要かもしれません")
+          return [false, message]
+        end
       end
 
       @stamper.punch(kind: kind, date: now.to_date, window_minutes: 0)
+      [true, nil]
     rescue StandardError => e
-      @logger.error("#{label(kind)}の打刻に失敗: #{e.class}: #{e.message}")
+      message = "#{e.class}: #{e.message}"
+      @logger.error("#{label(kind)}の打刻に失敗: #{message}。次の tick で再試行します。")
+      [false, message]
+    end
+
+    # 同日1回だけ通知する（デデュープ。@notified_keys は日付変化でリセット）。
+    def notify_once(key, message)
+      return if @notified_keys.include?(key)
+
+      @notified_keys << key
+      @notifier.notify(message)
+    end
+
+    # sukesan 障害による所定時刻フォールバックの通知（30分毎の再取得失敗で連打しない）。
+    def notify_sukesan_fallback(error)
+      notify_once(:sukesan_fallback,
+                  "sukesan からのイベント取得に失敗し、退勤は所定時刻にフォールバックしています（#{error}）")
     end
 
     # 残っている（未実行の）当日打刻目標＋ブートストラップ目標について wake を予約し直す。
