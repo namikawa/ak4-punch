@@ -14,8 +14,11 @@ module Ak4Punch
   class SlackNotifier
     PREFIX = "[ak4-punch]"
 
-    def initialize(webhook_url:, logger: nil, open_timeout: 5, read_timeout: 5)
+    # mention: 通知の先頭に付けるメンション（例: "<@U04XXXXXX>"）。nil/空なら付けない。
+    # プライベートチャンネル運用でも確実にプッシュ通知を飛ばすためのオプション。
+    def initialize(webhook_url:, mention: nil, logger: nil, open_timeout: 5, read_timeout: 5)
       @webhook_url = webhook_url
+      @mention = normalize_mention(mention)
       @logger = logger
       @open_timeout = open_timeout
       @read_timeout = read_timeout
@@ -37,7 +40,8 @@ module Ak4Punch
 
       req = Net::HTTP::Post.new(uri)
       req["Content-Type"] = "application/json"
-      req.body = JSON.generate(text: "#{PREFIX} #{message}")
+      text = [@mention, PREFIX, message].compact.join(" ")
+      req.body = JSON.generate(text: text)
 
       res = http.request(req)
       unless res.code.to_i.between?(200, 299)
@@ -45,6 +49,19 @@ module Ak4Punch
       end
     rescue StandardError => e
       @logger&.warn("Slack通知に失敗しました（#{e.class}: #{e.message}）。打刻処理は継続します。")
+    end
+
+    private
+
+    # メンション文字列を正規化する。素のメンバーID（U.../W...、先頭@も許容）が
+    # 渡された場合は <@ID> 形式に整形する（.env 設定ミスの救済）。
+    # "<@U...>" や "<!channel>" のような正しい形式はそのまま使う。
+    def normalize_mention(mention)
+      m = mention.to_s.strip
+      return nil if m.empty?
+      return "<@#{m.delete_prefix('@')}>" if m.match?(/\A@?[UW][A-Z0-9]+\z/)
+
+      m
     end
   end
 end

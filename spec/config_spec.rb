@@ -178,5 +178,13 @@ RSpec.describe Ak4Punch::Config do
       cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
       expect(cfg.slack_webhook_url).to be_nil
     end
+
+    it "slack_mention は環境変数(SLACK_MENTION)から読む（未設定なら nil）" do
+      ENV["SLACK_MENTION"] = "<@U04XXXXXX>"
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.slack_mention).to eq "<@U04XXXXXX>"
+    ensure
+      ENV.delete("SLACK_MENTION")
+    end
   end
 end

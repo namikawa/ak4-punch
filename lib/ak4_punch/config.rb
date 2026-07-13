@@ -37,7 +37,7 @@ module Ak4Punch
                 :calendar_leave_keywords, :calendar_leave_min_duration_hours,
                 :daemon_tick_seconds, :daemon_wake_lead_minutes,
                 :daemon_manage_wake, :daemon_late_grace_minutes,
-                :slack_webhook_url
+                :slack_webhook_url, :slack_mention
 
     def self.load(config_path:, root:)
       EnvFile.load(File.join(root, ".env"))
@@ -79,6 +79,8 @@ module Ak4Punch
 
       # Slack Incoming Webhook URL（機密・.env のみ）。未設定なら通知機能は無効。
       @slack_webhook_url = ENV["SLACK_WEBHOOK_URL"]
+      # 通知に付けるメンション（例: <@U04XXXXXX>）。任意・未設定なら付けない。
+      @slack_mention = ENV["SLACK_MENTION"]
 
       # カレンダー連動（退勤時刻の動的決定）の振る舞い。
       cal = data["calendar"] || {}
