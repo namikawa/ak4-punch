@@ -36,7 +36,8 @@ module Ak4Punch
                 :calendar_enabled, :calendar_exclude_keywords, :calendar_refresh_interval_minutes,
                 :calendar_leave_keywords, :calendar_leave_min_duration_hours,
                 :daemon_tick_seconds, :daemon_wake_lead_minutes,
-                :daemon_manage_wake, :daemon_late_grace_minutes
+                :daemon_manage_wake, :daemon_late_grace_minutes,
+                :slack_webhook_url
 
     def self.load(config_path:, root:)
       EnvFile.load(File.join(root, ".env"))
@@ -75,6 +76,9 @@ module Ak4Punch
       # sukesan 接続情報（機密）は .env から。BASE_URL は既定でループバック。
       @sukesan_base_url = env_or(data, "SUKESAN_BASE_URL", "sukesan_base_url") || DEFAULT_SUKESAN_BASE_URL
       @sukesan_api_key  = ENV["SUKESAN_API_KEY"]
+
+      # Slack Incoming Webhook URL（機密・.env のみ）。未設定なら通知機能は無効。
+      @slack_webhook_url = ENV["SLACK_WEBHOOK_URL"]
 
       # カレンダー連動（退勤時刻の動的決定）の振る舞い。
       cal = data["calendar"] || {}

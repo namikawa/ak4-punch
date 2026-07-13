@@ -31,6 +31,7 @@ RSpec.describe Ak4Punch::Daemon do
   let(:client) { instance_double(Ak4Punch::Client) }
   let(:wake_scheduler) { instance_double(Ak4Punch::WakeScheduler) }
   let(:logger) { instance_double(Logger, info: nil, warn: nil, error: nil) }
+  let(:notifier) { instance_double(Ak4Punch::SlackNotifier, notify: nil) }
 
   # 現在時刻を手で進められるクロック
   let(:clock_time) { { now: t("08:00") } }
@@ -47,7 +48,7 @@ RSpec.describe Ak4Punch::Daemon do
     described_class.new(
       config: config, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
       token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
-      clock: clock, sleeper: ->(_s) {},
+      notifier: notifier, clock: clock, sleeper: ->(_s) {},
     )
   end
 
@@ -281,6 +282,123 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
+  describe "打刻リトライと通知" do
+    it "打刻失敗は done にせず次の tick で再試行し、成功したら完了する（通知なし）" do
+      allow(calendar_client).to receive(:events).and_return([])
+      calls = 0
+      allow(stamper).to receive(:punch) do
+        calls += 1
+        raise Ak4Punch::Client::ApiError, "一時エラー" if calls == 1
+
+        :ok
+      end
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 1回目: 失敗（done にならない）
+      expect(logger).to have_received(:error).with(/出勤の打刻に失敗.*再試行/)
+
+      clock_time[:now] = t("09:30", 35)
+      daemon.tick # 2回目: 成功
+      expect(stamper).to have_received(:punch).twice
+      expect(notifier).not_to have_received(:notify)
+
+      clock_time[:now] = t("09:31", 5)
+      daemon.tick # done 済み → 再打刻しない
+      expect(stamper).to have_received(:punch).twice
+    end
+
+    it "窓内のリトライが尽きたら枯渇の文言で通知して諦める" do
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(stamper).to receive(:punch).and_raise(Ak4Punch::Client::ApiError, "HTTP 500")
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 失敗1
+      clock_time[:now] = t("09:35")
+      daemon.tick # 失敗2
+      clock_time[:now] = t("09:41") # 窓（grace 10分）超過
+      daemon.tick
+
+      expect(logger).to have_received(:warn).with(/出勤打刻はリトライ上限.*諦めます.*HTTP 500/)
+      expect(notifier).to have_received(:notify)
+        .with(/出勤打刻に失敗しました.*最後のエラー.*HTTP 500.*AKASHI で手動打刻してください/).once
+
+      # 諦めた後は打刻しない
+      punched = 0
+      allow(stamper).to receive(:punch) { punched += 1 }
+      clock_time[:now] = t("09:42")
+      daemon.tick
+      expect(punched).to eq 0
+    end
+
+    it "未試行の寝過ごしはスキップの文言で通知する" do
+      allow(calendar_client).to receive(:events).and_return([])
+      expect(stamper).not_to receive(:punch).with(hash_including(kind: :in))
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = t("09:41") # due 到達時点で既に grace 超過・未試行
+      daemon.tick
+
+      expect(notifier).to have_received(:notify)
+        .with(/出勤打刻をスキップしました.*09:30.*10分超過.*AKASHI で手動打刻してください/).once
+    end
+
+    it "Stamper の冪等スキップ（例外なし）は成功として完了する（通知なし）" do
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(stamper).to receive(:punch)
+        .and_return(Ak4Punch::Stamper::Result.new(status: :skipped, kind: :in, type: 11, message: "打刻済み"))
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+
+      clock_time[:now] = t("09:31")
+      daemon.tick # done 済み → 再試行しない
+      expect(stamper).to have_received(:punch).once
+      expect(notifier).not_to have_received(:notify)
+    end
+
+    it "トークン再発行失敗は打刻失敗としてリトライし、通知は同日1回だけ" do
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(token_store).to receive(:needs_refresh?).and_return(true)
+      allow(token_store).to receive(:refresh!).and_raise(RuntimeError, "トークン失効")
+      expect(stamper).not_to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 失敗1（通知）
+      clock_time[:now] = t("09:30", 35)
+      daemon.tick # 失敗2（リトライは継続・通知なし）
+
+      expect(token_store).to have_received(:refresh!).twice
+      expect(notifier).to have_received(:notify)
+        .with(/トークンの再発行に失敗しました.*トークン失効.*マイページでの再発行/).once
+    end
+
+    it "sukesan フォールバック通知は同日1回だけ（再取得の失敗で連打しない）" do
+      allow(calendar_client).to receive(:events)
+        .and_raise(Ak4Punch::CalendarClient::ApiError, "接続拒否")
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画時失敗 → 通知1回目
+      clock_time[:now] = t("08:20") # refresh 間隔(15分)経過 → 再取得も失敗
+      daemon.tick
+      clock_time[:now] = t("08:40")
+      daemon.tick
+
+      expect(notifier).to have_received(:notify)
+        .with(/sukesan からのイベント取得に失敗し、退勤は所定時刻にフォールバック.*接続拒否/).once
+    end
+  end
+
   describe "退勤直前の最終チェック" do
     # 定期 refresh の干渉を避けるため間隔を大きくし、due 時の fetch が最終チェック由来であることを保証する
     let(:config) do
@@ -391,6 +509,35 @@ RSpec.describe Ak4Punch::Daemon do
       expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0)
       clock_time[:now] = t("18:00", 5)
       d.tick # due → 最終チェックなし → そのまま打刻
+    end
+
+    it "退勤リトライ中は最終チェックを再実行しない（同一目標では初回 due 時のみ）" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+      out_calls = 0
+      allow(stamper).to receive(:punch) do |kind:, **|
+        if kind == :out
+          out_calls += 1
+          raise Ak4Punch::Client::ApiError, "一時エラー" if out_calls <= 2
+        end
+        :ok
+      end
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成（fetch 1回目）
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻（最終チェックなし）
+
+      clock_time[:now] = t("18:30", 10)
+      daemon.tick # 退勤 due → 最終チェック（fetch 2回目）→ 打刻失敗1
+      clock_time[:now] = t("18:30", 40)
+      daemon.tick # リトライ: fetch なしで打刻失敗2
+      clock_time[:now] = t("18:31", 10)
+      daemon.tick # リトライ: fetch なしで打刻成功
+
+      expect(calendar_client).to have_received(:events).twice
+      expect(out_calls).to eq 3
+      expect(notifier).not_to have_received(:notify)
     end
 
     it "最終チェックで休暇イベントを検知したら打刻を中止する" do

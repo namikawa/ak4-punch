@@ -164,4 +164,19 @@ RSpec.describe Ak4Punch::Config do
       expect(cfg.calendar_leave_keywords).to eq []
     end
   end
+
+  describe "Slack 通知設定" do
+    it "slack_webhook_url は環境変数(SLACK_WEBHOOK_URL)から読む" do
+      ENV["SLACK_WEBHOOK_URL"] = "https://hooks.slack.com/services/T000/B000/XXXX"
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.slack_webhook_url).to eq "https://hooks.slack.com/services/T000/B000/XXXX"
+    ensure
+      ENV.delete("SLACK_WEBHOOK_URL")
+    end
+
+    it "未設定なら nil（通知は無効）" do
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.slack_webhook_url).to be_nil
+    end
+  end
 end
