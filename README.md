@@ -40,8 +40,8 @@ bundle exec bin/punch plan
 # 5) pmset 自動起床を sudoers で許可（出力の1行を visudo で設置）
 bundle exec bin/punch sudoers
 
-# 6) LaunchAgent として常駐登録（出力の plist を設置して launchctl load）
-bundle exec bin/punch launchd
+# 6) LaunchAgent として常駐登録（plist 設置と launchctl 登録・起動を自動実行）
+bin/daemonctl install
 ```
 
 > `.env` / `config/config.yml` / `config/token.json` は `.gitignore` 済みです。
@@ -52,6 +52,8 @@ bundle exec bin/punch launchd
 bundle exec bin/punch plan      # 当日（--date=YYYY-MM-DD）の打刻計画・休暇判定を表示
 bundle exec bin/punch status    # 打刻状況を表示（--date=YYYY-MM-DD）
 bundle exec bin/punch recheck   # 稼働中デーモンに当日計画の再チェックを要求（SIGUSR1）
+bin/daemonctl status            # デーモンの稼働状態・ログ末尾・起床予約を表示
+bin/daemonctl restart           # デーモンを再起動（start/stop/log もあり）
 ```
 
 - 休暇の入れ方: カレンダーに「休暇」等のキーワードを含む「終日 or 4時間以上」のイベントを入れるだけ。`schedule.exclude_dates` は補助として使えます。

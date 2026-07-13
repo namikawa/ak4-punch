@@ -156,43 +156,18 @@ module Ak4Punch
       abort "エラー: #{e.message}"
     end
 
-    desc "launchd", "LaunchAgent plist と設置手順を出力（cron+pmset の後継・推奨）"
+    desc "launchd", "LaunchAgent plist と設置手順を出力（bin/daemonctl install が利用）"
+    method_option :plist_only, type: :boolean, default: false,
+                               desc: "plist XML のみを出力（ガイド文なし。daemonctl install 用）"
     def launchd
       root = project_root
-      ruby_bindir = File.dirname(RbConfig.ruby)
-      exec_path = File.join(root, "bin", "punch")
-      plist = <<~PLIST
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-          <key>Label</key>
-          <string>com.ak4punch.daemon</string>
-          <key>ProgramArguments</key>
-          <array>
-            <string>#{exec_path}</string>
-            <string>daemon</string>
-          </array>
-          <key>WorkingDirectory</key>
-          <string>#{root}</string>
-          <key>EnvironmentVariables</key>
-          <dict>
-            <key>PATH</key>
-            <string>#{ruby_bindir}:/usr/bin:/bin:/usr/sbin:/sbin</string>
-            <key>LANG</key>
-            <string>ja_JP.UTF-8</string>
-          </dict>
-          <key>RunAtLoad</key>
-          <true/>
-          <key>KeepAlive</key>
-          <true/>
-          <key>StandardOutPath</key>
-          <string>#{root}/punch.log</string>
-          <key>StandardErrorPath</key>
-          <string>#{root}/punch.log</string>
-        </dict>
-        </plist>
-      PLIST
+      plist = build_launchd_plist(root)
+
+      # --plist-only は plist XML だけを出力する（bin/daemonctl install がリダイレクトで使う）。
+      if options[:plist_only]
+        puts plist
+        return
+      end
 
       puts <<~GUIDE
         # ===== LaunchAgent（推奨・常駐デーモン）=====
@@ -330,6 +305,44 @@ module Ak4Punch
 
     def build_calendar_client(cfg)
       CalendarClient.new(base_url: cfg.sukesan_base_url, api_key: cfg.sukesan_api_key)
+    end
+
+    # LaunchAgent plist（デーモン常駐用）。ruby の PATH はビルド時に解決する。
+    def build_launchd_plist(root)
+      ruby_bindir = File.dirname(RbConfig.ruby)
+      exec_path = File.join(root, "bin", "punch")
+      <<~PLIST
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>Label</key>
+          <string>com.ak4punch.daemon</string>
+          <key>ProgramArguments</key>
+          <array>
+            <string>#{exec_path}</string>
+            <string>daemon</string>
+          </array>
+          <key>WorkingDirectory</key>
+          <string>#{root}</string>
+          <key>EnvironmentVariables</key>
+          <dict>
+            <key>PATH</key>
+            <string>#{ruby_bindir}:/usr/bin:/bin:/usr/sbin:/sbin</string>
+            <key>LANG</key>
+            <string>ja_JP.UTF-8</string>
+          </dict>
+          <key>RunAtLoad</key>
+          <true/>
+          <key>KeepAlive</key>
+          <true/>
+          <key>StandardOutPath</key>
+          <string>#{root}/punch.log</string>
+          <key>StandardErrorPath</key>
+          <string>#{root}/punch.log</string>
+        </dict>
+        </plist>
+      PLIST
     end
 
     # `punch plan` の計画を人間可読で出力する。

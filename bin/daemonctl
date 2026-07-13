@@ -1,0 +1,136 @@
+#!/bin/bash
+# ak4-punch デーモン（launchd 常駐）の操作ラッパー。
+# launchd 管理を前提とし、覚えにくい launchctl 操作を日本語サブコマンドに集約する。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LABEL="com.ak4punch.daemon"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$ROOT/punch.log"
+GUI_DOMAIN="gui/$(id -u)"
+
+usage() {
+  cat <<USAGE
+使い方: bin/daemonctl <サブコマンド>
+
+  install   plist を設置して launchd に登録・起動する（冪等・既存 plist は上書き）
+  start     デーモンを起動する（plist 未設置なら install を自動実行）
+  stop      デーモンを停止する（plist は残す）
+  restart   デーモンを再起動する（未起動なら起動）
+  status    稼働状態・ログ末尾・起床予約を表示する
+  log       ログを追尾表示する（tail -f）
+USAGE
+  exit 1
+}
+
+# launchd にロード済みか（稼働有無ではなく登録の有無）
+is_loaded() {
+  launchctl list "$LABEL" >/dev/null 2>&1
+}
+
+# 稼働中の PID（未稼働・未ロードなら空）
+get_pid() {
+  launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l && $1 != "-" { print $1 }'
+}
+
+write_plist() {
+  mkdir -p "$(dirname "$PLIST")"
+  "$ROOT/bin/punch" launchd --plist-only > "$PLIST"
+  echo "plist を設置しました: $PLIST"
+}
+
+cmd_install() {
+  write_plist
+  if is_loaded; then
+    echo "既にロード済みです（再読込は restart を使ってください）"
+  else
+    launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+    echo "launchd に登録して起動しました"
+  fi
+}
+
+cmd_start() {
+  if [ ! -f "$PLIST" ]; then
+    echo "plist が未設置のため install を実行します"
+    cmd_install
+    return
+  fi
+  if is_loaded; then
+    local pid
+    pid="$(get_pid)"
+    echo "起動済みです（PID ${pid:-不明}）"
+  else
+    launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+    echo "起動しました"
+  fi
+}
+
+cmd_stop() {
+  if is_loaded; then
+    launchctl bootout "$GUI_DOMAIN/$LABEL"
+    # bootout は非同期のため、登録解除（＝プロセス終了）の完了を待つ。
+    # デーモンは tick の sleep 中だと終了まで最大 tick_seconds かかる。
+    local i
+    for i in $(seq 1 40); do
+      is_loaded || break
+      sleep 1
+    done
+    if is_loaded; then
+      echo "停止要求を送りましたが完了確認がタイムアウトしました（status で確認してください）"
+    else
+      echo "停止しました（plist は残っています。再開は start）"
+    fi
+  else
+    echo "起動していません"
+  fi
+}
+
+cmd_restart() {
+  if is_loaded; then
+    launchctl kickstart -k "$GUI_DOMAIN/$LABEL"
+    echo "再起動しました"
+  else
+    echo "起動していないため start します"
+    cmd_start
+  fi
+}
+
+cmd_status() {
+  if is_loaded; then
+    local pid
+    pid="$(get_pid)"
+    if [ -n "$pid" ]; then
+      echo "デーモン: 稼働中（PID ${pid}）"
+    else
+      echo "デーモン: ロード済み・プロセスなし（起動待ち/クラッシュの可能性。log を確認）"
+    fi
+  else
+    echo "デーモン: 停止中（start で起動できます）"
+  fi
+
+  echo
+  echo "--- ログ末尾 ($LOG) ---"
+  if [ -f "$LOG" ]; then
+    tail -5 "$LOG"
+  else
+    echo "(ログファイルなし)"
+  fi
+
+  echo
+  echo "--- 起床予約 (pmset -g sched) ---"
+  pmset -g sched | grep "by 'pmset'" || echo "(pmset による起床予約なし)"
+}
+
+cmd_log() {
+  exec tail -f "$LOG"
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  log)     cmd_log ;;
+  *)       usage ;;
+esac
