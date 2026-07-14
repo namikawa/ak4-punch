@@ -31,7 +31,7 @@ RSpec.describe Ak4Punch::Daemon do
   let(:client) { instance_double(Ak4Punch::Client) }
   let(:wake_scheduler) { instance_double(Ak4Punch::WakeScheduler) }
   let(:logger) { instance_double(Logger, info: nil, warn: nil, error: nil) }
-  let(:notifier) { instance_double(Ak4Punch::SlackNotifier, notify: nil) }
+  let(:notifier) { instance_double(Ak4Punch::SlackNotifier, notify: nil, retry_pending: nil) }
 
   # 現在時刻を手で進められるクロック
   let(:clock_time) { { now: t("08:00") } }
@@ -671,6 +671,86 @@ RSpec.describe Ak4Punch::Daemon do
       allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
       day = daemon.build_day_plan(date: date)
       expect(day[:leave_event]).to be_nil
+    end
+  end
+
+  describe "日跨ぎ時の未打刻通知" do
+    it "未完了(退勤)が残ったまま日付を跨いだら警告＋通知し、新しい日の計画は通常どおり作られる" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 7/10 計画: 出勤09:30 / 退勤18:30
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤のみ打刻（退勤は未打刻のまま）
+
+      # 翌日(7/11)の最初の tick で日付切替を検知 → 前日の未完了(退勤)を通知
+      clock_time[:now] = t("08:00", day: 11)
+      daemon.tick
+      expect(logger).to have_received(:warn).with(/昨日（2026-07-10）の退勤が未打刻のまま日付が変わりました/)
+      expect(notifier).to have_received(:notify)
+        .with(/昨日（2026-07-10）の退勤は打刻されませんでした.*未打刻のまま日付が変わりました.*AKASHI で手動申請してください/).once
+      # 出勤は打刻済み(done)なので通知されない
+      expect(notifier).not_to have_received(:notify).with(/出勤は打刻されませんでした/)
+      # 新しい日の計画は通常どおり作られる
+      expect(logger).to have_received(:info).with(/出勤目標を設定/).twice
+    end
+
+    it "前日分が全て done なら通知しない" do
+      allow(calendar).to receive(:target?) { |d| !d.saturday? && !d.sunday? }
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画: 出勤09:30 / 退勤18:00
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤 done
+      clock_time[:now] = t("18:00", 5)
+      daemon.tick # 退勤 done
+
+      clock_time[:now] = t("08:00", day: 11) # 翌日
+      daemon.tick
+      expect(notifier).not_to have_received(:notify)
+      expect(logger).not_to have_received(:warn).with(/未打刻のまま日付が変わりました/)
+    end
+
+    it "前日が休暇日なら計画が無いので通知しない" do
+      leave = event(title: "夏季休暇", ends_at: nil, all_day: true)
+      allow(calendar_client).to receive(:events).and_return([leave])
+      expect(stamper).not_to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 休暇日として計画なし
+
+      clock_time[:now] = t("08:00", day: 11) # 翌日
+      daemon.tick
+      expect(notifier).not_to have_received(:notify)
+      expect(logger).not_to have_received(:warn).with(/未打刻のまま日付が変わりました/)
+    end
+
+    it "前日が非対象日（計画なし）なら通知しない" do
+      allow(calendar).to receive(:reason).and_return("週末")
+      allow(calendar).to receive(:target?).and_return(false)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 非対象日として計画なし
+
+      clock_time[:now] = t("08:00", day: 11)
+      daemon.tick
+      expect(notifier).not_to have_received(:notify)
+    end
+  end
+
+  describe "tick 毎に retry_pending を呼ぶ" do
+    it "各 tick の冒頭で notifier.retry_pending が呼ばれる" do
+      allow(calendar_client).to receive(:events).and_return([])
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = t("08:05")
+      daemon.tick
+      expect(notifier).to have_received(:retry_pending).twice
     end
   end
 
