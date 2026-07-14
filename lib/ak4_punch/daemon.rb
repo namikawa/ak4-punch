@@ -100,6 +100,8 @@ module Ak4Punch
     #   再チェック要求 → 日付変化 → 計画作成 / refresh 間隔 → 退勤再計算 / due 判定 → 打刻。
     def tick
       now = @clock.call
+      # スリープ明け直後の失敗（Wi-Fi 未接続等）を後の tick で拾い直す。無効時は no-op。
+      @notifier.retry_pending
       consume_recheck_request
       ensure_day_plan(now)
       refresh_if_due(now)
@@ -159,6 +161,10 @@ module Ak4Punch
     def ensure_day_plan(now)
       today = now.to_date
       return if @plan_date == today
+
+      # 前日の計画を破棄する前に、未打刻のまま日付を跨いだ分がないか確認して通知する。
+      # 制約: デーモン再起動でメモリ（@punch_plans）が消えるため、再起動を挟いだ場合は検知できない。
+      notify_unpunched_from_previous_day if @plan_date
 
       @plan_date = today
       @punch_plans = {}
@@ -397,6 +403,21 @@ module Ak4Punch
 
       @notified_keys << key
       @notifier.notify(message)
+    end
+
+    # 日付切替時、前日の @punch_plans に未完了（done でない）計画が残っていれば警告＋通知する。
+    # 未打刻のまま一度も起きずに0時を跨いだケース（誤時刻打刻ガードで grace 窓を逃した等）を拾う。
+    # 休暇日は @punch_plans が空なので誤報しない。通知は改修1の pending 機構に乗る
+    # （起床直後で Wi-Fi 未接続でも、後の tick で届く）。
+    def notify_unpunched_from_previous_day
+      prev_date = @plan_date
+      @punch_plans.each_value do |pp|
+        next if pp.done?
+
+        @logger.warn("昨日（#{prev_date}）の#{label(pp.kind)}が未打刻のまま日付が変わりました。")
+        @notifier.notify("昨日（#{prev_date}）の#{label(pp.kind)}は打刻されませんでした" \
+                         "（未打刻のまま日付が変わりました）。AKASHI で手動申請してください")
+      end
     end
 
     # sukesan 障害による所定時刻フォールバックの通知（30分毎の再取得失敗で連打しない）。
