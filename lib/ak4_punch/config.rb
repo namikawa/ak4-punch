@@ -9,9 +9,8 @@ module Ak4Punch
   class Config
     class Error < StandardError; end
 
-    # ランダム打刻ウィンドウの上限（分）と、opt-in時の既定値。
+    # ランダム打刻ウィンドウの上限（分）。
     MAX_WINDOW_MINUTES = 30
-    DEFAULT_RANDOM_WINDOW_MINUTES = 5
 
     # カレンダー連動デーモンの既定値。
     DEFAULT_EXCLUDE_KEYWORDS = %w[会食 懇親会 飲み会 打ち上げ 歓迎会 送別会 忘年会 新年会].freeze
@@ -26,7 +25,7 @@ module Ak4Punch
     DEFAULT_LEAVE_KEYWORDS = %w[休暇 有給 年休 全休 休み].freeze
     DEFAULT_LEAVE_MIN_DURATION_HOURS = 4
 
-    attr_reader :base_url, :company_id, :timezone,
+    attr_reader :base_url, :company_id,
                 :clock_in_time, :clock_out_time,
                 :clock_in_window, :clock_out_window,
                 :weekdays_only, :skip_japanese_holidays,
@@ -48,7 +47,6 @@ module Ak4Punch
     def initialize(data:, root:)
       @base_url   = env_or(data, "AK4_BASE_URL", "base_url") || "https://atnd.ak4.jp/api/cooperation"
       @company_id = env_or(data, "AK4_COMPANY_ID", "company_id")
-      @timezone   = data["timezone"] || Ak4Punch::JST
 
       work = data["work"] || {}
       @clock_in_time  = work["clock_in"]  || "09:30"
