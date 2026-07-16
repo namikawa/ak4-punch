@@ -257,12 +257,12 @@ module Ak4Punch
       grace = @config.daemon_late_grace_minutes * 60
       transitioned = false
       KINDS.each do |kind|
-        pp = @punch_plans[kind]
-        next if pp.nil? || pp.done?
-        next if now < pp.target_at # まだ
+        plan = @punch_plans[kind]
+        next if plan.nil? || plan.done?
+        next if now < plan.target_at # まだ
 
-        if now > pp.target_at + grace
-          give_up_punch(pp, now)
+        if now > plan.target_at + grace
+          give_up_punch(plan, now)
           transitioned = true
           next
         end
@@ -270,20 +270,20 @@ module Ak4Punch
         # 退勤は打刻直前にカレンダーを最終再取得し、直前の会議延長に追随する。
         # 同一目標に対しては初回 due 時のみ実施し、リトライ中は打刻だけを再試行する
         # （30秒毎に sukesan を叩かない）。目標が変わったら新目標で改めて実施する。
-        if kind == :out && !pp.final_checked
+        if kind == :out && !plan.final_checked
           next if postpone_out_by_final_check?(now)
 
-          pp.final_checked = true
+          plan.final_checked = true
         end
 
         ok, error = execute_punch(kind, now)
         if ok
-          pp.done = true
+          plan.done = true
           transitioned = true
         else
           # done にせず次の tick で再試行（窓＝grace が自然な上限になる）。
-          pp.attempted = true
-          pp.last_error = error
+          plan.attempted = true
+          plan.last_error = error
         end
       end
 
@@ -293,20 +293,20 @@ module Ak4Punch
     end
 
     # grace 窓を超過した打刻を断念する。未試行（寝過ごし）とリトライ枯渇で文言を分けて通知する。
-    def give_up_punch(pp, now)
+    def give_up_punch(plan, now)
       grace_min = @config.daemon_late_grace_minutes
-      if pp.attempted
-        @logger.warn("#{label(pp.kind)}打刻はリトライ上限（目標+#{grace_min}分）に達したため諦めます" \
-                     "（最後のエラー: #{pp.last_error}）。")
-        @notifier.notify("#{label(pp.kind)}打刻に失敗しました（最後のエラー: #{pp.last_error}）。" \
+      if plan.attempted
+        @logger.warn("#{label(plan.kind)}打刻はリトライ上限（目標+#{grace_min}分）に達したため諦めます" \
+                     "（最後のエラー: #{plan.last_error}）。")
+        @notifier.notify("#{label(plan.kind)}打刻に失敗しました（最後のエラー: #{plan.last_error}）。" \
                          "AKASHI で手動打刻してください")
       else
-        @logger.warn("#{label(pp.kind)}目標 #{fmt(pp.target_at)} を#{grace_min}分超過（現在 #{fmt(now)}）。" \
+        @logger.warn("#{label(plan.kind)}目標 #{fmt(plan.target_at)} を#{grace_min}分超過（現在 #{fmt(now)}）。" \
                      "誤時刻打刻を避けるため打刻せずスキップします。")
-        @notifier.notify("#{label(pp.kind)}打刻をスキップしました" \
-                         "（目標 #{pp.target_at.strftime('%H:%M')} を#{grace_min}分超過）。AKASHI で手動打刻してください")
+        @notifier.notify("#{label(plan.kind)}打刻をスキップしました" \
+                         "（目標 #{plan.target_at.strftime('%H:%M')} を#{grace_min}分超過）。AKASHI で手動打刻してください")
       end
-      pp.done = true
+      plan.done = true
     end
 
     # 退勤打刻の直前チェック。sukesan を強制再取得して退勤目標を再計算し、
@@ -407,15 +407,15 @@ module Ak4Punch
 
     # 日付切替時、前日の @punch_plans に未完了（done でない）計画が残っていれば警告＋通知する。
     # 未打刻のまま一度も起きずに0時を跨いだケース（誤時刻打刻ガードで grace 窓を逃した等）を拾う。
-    # 休暇日は @punch_plans が空なので誤報しない。通知は改修1の pending 機構に乗る
+    # 休暇日は @punch_plans が空なので誤報しない。通知は SlackNotifier の再送（pending）機構に乗る
     # （起床直後で Wi-Fi 未接続でも、後の tick で届く）。
     def notify_unpunched_from_previous_day
       prev_date = @plan_date
-      @punch_plans.each_value do |pp|
-        next if pp.done?
+      @punch_plans.each_value do |plan|
+        next if plan.done?
 
-        @logger.warn("昨日（#{prev_date}）の#{label(pp.kind)}が未打刻のまま日付が変わりました。")
-        @notifier.notify("昨日（#{prev_date}）の#{label(pp.kind)}は打刻されませんでした" \
+        @logger.warn("昨日（#{prev_date}）の#{label(plan.kind)}が未打刻のまま日付が変わりました。")
+        @notifier.notify("昨日（#{prev_date}）の#{label(plan.kind)}は打刻されませんでした" \
                          "（未打刻のまま日付が変わりました）。AKASHI で手動申請してください")
       end
     end
@@ -466,12 +466,13 @@ module Ak4Punch
       end
 
       if events.nil?
-        @logger&.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定退勤時刻へフォールバックします。")
+        @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定退勤時刻へフォールバックします。")
         summary = "sukesan 障害のため所定時刻へフォールバック"
         return { target: apply_jitter(default, date, :out), plan: nil, summary: summary, error: error }
       end
 
-      plan = build_out_plan(events, date, default)
+      plan = ClockOutPlanner.new(exclude_keywords: @config.calendar_exclude_keywords)
+                            .plan(events: events, date: date, default_clock_out: default)
       summary =
         if plan.source == :calendar
           "採用: #{event_label(plan.adopted_event)}"
@@ -480,11 +481,6 @@ module Ak4Punch
         end
 
       { target: apply_jitter(plan.target_at, date, :out), plan: plan, summary: summary, error: nil }
-    end
-
-    def build_out_plan(events, date, default)
-      ClockOutPlanner.new(exclude_keywords: @config.calendar_exclude_keywords)
-                     .plan(events: events, date: date, default_clock_out: default)
     end
 
     # 出勤の目標時刻 = 所定時刻 + 日毎固定の揺らぎ。

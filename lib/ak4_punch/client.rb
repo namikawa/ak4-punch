@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "net/http"
+require "openssl"
 require "uri"
 require "json"
 require "time"
@@ -74,7 +75,7 @@ module Ak4Punch
       end
 
       parse_response(http.request(req))
-    rescue SocketError, Timeout::Error, Errno::ECONNREFUSED => e
+    rescue SocketError, Timeout::Error, EOFError, OpenSSL::SSL::SSLError, SystemCallError => e
       raise ApiError, "通信エラー: #{e.class}: #{e.message}"
     end
 

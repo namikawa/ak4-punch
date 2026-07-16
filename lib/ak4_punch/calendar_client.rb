@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "net/http"
+require "openssl"
 require "uri"
 require "json"
 require "time"
@@ -71,7 +72,7 @@ module Ak4Punch
       req["Authorization"] = "Bearer #{@api_key}"
 
       parse_response(http.request(req))
-    rescue SocketError, Timeout::Error, Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
+    rescue SocketError, Timeout::Error, EOFError, OpenSSL::SSL::SSLError, SystemCallError => e
       raise ApiError, "sukesan 通信エラー: #{e.class}: #{e.message}"
     end
 

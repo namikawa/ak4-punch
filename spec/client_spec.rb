@@ -53,4 +53,9 @@ RSpec.describe Ak4Punch::Client do
     stub_request(:post, %r{/stamps\z}).to_return(status: 500, body: "oops")
     expect { client.post_stamp(type: 11) }.to raise_error(Ak4Punch::Client::ApiError, /HTTP 500/)
   end
+
+  it "接続リセット(ECONNRESET)も ApiError にラップ" do
+    stub_request(:post, %r{/stamps\z}).to_raise(Errno::ECONNRESET)
+    expect { client.post_stamp(type: 11) }.to raise_error(Ak4Punch::Client::ApiError, /通信エラー/)
+  end
 end

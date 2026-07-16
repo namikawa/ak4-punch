@@ -64,6 +64,11 @@ RSpec.describe Ak4Punch::CalendarClient do
     expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /通信エラー/)
   end
 
+  it "接続リセット(ECONNRESET)も ApiError にラップ" do
+    stub_request(:get, %r{/events}).to_raise(Errno::ECONNRESET)
+    expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /通信エラー/)
+  end
+
   it "JSON不正は ApiError" do
     stub_request(:get, %r{/events}).to_return(status: 200, body: "not json{")
     expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /JSONパース/)
