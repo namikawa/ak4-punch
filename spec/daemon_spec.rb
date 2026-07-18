@@ -219,28 +219,28 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
     end
 
-    it "done へ遷移した tick で予約し直し、遷移が無い tick では予約しない" do
+    it "manage_wake=true なら毎 tick で起床予約を突き合わせる（自己回復のため add-only 呼び出し）" do
       allow(calendar_client).to receive(:events).and_return([])
       allow(stamper).to receive(:punch)
 
       clock_time[:now] = t("08:00")
-      daemon.tick # 計画作成で1回
+      daemon.tick # 計画作成
       expect(wake_scheduler).to have_received(:reschedule).once
 
-      clock_time[:now] = t("08:05") # due なし・refresh 間隔前 → 遷移なし
-      daemon.tick
-      expect(wake_scheduler).to have_received(:reschedule).once # 増えない
-
-      clock_time[:now] = t("09:30", 5) # 出勤 due → done 遷移
+      clock_time[:now] = t("08:05") # due なし・refresh 間隔前でも突き合わせは走る
       daemon.tick
       expect(wake_scheduler).to have_received(:reschedule).twice
+
+      clock_time[:now] = t("09:30", 5) # 出勤 due → done 遷移。ここでも突き合わせる
+      daemon.tick
+      expect(wake_scheduler).to have_received(:reschedule).exactly(3).times
     end
 
-    it "graceスキップによる done 遷移でも予約し直す" do
+    it "grace スキップ（done 遷移）を挟んだ tick でも突き合わせる" do
       allow(calendar_client).to receive(:events).and_return([])
 
       clock_time[:now] = t("08:00")
-      daemon.tick # 計画作成で1回
+      daemon.tick # 計画作成
 
       clock_time[:now] = t("09:41") # 出勤 grace 超過 → スキップ（done 遷移）
       daemon.tick

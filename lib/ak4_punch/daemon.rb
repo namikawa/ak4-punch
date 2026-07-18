@@ -97,7 +97,8 @@ module Ak4Punch
     end
 
     # 1 tick 分の処理（テストから直接呼べる）:
-    #   再チェック要求 → 日付変化 → 計画作成 / refresh 間隔 → 退勤再計算 / due 判定 → 打刻。
+    #   再チェック要求 → 日付変化 → 計画作成 / refresh 間隔 → 退勤再計算 / due 判定 → 打刻
+    #   → 起床予約の突き合わせ。
     def tick
       now = @clock.call
       # スリープ明け直後の失敗（Wi-Fi 未接続等）を後の tick で拾い直す。無効時は no-op。
@@ -106,6 +107,10 @@ module Ak4Punch
       ensure_day_plan(now)
       refresh_if_due(now)
       fire_due_punches(now)
+      # 毎 tick で pmset 起床予約を現状の計画に突き合わせる（add-only・不足分のみ追加）。
+      # 同居デーモンの cancelall などで自分の予約が消えても、次の tick で再追加され自己回復する。
+      # 予約が揃っていれば pmset -g sched の読み取り1回だけで無言終了する軽い処理。
+      reschedule_wakes(now)
     end
 
     # 再チェック要求（SIGUSR1 / punch recheck）。次の tick で当日を完全再計画する。
@@ -176,8 +181,8 @@ module Ak4Punch
       reason = @calendar.reason(today)
       if reason
         @logger.info("#{today} は対象日ではないため計画しません（#{reason}）。翌日を待機します。")
-        # 計画なし＝targets は空。前日の予約が残っていれば消す（manage_wake 有効時のみ pmset に触る）。
-        reschedule_wakes(now)
+        # 計画なし＝当日 targets は空。起床予約は tick 末尾の突き合わせで
+        # 翌営業日ブートストラップのみが維持される（既存の予約は消さない）。
         return
       end
 
@@ -188,7 +193,7 @@ module Ak4Punch
       if fetched[:events] && (leave = detect_leave(fetched[:events]))
         @leave_event = leave
         @logger.info("休暇イベント『#{leave.title}』を検知したため、本日は打刻しません")
-        reschedule_wakes(now) # 計画なし＝翌営業日ブートストラップのみ予約される
+        # 計画なし＝tick 末尾の突き合わせで翌営業日ブートストラップのみが維持される。
         return
       end
 
@@ -199,7 +204,6 @@ module Ak4Punch
 
       out = plan_clock_out(date: today, events: fetched[:events], error: fetched[:error])
       set_out_plan(out, now)
-      reschedule_wakes(now)
     end
 
     # refresh 間隔ごとに sukesan を再取得して退勤目標を再計算する。
@@ -218,11 +222,7 @@ module Ak4Punch
       return if switch_to_leave_day?(fetched[:events], now)
 
       out = plan_clock_out(date: now.to_date, events: fetched[:events], error: fetched[:error])
-      before = @punch_plans[:out].target_at
       set_out_plan(out, now)
-      after = @punch_plans[:out].target_at
-
-      reschedule_wakes(now) if after != before
     end
 
     # 退勤計画を @punch_plans[:out] に反映する。
@@ -255,7 +255,6 @@ module Ak4Punch
       return if @leave_event # 休暇日は打刻しない
 
       grace = @config.daemon_late_grace_minutes * 60
-      transitioned = false
       KINDS.each do |kind|
         plan = @punch_plans[kind]
         next if plan.nil? || plan.done?
@@ -263,7 +262,6 @@ module Ak4Punch
 
         if now > plan.target_at + grace
           give_up_punch(plan, now)
-          transitioned = true
           next
         end
 
@@ -279,17 +277,13 @@ module Ak4Punch
         ok, error = execute_punch(kind, now)
         if ok
           plan.done = true
-          transitioned = true
         else
           # done にせず次の tick で再試行（窓＝grace が自然な上限になる）。
           plan.attempted = true
           plan.last_error = error
         end
       end
-
-      # 打刻完了/断念で done へ遷移したら、残り目標＋ブートストラップで予約し直す
-      # （当日分の縮小を反映しつつ、翌営業日朝の起床予約を維持する）。
-      reschedule_wakes(now) if transitioned
+      # 起床予約の突き合わせは tick 末尾で毎回行う（done への遷移もそこで反映される）。
     end
 
     # grace 窓を超過した打刻を断念する。未試行（寝過ごし）とリトライ枯渇で文言を分けて通知する。
@@ -335,8 +329,7 @@ module Ak4Punch
       return false if out[:target] <= now
 
       @logger.info("退勤直前チェック: 目標が後ろ倒しされたため打刻を延期します")
-      set_out_plan(out, now) # 「退勤目標を更新」ログが出る
-      reschedule_wakes(now)  # 起床予約も新目標で取り直す
+      set_out_plan(out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
       true
     end
 
@@ -352,7 +345,8 @@ module Ak4Punch
       @punch_plans = {}
       @logger.warn("休暇イベント『#{leave.title}』を検知したため、以降の打刻を中止します。" \
                    "打刻済みの分は手動で削除してください")
-      reschedule_wakes(now) # 当日分の予約を整理（翌営業日ブートストラップのみ残る）
+      # 当日 targets が空になる。既存の予約は消さず、tick 末尾の突き合わせで
+      # 翌営業日ブートストラップのみが維持される（残った当日予約は発火しても無害）。
       true
     end
 
@@ -426,7 +420,10 @@ module Ak4Punch
                   "sukesan からのイベント取得に失敗し、退勤は所定時刻にフォールバックしています（#{error}）")
     end
 
-    # 残っている（未実行の）当日打刻目標＋ブートストラップ目標について wake を予約し直す。
+    # 現状の計画（未完了の打刻目標＋翌営業日ブートストラップ）に pmset 起床予約を
+    # 突き合わせ、不足分だけを追加する。tick 末尾から毎回呼ばれる。WakeScheduler は
+    # add-only（不足分のみ追加・何も消さない）なので、揃っていれば読み取り1回で無言終了し、
+    # 消されていれば再追加する。manage_wake=false のときは pmset に一切触らない。
     def reschedule_wakes(now)
       return unless @config.daemon_manage_wake
 
