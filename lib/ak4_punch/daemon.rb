@@ -287,20 +287,42 @@ module Ak4Punch
     end
 
     # grace 窓を超過した打刻を断念する。未試行（寝過ごし）とリトライ枯渇で文言を分けて通知する。
+    # ただし断念・通知の前に AKASHI を read-only で確認し、既に打刻済みなら通知しない
+    # （再起動でメモリ上の done が失われた場合や、窓超過中に手動打刻した場合の誤通知を防ぐ。
+    #  打刻経路の冪等チェックは Stamper 内にあるが、give_up は Stamper を通らないためここで確認する）。
     def give_up_punch(plan, now)
+      if already_stamped?(plan.kind, now.to_date)
+        @logger.info("#{label(plan.kind)}は既にAKASHIで打刻済みのため、スキップ通知は出しません" \
+                     "（目標 #{fmt(plan.target_at)}）。")
+        plan.done = true
+        return
+      end
+
       grace_min = @config.daemon_late_grace_minutes
+      over_min = ((now - plan.target_at) / 60).floor
       if plan.attempted
         @logger.warn("#{label(plan.kind)}打刻はリトライ上限（目標+#{grace_min}分）に達したため諦めます" \
                      "（最後のエラー: #{plan.last_error}）。")
         @notifier.notify("#{label(plan.kind)}打刻に失敗しました（最後のエラー: #{plan.last_error}）。" \
                          "AKASHI で手動打刻してください")
       else
-        @logger.warn("#{label(plan.kind)}目標 #{fmt(plan.target_at)} を#{grace_min}分超過（現在 #{fmt(now)}）。" \
-                     "誤時刻打刻を避けるため打刻せずスキップします。")
+        @logger.warn("#{label(plan.kind)}目標 #{fmt(plan.target_at)} を#{over_min}分超過" \
+                     "（現在 #{fmt(now)}、grace #{grace_min}分）。誤時刻打刻を避けるため打刻せずスキップします。")
         @notifier.notify("#{label(plan.kind)}打刻をスキップしました" \
-                         "（目標 #{plan.target_at.strftime('%H:%M')} を#{grace_min}分超過）。AKASHI で手動打刻してください")
+                         "（目標 #{plan.target_at.strftime('%H:%M')}／現在 #{now.strftime('%H:%M')}・#{over_min}分超過）。" \
+                         "AKASHI で手動打刻してください")
       end
       plan.done = true
+    end
+
+    # 断念・未打刻通知の前の安全確認: この kind の打刻が当日の勤務セッションとして既に済んでいるか。
+    # 判定は Stamper#already_done?（当日の最終打刻＝在席状態で判定）に委譲する。
+    # 取得に失敗した場合は false（確認不能 → 通知する安全側に倒す）。
+    def already_stamped?(kind, date)
+      @stamper.already_done?(kind, date)
+    rescue StandardError => e
+      @logger.warn("打刻済み確認に失敗（#{e.class}: #{e.message}）。確認できないため通知します。")
+      false
     end
 
     # 退勤打刻の直前チェック。sukesan を強制再取得して退勤目標を再計算し、
@@ -406,7 +428,8 @@ module Ak4Punch
     def notify_unpunched_from_previous_day
       prev_date = @plan_date
       @punch_plans.each_value do |plan|
-        next if plan.done?
+        # done でなくても AKASHI に打刻があれば（再起動後の突き合わせ・手動打刻など）通知しない。
+        next if plan.done? || already_stamped?(plan.kind, prev_date)
 
         @logger.warn("昨日（#{prev_date}）の#{label(plan.kind)}が未打刻のまま日付が変わりました。")
         @notifier.notify("昨日（#{prev_date}）の#{label(plan.kind)}は打刻されませんでした" \

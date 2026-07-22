@@ -41,14 +41,21 @@ module Ak4Punch
       # 冪等チェックを待機後に行うことで、待機中の手動打刻も検出できる。
       wait_for_jitter(window, label) if window.positive?
 
-      if @config.check_existing && !force
-        if @client.stamped_types(date: date).include?(type)
-          return result(:skipped, kind, type, "#{date} は既に#{label}打刻済みのためスキップ")
-        end
+      if @config.check_existing && !force && already_done?(kind, date)
+        return result(:skipped, kind, type, "#{date} は既に#{label}打刻済みのためスキップ")
       end
 
       res = @client.post_stamp(type: type)
       result(:punched, kind, type, "#{label}を打刻しました", recorded_at: res[:stamped_at])
+    end
+
+    # 当日の勤務セッションとして、この kind の打刻が既に済んでいるかを AKASHI の当日打刻から判定する。
+    # 「当日に同 type があるか」ではなく当日の最終打刻（在席状態）で判定する:
+    #   出勤(:in) は最終打刻が出勤なら済み / 退勤(:out) は最終打刻が出勤でない（退勤 or 打刻なし）なら済み。
+    # → 前営業日の退勤が当日日付に記録される日跨ぎ勤務でも、当日の出勤・退勤を正しく扱える。
+    def already_done?(kind, date)
+      currently_in = @client.latest_stamp_type(date: date) == TYPE.fetch(:in)
+      kind == :in ? currently_in : !currently_in
     end
 
     private
