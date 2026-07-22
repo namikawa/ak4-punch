@@ -39,9 +39,12 @@ module Ak4Punch
       json.dig("response", "stamps") || []
     end
 
-    # 指定日に存在する打刻種別(type)の一覧。冪等チェック用。
-    def stamped_types(date:)
-      get_stamps(date: date).map { |s| s["type"] }
+    # 当日の最終打刻（stamped_at 昇順の最後）の種別を返す。打刻が無ければ nil。
+    # 冪等・在席判定用。単純な「当日に同 type があるか」ではなくこれを使うことで、
+    # 前営業日の退勤が当日日付に記録される日跨ぎ勤務でも、当日の勤務セッションを正しく判定できる。
+    def latest_stamp_type(date:)
+      latest = get_stamps(date: date).max_by { |s| s["stamped_at"].to_s }
+      latest && latest["type"]
     end
 
     # アクセストークン再発行(6.9)。新 token と有効期限(Time)を返す。

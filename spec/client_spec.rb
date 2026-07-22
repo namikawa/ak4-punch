@@ -27,14 +27,24 @@ RSpec.describe Ak4Punch::Client do
     expect { client.post_stamp(type: 11) }.to raise_error(Ak4Punch::Client::ApiError, /だめ/)
   end
 
-  it "stamped_types は当日の type 一覧を返す" do
+  it "latest_stamp_type は stamped_at が最新の打刻種別を返す（日跨ぎ勤務対応）" do
     stub_request(:get, %r{/soldout/stamps})
       .to_return(status: 200, body: {
         success: true,
-        response: { stamps: [{ "type" => 11, "stamped_at" => "2026/07/08 09:30:01" }, { "type" => 12 }] },
+        response: { stamps: [
+          { "type" => 12, "stamped_at" => "2026/07/08 01:21:25" }, # 前営業日の退勤（順不同で先頭）
+          { "type" => 11, "stamped_at" => "2026/07/08 09:30:30" }, # 当日の出勤（最新）
+        ] },
       }.to_json)
 
-    expect(client.stamped_types(date: Date.new(2026, 7, 8))).to eq [11, 12]
+    expect(client.latest_stamp_type(date: Date.new(2026, 7, 8))).to eq 11
+  end
+
+  it "latest_stamp_type は打刻が無ければ nil" do
+    stub_request(:get, %r{/soldout/stamps})
+      .to_return(status: 200, body: { success: true, response: { stamps: [] } }.to_json)
+
+    expect(client.latest_stamp_type(date: Date.new(2026, 7, 8))).to be_nil
   end
 
   it "reissue_token は新token/有効期限を返す" do
