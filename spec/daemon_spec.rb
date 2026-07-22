@@ -58,7 +58,7 @@ RSpec.describe Ak4Punch::Daemon do
     allow(wake_scheduler).to receive(:reset!)
     allow(wake_scheduler).to receive(:reschedule)
     allow(token_store).to receive(:needs_refresh?).and_return(false)
-    allow(stamper).to receive(:already_done?).and_return(false) # 既定: 当日の打刻は未完了
+    allow(stamper).to receive(:punch_recorded?).and_return(false) # 既定: 当日の打刻は未記録
   end
 
   describe "due 到達で打刻" do
@@ -352,7 +352,7 @@ RSpec.describe Ak4Punch::Daemon do
 
     it "grace 超過でも既にAKASHIで打刻済みならスキップ通知を出さず done にする（再起動時の誤通知防止）" do
       allow(calendar_client).to receive(:events).and_return([])
-      allow(stamper).to receive(:already_done?).with(:in, date).and_return(true) # 出勤は当日打刻済み
+      allow(stamper).to receive(:punch_recorded?).with(:in, date).and_return(true) # 出勤は当日記録済み
       allow(stamper).to receive(:punch)
 
       clock_time[:now] = t("08:00")
@@ -368,9 +368,24 @@ RSpec.describe Ak4Punch::Daemon do
       expect(notifier).not_to have_received(:notify)
     end
 
+    it "退勤まで完了した日に退勤後に再起動しても出勤・退勤とも通知しない（誤通知防止・退勤後）" do
+      allow(calendar_client).to receive(:events).and_return([])
+      # AKASHI 履歴上は出勤・退勤とも記録済み（[出勤,退勤]の正常完了日）
+      allow(stamper).to receive(:punch_recorded?).with(:in, date).and_return(true)
+      allow(stamper).to receive(:punch_recorded?).with(:out, date).and_return(true)
+      allow(stamper).to receive(:punch)
+
+      # 退勤後(18:30)相当で最初の tick（＝再起動直後）。出勤(目標09:30)・退勤(目標18:00)とも
+      # grace 超過だが、履歴上は完了しているので give_up で通知しない。
+      clock_time[:now] = t("18:30")
+      daemon.tick
+
+      expect(notifier).not_to have_received(:notify)
+    end
+
     it "AKASHI 確認が失敗したら安全側で通知する（確認不能なら黙殺しない）" do
       allow(calendar_client).to receive(:events).and_return([])
-      allow(stamper).to receive(:already_done?).and_raise(Ak4Punch::Client::ApiError, "HTTP 503")
+      allow(stamper).to receive(:punch_recorded?).and_raise(Ak4Punch::Client::ApiError, "HTTP 503")
       allow(stamper).to receive(:punch)
 
       clock_time[:now] = t("08:00")
@@ -751,7 +766,7 @@ RSpec.describe Ak4Punch::Daemon do
     it "前日の未打刻でも AKASHI に打刻があれば通知しない（再起動後の突き合わせ・手動打刻）" do
       allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
       allow(stamper).to receive(:punch)
-      allow(stamper).to receive(:already_done?).with(:out, date).and_return(true) # 退勤は当日打刻済み
+      allow(stamper).to receive(:punch_recorded?).with(:out, date).and_return(true) # 退勤は当日記録済み
 
       clock_time[:now] = t("08:00")
       daemon.tick # 7/10 計画（出勤09:30 / 退勤18:30）

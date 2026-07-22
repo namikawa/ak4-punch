@@ -315,11 +315,13 @@ module Ak4Punch
       plan.done = true
     end
 
-    # 断念・未打刻通知の前の安全確認: この kind の打刻が当日の勤務セッションとして既に済んでいるか。
-    # 判定は Stamper#already_done?（当日の最終打刻＝在席状態で判定）に委譲する。
+    # 断念・未打刻通知の前の安全確認: この kind の計画した打刻が既に記録済みか。
+    # 判定は Stamper#punch_recorded?（当日の打刻履歴を時刻順で見る）に委譲する。
+    # 在席状態ベースの冪等(already_done?)ではなく履歴で見ることで、退勤後（[出勤,退勤]）に
+    # 再起動しても「出勤が未打刻」と誤判定して通知することがない。
     # 取得に失敗した場合は false（確認不能 → 通知する安全側に倒す）。
     def already_stamped?(kind, date)
-      @stamper.already_done?(kind, date)
+      @stamper.punch_recorded?(kind, date)
     rescue StandardError => e
       @logger.warn("打刻済み確認に失敗（#{e.class}: #{e.message}）。確認できないため通知します。")
       false

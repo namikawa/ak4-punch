@@ -75,6 +75,45 @@ RSpec.describe Ak4Punch::Stamper do
     expect(result.status).to eq :punched
   end
 
+  describe "#punch_recorded?（当日の打刻履歴で完了判定）" do
+    it "出勤は当日に出勤があれば記録済み" do
+      allow(client).to receive(:get_stamps).with(date: workday)
+        .and_return([{ "type" => 11, "stamped_at" => "2026/07/08 09:30:30" }])
+      expect(stamper.punch_recorded?(:in, workday)).to be true
+    end
+
+    it "退勤は最後の出勤より後に退勤があれば記録済み" do
+      allow(client).to receive(:get_stamps).with(date: workday).and_return([
+        { "type" => 11, "stamped_at" => "2026/07/08 09:30:30" },
+        { "type" => 12, "stamped_at" => "2026/07/08 18:00:10" },
+      ])
+      expect(stamper.punch_recorded?(:out, workday)).to be true
+    end
+
+    it "退勤後(完了日)でも出勤は記録済みと判定する（退勤後の再起動で誤通知しない）" do
+      allow(client).to receive(:get_stamps).with(date: workday).and_return([
+        { "type" => 11, "stamped_at" => "2026/07/08 09:30:30" },
+        { "type" => 12, "stamped_at" => "2026/07/08 18:00:10" },
+      ])
+      expect(stamper.punch_recorded?(:in, workday)).to be true
+    end
+
+    it "前営業日の退勤(当日日付)だけなら当日の退勤は未記録（日跨ぎ勤務）" do
+      allow(client).to receive(:get_stamps).with(date: workday).and_return([
+        { "type" => 12, "stamped_at" => "2026/07/08 01:21:25" }, # 前営業日の退勤
+        { "type" => 11, "stamped_at" => "2026/07/08 09:30:30" }, # 当日出勤
+      ])
+      expect(stamper.punch_recorded?(:in, workday)).to be true
+      expect(stamper.punch_recorded?(:out, workday)).to be false
+    end
+
+    it "打刻が無ければ出勤も退勤も未記録" do
+      allow(client).to receive(:get_stamps).with(date: workday).and_return([])
+      expect(stamper.punch_recorded?(:in, workday)).to be false
+      expect(stamper.punch_recorded?(:out, workday)).to be false
+    end
+  end
+
   describe "ランダム打刻ウィンドウ" do
     let(:slept) { [] }
     let(:sleeper) { ->(sec) { slept << sec } }

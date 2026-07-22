@@ -28,7 +28,7 @@ schedule:
   extra_workdays: []             # 週末/祝日でも出勤する日（最優先で対象化）
 
 idempotency:
-  check_existing: true           # 打刻前に GET で当日の同種打刻を確認し、あればスキップ
+  check_existing: true           # 打刻前に GET で当日の在席状態(最終打刻)を確認し、既に済んでいればスキップ
 
 token:
   path: "config/token.json"      # 再発行トークンの保存先（.gitignore 済み）
