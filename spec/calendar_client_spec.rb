@@ -112,6 +112,17 @@ RSpec.describe Ak4Punch::CalendarClient do
       expect(slept).to eq [2, 4]
     end
 
+    it "Net::HTTP の内蔵リトライ(max_retries)を無効化して二重リトライを防ぐ" do
+      response = instance_double(Net::HTTPResponse, code: "200", body: { events: [] }.to_json)
+      http = instance_spy(Net::HTTP)
+      allow(http).to receive(:request).and_return(response)
+      allow(Net::HTTP).to receive(:new).and_return(http)
+
+      client.events(date: date)
+
+      expect(http).to have_received(:max_retries=).with(0)
+    end
+
     it "4xx はリトライしない（1回で ApiError・待機なし）" do
       stub = stub_request(:get, %r{/events})
              .to_return(status: 401, body: { error: { message: "認証に失敗しました" } }.to_json)

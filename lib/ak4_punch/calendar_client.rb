@@ -92,6 +92,10 @@ module Ak4Punch
       http.use_ssl = uri.scheme == "https"
       http.open_timeout = @open_timeout
       http.read_timeout = @read_timeout
+      # Net::HTTP は既定 max_retries=1 で、ReadTimeout/EOFError/ECONNRESET 等では
+      # ここで暗黙に1回再試行する（バックオフなし）。本クラスの request のリトライと二重になり
+      # 実リクエストが最大6回になるのを防ぐため、内蔵リトライは無効化して制御を一本化する。
+      http.max_retries = 0
 
       req = Net::HTTP::Get.new(uri)
       req["Authorization"] = "Bearer #{@api_key}"
