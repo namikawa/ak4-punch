@@ -218,10 +218,24 @@ module Ak4Punch
       return if @last_refresh_at && (now - @last_refresh_at) < interval
 
       fetched = fetch_events(now.to_date)
-      notify_sukesan_fallback(fetched[:error]) if fetched[:error]
+
+      # 定期再取得の失敗では退勤目標を所定時刻へ巻き戻さない（直近の有効目標を維持する）。
+      # 巻き戻すと、カレンダー由来の遅い目標が所定時刻（＝過去）に化けて grace 超過と判定され、
+      # 退勤が恒久スキップ（give_up で done 確定 → 以降 refresh されない）になる事故が起きるため。
+      # 打刻直前チェック（postpone_out_by_final_check?）と同じ「取得失敗は現状維持」の安全側に倒す。
+      # 次の間隔で再取得を試すため @last_refresh_at は進める（30秒毎の連打・ブロッキングを避ける）。
+      if fetched[:error]
+        @last_refresh_at = now
+        held = @punch_plans[:out].target_at.strftime("%H:%M")
+        @logger.warn("退勤の定期再取得に失敗したため、退勤目標を現状（#{held}）のまま維持します（#{fetched[:error]}）")
+        notify_once(:sukesan_fallback,
+                    "sukesan からのイベント再取得に失敗しています。退勤目標は直近の値のまま維持します（#{fetched[:error]}）")
+        return
+      end
+
       return if switch_to_leave_day?(fetched[:events], now)
 
-      out = plan_clock_out(date: now.to_date, events: fetched[:events], error: fetched[:error])
+      out = plan_clock_out(date: now.to_date, events: fetched[:events])
       set_out_plan(out, now)
     end
 

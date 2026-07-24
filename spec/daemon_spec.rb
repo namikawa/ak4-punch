@@ -168,6 +168,36 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("18:00", 5)
       daemon.tick
     end
+
+    it "日中の再取得が失敗しても退勤目標を所定へ巻き戻さず、直近のカレンダー目標を維持して打刻する" do
+      # 初回はカレンダー取得成功（20:00）、以降の再取得は失敗する。
+      calls = 0
+      allow(calendar_client).to receive(:events) do
+        calls += 1
+        raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if calls > 1
+
+        [event(title: "実装", ends_at: t("20:00"))]
+      end
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 退勤目標 20:00（カレンダー）
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻（以降 :in は due にならない）
+
+      # 所定 18:00+grace10分(=18:10)を過ぎた 18:20 に再取得が失敗しても、目標が 18:00 へ
+      # 巻き戻らず 20:00 のまま維持され、退勤スキップ（恒久 done）が起きないこと。
+      clock_time[:now] = t("18:20")
+      daemon.tick
+      expect(logger).to have_received(:warn).with(/退勤の定期再取得に失敗.*20:00.*維持/).at_least(:once)
+      expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+
+      # 維持された目標 20:00 に達したら退勤打刻される（巻き戻っていたら done 済みで打刻されない）。
+      clock_time[:now] = t("20:00", 5)
+      daemon.tick
+      expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
+    end
   end
 
   describe "非対象日は何もしない" do
