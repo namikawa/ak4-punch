@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "json"
-require "time"
 require "fileutils"
 
 module Ak4Punch
@@ -18,17 +17,9 @@ module Ak4Punch
       new(
         path: path,
         token: (data["token"] && !data["token"].empty? ? data["token"] : seed_token),
-        expired_at: parse_time(data["expired_at"]),
+        expired_at: Ak4Punch.parse_akashi_time(data["expired_at"]),
         threshold_days: threshold_days,
       )
-    end
-
-    def self.parse_time(str)
-      return nil if str.nil? || str.to_s.strip.empty?
-
-      Time.strptime("#{str} +0900", "%Y/%m/%d %H:%M:%S %z")
-    rescue ArgumentError
-      nil
     end
 
     attr_reader :token, :expired_at, :path
@@ -65,7 +56,7 @@ module Ak4Punch
       FileUtils.mkdir_p(File.dirname(@path))
       File.write(@path, JSON.pretty_generate(
         "token" => @token,
-        "expired_at" => @expired_at&.strftime("%Y/%m/%d %H:%M:%S"),
+        "expired_at" => Ak4Punch.format_akashi_time(@expired_at),
       ))
       File.chmod(0o600, @path)
     end

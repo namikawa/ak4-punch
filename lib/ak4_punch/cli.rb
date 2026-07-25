@@ -46,7 +46,7 @@ module Ak4Punch
     def refresh_token
       app = build
       app[:store].refresh!(app[:client])
-      puts "トークンを再発行しました。有効期限: #{app[:store].expired_at&.strftime('%Y/%m/%d %H:%M:%S')}"
+      puts "トークンを再発行しました。有効期限: #{Ak4Punch.format_akashi_time(app[:store].expired_at)}"
     rescue StandardError => e
       abort "エラー: #{e.message}"
     end
@@ -300,13 +300,12 @@ module Ak4Punch
               elsif excluded_ids.include?(ev.id) then "除外"
               else "対象外"
               end
-            title = ev.title.nil? || ev.title.empty? ? "(タイトルなし)" : ev.title
-            puts "  #{ev.starts_at&.strftime('%H:%M')}-#{ev.ends_at.strftime('%H:%M')} #{title}  [#{mark}]"
+            puts "  #{ev.starts_at&.strftime('%H:%M')}-#{ev.ends_at.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
           end
         end
         puts
         if plan.source == :calendar
-          puts "採用イベント: #{plan.adopted_event.title || '(タイトルなし)'}（終了 #{plan.adopted_event.ends_at.strftime('%H:%M')}）"
+          puts "採用イベント: #{plan.adopted_event.display_title}（終了 #{plan.adopted_event.ends_at.strftime('%H:%M')}）"
           puts "フォールバック: #{plan.fallback_reason}" if plan.fallback_reason
         else
           puts "採用イベントなし → 所定退勤時刻（理由: #{plan.fallback_reason}）"

@@ -23,7 +23,10 @@ module Ak4Punch
     EVENTS_PATH = "/api/v1/calendars/google/events"
 
     # 1件のイベント。時刻は Time（オフセット付き）または nil。
-    Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true)
+    Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true) do
+      # ログ・CLI 表示用のタイトル。nil と空文字はプレースホルダに置き換える。
+      def display_title = title.nil? || title.empty? ? "(タイトルなし)" : title
+    end
 
     # retry_backoffs: 一過性エラー時に待機する秒の配列（要素数＝リトライ回数）。既定 [2, 4]（計3回試行）。
     # sleeper: 待機の副作用（テストで実 sleep を避けるため注入可能）。

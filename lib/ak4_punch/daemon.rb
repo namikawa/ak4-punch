@@ -545,11 +545,10 @@ module Ak4Punch
     def event_label(event)
       return "(不明なイベント)" if event.nil?
 
-      title = event.title.nil? || event.title.empty? ? "(タイトルなし)" : event.title
-      "#{title} 〜#{event.ends_at.strftime('%H:%M')}"
+      "#{event.display_title} 〜#{event.ends_at.strftime('%H:%M')}"
     end
 
-    def label(kind) = kind == :in ? "出勤" : "退勤"
+    def label(kind) = KIND_LABELS.fetch(kind)
     def fmt(time) = time.strftime("%Y-%m-%d %H:%M:%S")
   end
 end

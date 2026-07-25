@@ -4,7 +4,6 @@ require "net/http"
 require "openssl"
 require "uri"
 require "json"
-require "time"
 
 module Ak4Punch
   # AKASHI 公開API クライアント（打刻・打刻取得・トークン再発行）。
@@ -51,7 +50,7 @@ module Ak4Punch
     def reissue_token
       json = request(:post, "/token/reissue/#{@company_id}", body: { token: @token })
       resp = json["response"] || {}
-      { token: resp["token"], expired_at: parse_time(resp["expired_at"]) }
+      { token: resp["token"], expired_at: Ak4Punch.parse_akashi_time(resp["expired_at"]) }
     end
 
     private
@@ -92,14 +91,6 @@ module Ak4Punch
         raise ApiError, "APIエラー: #{messages}"
       end
       json
-    end
-
-    def parse_time(str)
-      return nil if str.nil? || str.to_s.strip.empty?
-
-      Time.strptime("#{str} +0900", "%Y/%m/%d %H:%M:%S %z")
-    rescue ArgumentError
-      nil
     end
   end
 end

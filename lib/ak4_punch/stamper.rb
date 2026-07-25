@@ -4,8 +4,7 @@ module Ak4Punch
   # 1回分の打刻ユースケース（出勤 or 退勤）。
   # 対象日判定 → 冪等チェック → 打刻 の順で、実行時刻に記録する。
   class Stamper
-    TYPE  = { in: 11, out: 12 }.freeze
-    LABEL = { in: "出勤", out: "退勤" }.freeze
+    TYPE = { in: 11, out: 12 }.freeze
 
     Result = Struct.new(:status, :kind, :type, :message, :recorded_at, keyword_init: true)
 
@@ -24,7 +23,7 @@ module Ak4Punch
     # （AKASHI は記録時刻＝リクエスト到着時刻のため、待機＝記録時刻の後ろ倒し）。
     def punch(kind:, date: Ak4Punch.today, force: false, dry_run: false, window_minutes: 0)
       type   = TYPE.fetch(kind)
-      label  = LABEL.fetch(kind)
+      label  = KIND_LABELS.fetch(kind)
       window = window_minutes.to_i
 
       unless force

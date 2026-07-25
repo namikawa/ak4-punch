@@ -8,10 +8,28 @@ module Ak4Punch
   # 本アプリは「その時刻に呼び出す」前提で JST 基準の日付判定を行う。
   JST = "+09:00"
 
+  # AKASHI が返す・token.json に保存する時刻の書式（タイムゾーンを持たないため JST として扱う）。
+  AKASHI_TIME_FORMAT = "%Y/%m/%d %H:%M:%S"
+
+  # 打刻種別の表示名。ログ・Slack通知・CLI 出力で共通に使う。
+  KIND_LABELS = { in: "出勤", out: "退勤" }.freeze
+
   module_function
 
   def now = Time.now.getlocal(JST)
   def today = now.to_date
+
+  # AKASHI 形式の時刻文字列を Time にする。空文字・パース不能な値は nil を返す。
+  def parse_akashi_time(str)
+    return nil if str.nil? || str.to_s.strip.empty?
+
+    Time.strptime("#{str} #{JST}", "#{AKASHI_TIME_FORMAT} %z")
+  rescue ArgumentError
+    nil
+  end
+
+  # Time を AKASHI 形式の文字列にする（nil はそのまま nil）。
+  def format_akashi_time(time) = time&.strftime(AKASHI_TIME_FORMAT)
 end
 
 require_relative "ak4_punch/version"
