@@ -26,7 +26,7 @@ module Ak4Punch
     #   attempted:     窓内で打刻を試行したか（寝過ごしスキップとリトライ枯渇の区別用）
     #   last_error:    最後の打刻失敗のエラー内容（枯渇通知に含める）
     #   final_checked: この目標に対して退勤直前チェックを実施済みか（リトライ中は再実行しない）
-    PunchPlan = Struct.new(:kind, :target_at, :done, :plan_detail,
+    PunchPlan = Struct.new(:kind, :target_at, :done,
                            :attempted, :last_error, :final_checked, keyword_init: true) do
       def done? = done == true
     end
@@ -147,7 +147,7 @@ module Ak4Punch
         end
       end
       # 再チェック要求（punch recheck から送られる）。trap 内ではフラグ設定のみ行う。
-      Signal.trap("USR1") { @recheck_requested = true }
+      Signal.trap("USR1") { request_recheck! }
     end
 
     # SIGUSR1 のフラグを検知したら当日の計画を破棄して完全再計画する
@@ -198,8 +198,7 @@ module Ak4Punch
       end
 
       in_target = in_target_at(today)
-      @punch_plans[:in] = PunchPlan.new(kind: :in, target_at: in_target, done: false,
-                                        plan_detail: "所定#{@config.clock_in_time}+揺らぎ")
+      @punch_plans[:in] = PunchPlan.new(kind: :in, target_at: in_target, done: false)
       @logger.info("出勤目標を設定: #{fmt(in_target)}")
 
       out = plan_clock_out(date: today, events: fetched[:events], error: fetched[:error])
@@ -233,7 +232,7 @@ module Ak4Punch
         return
       end
 
-      return if switch_to_leave_day?(fetched[:events], now)
+      return if switch_to_leave_day?(fetched[:events])
 
       out = plan_clock_out(date: now.to_date, events: fetched[:events])
       set_out_plan(out, now)
@@ -255,7 +254,7 @@ module Ak4Punch
       end
 
       @punch_plans[:out] = PunchPlan.new(
-        kind: :out, target_at: target, done: existing&.done? || false, plan_detail: out[:summary],
+        kind: :out, target_at: target, done: existing&.done? || false,
         attempted: same_target ? existing.attempted : false,
         last_error: same_target ? existing.last_error : nil,
         final_checked: same_target ? existing.final_checked : false,
@@ -359,7 +358,7 @@ module Ak4Punch
       end
 
       # まず休暇判定（検知したら以降の打刻を中止）。
-      return true if switch_to_leave_day?(fetched[:events], now)
+      return true if switch_to_leave_day?(fetched[:events])
 
       out = plan_clock_out(date: now.to_date, events: fetched[:events])
 
@@ -373,7 +372,7 @@ module Ak4Punch
 
     # 取得済みイベントに休暇判定を適用し、検知したら未実行の打刻計画を破棄して
     # 休暇日に切り替える。戻り値: true = 休暇日に切り替えた。
-    def switch_to_leave_day?(events, now)
+    def switch_to_leave_day?(events)
       return false if events.nil?
 
       leave = detect_leave(events)

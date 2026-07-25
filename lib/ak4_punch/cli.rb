@@ -166,10 +166,10 @@ module Ak4Punch
       end
 
       window = resolve_window(kind, app[:config])
-      result = app[:stamper].punch(
+      # 打刻失敗は例外として上がり、下の rescue で abort する（結果の status は成功系のみ）。
+      app[:stamper].punch(
         kind: kind, force: options[:force], dry_run: options[:dry_run], window_minutes: window,
       )
-      exit(1) if result.status == :error
     rescue StandardError => e
       abort "エラー: #{e.message}"
     end

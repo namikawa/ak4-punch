@@ -41,7 +41,7 @@ module Ak4Punch
     def events(date: nil)
       path = EVENTS_PATH
       path += "?#{URI.encode_www_form(date: date.strftime('%Y-%m-%d'))}" if date
-      json = request(:get, path)
+      json = request(path)
       Array(json["events"]).map { |e| build_event(e) }
     end
 
@@ -67,7 +67,7 @@ module Ak4Punch
       nil
     end
 
-    def request(method, path)
+    def request(path)
       raise ApiError, "sukesan APIキー(SUKESAN_API_KEY)が未設定です" if @api_key.nil? || @api_key.to_s.strip.empty?
 
       attempt = 0
