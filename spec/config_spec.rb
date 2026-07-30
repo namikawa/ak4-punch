@@ -74,6 +74,7 @@ RSpec.describe Ak4Punch::Config do
       expect(cfg.calendar_enabled).to be false
       expect(cfg.calendar_exclude_keywords).to eq described_class::DEFAULT_EXCLUDE_KEYWORDS
       expect(cfg.calendar_refresh_interval_minutes).to eq 15
+      expect(cfg.calendar_refresh_failure_notify_threshold).to eq 3
       expect(cfg.daemon_tick_seconds).to eq 30
       expect(cfg.daemon_wake_lead_minutes).to eq 1
       expect(cfg.daemon_manage_wake).to be true
@@ -89,6 +90,7 @@ RSpec.describe Ak4Punch::Config do
             "enabled" => true,
             "exclude_keywords" => %w[飲み会 打ち上げ],
             "refresh_interval_minutes" => 5,
+            "refresh_failure_notify_threshold" => 6,
           },
           "daemon" => {
             "tick_seconds" => 60, "wake_lead_minutes" => 2,
@@ -100,6 +102,7 @@ RSpec.describe Ak4Punch::Config do
       expect(cfg.calendar_enabled).to be true
       expect(cfg.calendar_exclude_keywords).to eq %w[飲み会 打ち上げ]
       expect(cfg.calendar_refresh_interval_minutes).to eq 5
+      expect(cfg.calendar_refresh_failure_notify_threshold).to eq 6
       expect(cfg.daemon_tick_seconds).to eq 60
       expect(cfg.daemon_wake_lead_minutes).to eq 2
       expect(cfg.daemon_manage_wake).to be false
@@ -110,14 +113,28 @@ RSpec.describe Ak4Punch::Config do
       cfg = described_class.new(
         data: {
           "company_id" => "x",
-          "calendar" => { "refresh_interval_minutes" => 0 },
+          "calendar" => { "refresh_interval_minutes" => 0, "refresh_failure_notify_threshold" => 0 },
           "daemon" => { "tick_seconds" => -1, "late_grace_minutes" => 0 },
         },
         root: Dir.pwd,
       )
       expect(cfg.calendar_refresh_interval_minutes).to eq 15
+      expect(cfg.calendar_refresh_failure_notify_threshold).to eq 3
       expect(cfg.daemon_tick_seconds).to eq 30
       expect(cfg.daemon_late_grace_minutes).to eq 10
+    end
+
+    it "refresh_failure_notify_threshold の負値・不正値も既定値(3)へフォールバック" do
+      negative = described_class.new(
+        data: { "company_id" => "x", "calendar" => { "refresh_failure_notify_threshold" => -2 } },
+        root: Dir.pwd,
+      )
+      invalid = described_class.new(
+        data: { "company_id" => "x", "calendar" => { "refresh_failure_notify_threshold" => "たくさん" } },
+        root: Dir.pwd,
+      )
+      expect(negative.calendar_refresh_failure_notify_threshold).to eq 3
+      expect(invalid.calendar_refresh_failure_notify_threshold).to eq 3
     end
 
     it "exclude_keywords を空配列にすると除外なしにできる" do

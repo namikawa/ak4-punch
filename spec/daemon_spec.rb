@@ -198,6 +198,81 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
       expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0)
     end
+
+    describe "定期再取得の失敗は連続失敗が閾値に達するまで通知しない" do
+      # succeed_calls に含まれる回数目の fetch だけ成功し、それ以外は ApiError を投げる。
+      # （DarkWake の無通信で1回だけ失敗する、といったパターンを再現するため）
+      def stub_events(succeed_calls)
+        calls = 0
+        allow(calendar_client).to receive(:events) do
+          calls += 1
+          raise Ak4Punch::CalendarClient::ApiError, "接続拒否" unless succeed_calls.include?(calls)
+
+          [event(title: "実装", ends_at: t("20:00"))]
+        end
+      end
+
+      it "1回の失敗では通知せずログだけ出す" do
+        stub_events([1])
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 計画作成（取得成功・退勤目標 20:00）
+        clock_time[:now] = t("08:16") # refresh 間隔(15分)経過 → 再取得1回目が失敗
+        daemon.tick
+
+        expect(logger).to have_received(:warn).with(/退勤の定期再取得に失敗.*20:00.*維持/).once
+        expect(notifier).not_to have_received(:notify)
+      end
+
+      it "3回連続で失敗したら1回だけ通知し、以降の失敗では鳴らさない" do
+        stub_events([1])
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 計画作成（取得成功）
+        ["08:16", "08:32", "08:48", "09:04", "09:20"].each do |hhmm|
+          clock_time[:now] = t(hhmm)
+          daemon.tick # 再取得はすべて失敗（1,2,3,4,5回目）
+        end
+
+        expect(notifier).to have_received(:notify)
+          .with(/sukesan からのイベント再取得に3回連続で失敗しています。退勤目標は直近の値（20:00）のまま維持します（接続拒否）/)
+          .once
+        # 失敗ログ自体は間引かず毎回出す（障害調査で全履歴が必要なため）
+        expect(logger).to have_received(:warn).with(/退勤の定期再取得に失敗/).exactly(5).times
+      end
+
+      it "途中で取得が成功したらカウントをリセットし、その後2回失敗しても通知しない" do
+        stub_events([1, 4]) # 4回目（08:48 の再取得）だけ復旧
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 計画作成（取得成功）
+        ["08:16", "08:32", "08:48", "09:04", "09:20"].each do |hhmm|
+          clock_time[:now] = t(hhmm)
+          daemon.tick # 失敗2回 → 成功（リセット）→ 失敗2回
+        end
+
+        expect(logger).to have_received(:info).with(/sukesan のイベント取得が復旧しました（連続失敗 2 回）/).once
+        expect(notifier).not_to have_received(:notify)
+      end
+
+      it "日付が変わったらカウントをリセットする" do
+        stub_events([1, 4]) # 4回目 = 翌日の計画作成時の取得
+        allow(stamper).to receive(:punch_recorded?).and_return(true) # 前日未打刻の通知を鳴らさない
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 7/10 計画作成（取得成功）
+        clock_time[:now] = t("08:16")
+        daemon.tick # 再取得1回目が失敗
+        clock_time[:now] = t("08:32")
+        daemon.tick # 再取得2回目が失敗
+
+        # 翌日の最初の tick で取得に成功する。カウントが日付変化でリセットされていれば
+        # 「復旧」ログは出ない（リセットされていなければ 連続失敗2回 からの復旧として記録される）。
+        clock_time[:now] = t("08:00", day: 11)
+        daemon.tick
+        expect(logger).not_to have_received(:info).with(/sukesan のイベント取得が復旧しました/)
+      end
+    end
   end
 
   describe "非対象日は何もしない" do

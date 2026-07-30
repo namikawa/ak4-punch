@@ -15,6 +15,9 @@ module Ak4Punch
     # カレンダー連動デーモンの既定値。
     DEFAULT_EXCLUDE_KEYWORDS = %w[会食 懇親会 飲み会 打ち上げ 歓迎会 送別会 忘年会 新年会].freeze
     DEFAULT_REFRESH_INTERVAL_MINUTES = 15
+    # 定期再取得が何回連続で失敗したら Slack に通知するか
+    # （DarkWake 中の無通信など一過性の失敗で鳴らさないための閾値）。
+    DEFAULT_REFRESH_FAILURE_NOTIFY_THRESHOLD = 3
     DEFAULT_TICK_SECONDS = 30
     DEFAULT_WAKE_LEAD_MINUTES = 1
     DEFAULT_LATE_GRACE_MINUTES = 10
@@ -33,6 +36,7 @@ module Ak4Punch
                 :check_existing, :token_path, :token_refresh_threshold_days,
                 :sukesan_base_url, :sukesan_api_key,
                 :calendar_enabled, :calendar_exclude_keywords, :calendar_refresh_interval_minutes,
+                :calendar_refresh_failure_notify_threshold,
                 :calendar_leave_keywords, :calendar_leave_min_duration_hours,
                 :daemon_tick_seconds, :daemon_wake_lead_minutes,
                 :daemon_manage_wake, :daemon_late_grace_minutes,
@@ -88,6 +92,11 @@ module Ak4Punch
       @calendar_refresh_interval_minutes =
         positive_int(cal.fetch("refresh_interval_minutes", DEFAULT_REFRESH_INTERVAL_MINUTES),
                      DEFAULT_REFRESH_INTERVAL_MINUTES)
+      # 定期再取得の連続失敗が この回数に達したときだけ Slack に通知する
+      # （回数 × refresh_interval_minutes ≒ 取得できていない時間）。
+      @calendar_refresh_failure_notify_threshold =
+        positive_int(cal.fetch("refresh_failure_notify_threshold", DEFAULT_REFRESH_FAILURE_NOTIFY_THRESHOLD),
+                     DEFAULT_REFRESH_FAILURE_NOTIFY_THRESHOLD)
 
       # 休暇の自動検知（タイトル部分一致 + 終日または一定時間以上のイベント）。
       lkw = cal["leave_keywords"]
