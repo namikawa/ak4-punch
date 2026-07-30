@@ -16,6 +16,8 @@ module Ak4Punch
   #     検知したら、その日は打刻しない（AKASHI は休暇申請日でも打刻を受理するため）。
   #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害）のみ
   #     Slack に通知する。成功・休暇検知・目標変更は通知しない。
+  #     ただし定期再取得の失敗は実害がないため、連続失敗が閾値に達するまで通知しない
+  #     （DarkWake 中の無通信による一過性の失敗で鳴らさない）。
   #   - 長い sleep はせず tick で進める（Mac スリープ復帰後に正しく追随するため）。
   class Daemon
     KINDS = %i[in out].freeze
@@ -72,6 +74,7 @@ module Ak4Punch
       @punch_plans = {}         # kind => PunchPlan（対象日のみ）
       @leave_event = nil        # 検知した休暇イベント（非nilの間、当日は「休暇日」として打刻しない）
       @last_refresh_at = nil    # 最後に sukesan を再取得した時刻
+      @calendar_failure_count = 0 # sukesan 取得の連続失敗回数（成功でリセット。定期再取得の通知判定に使う）
       @notified_keys = []       # 当日通知済みのイベント種別（同日デデュープ用。日付変化でリセット）
       @recheck_requested = false # SIGUSR1（punch recheck）による再計画要求フラグ
       @running = false
@@ -175,6 +178,7 @@ module Ak4Punch
       @punch_plans = {}
       @leave_event = nil
       @last_refresh_at = nil
+      @calendar_failure_count = 0 # 前日の連続失敗を持ち越さない
       @notified_keys = [] # 同日デデュープを日付変化でリセット
       @wake_scheduler.reset!
 
@@ -223,12 +227,22 @@ module Ak4Punch
       # 退勤が恒久スキップ（give_up で done 確定 → 以降 refresh されない）になる事故が起きるため。
       # 打刻直前チェック（postpone_out_by_final_check?）と同じ「取得失敗は現状維持」の安全側に倒す。
       # 次の間隔で再取得を試すため @last_refresh_at は進める（30秒毎の連打・ブロッキングを避ける）。
+      # Slack 通知は連続失敗が閾値に達するまで抑制する（実害がないため）。DarkWake（同居デーモンの
+      # 起床予約に相乗り）で無通信のまま tick が回ると sukesan が Google に到達できず 1 回だけ失敗する、
+      # という一過性のケースが構造的に頻発するため。
+      # 判定を「最後の成功からの経過時間」にしないのは、Mac がスリープする以上「起床直後に Wi-Fi 未接続で
+      # 1 回失敗した」だけでも長時間扱いになって誤検知するため。再取得は refresh_interval でゲートされて
+      # いるので 回数 × 間隔 ≒ 経過時間になり、スリープ跨ぎにも強い。
+      # ログ（warn）は間引かず毎回出す（事後の障害調査で失敗の全履歴が必要なため）。
       if fetched[:error]
         @last_refresh_at = now
         held = @punch_plans[:out].target_at.strftime("%H:%M")
         @logger.warn("退勤の定期再取得に失敗したため、退勤目標を現状（#{held}）のまま維持します（#{fetched[:error]}）")
-        notify_once(:sukesan_fallback,
-                    "sukesan からのイベント再取得に失敗しています。退勤目標は直近の値のまま維持します（#{fetched[:error]}）")
+        if @calendar_failure_count >= @config.calendar_refresh_failure_notify_threshold
+          notify_once(:sukesan_fallback,
+                      "sukesan からのイベント再取得に#{@calendar_failure_count}回連続で失敗しています。" \
+                      "退勤目標は直近の値（#{held}）のまま維持します（#{fetched[:error]}）")
+        end
         return
       end
 
@@ -388,9 +402,17 @@ module Ak4Punch
     end
 
     # sukesan から指定日のイベントを取得する。失敗時は events: nil + error(メッセージ)。
+    # 連続失敗回数（@calendar_failure_count）はここで一元管理する
+    # （呼び出し元が計画時・定期再取得・打刻直前チェックと複数あるため）。
     def fetch_events(date)
-      { events: @calendar_client.events(date: date), error: nil }
+      events = @calendar_client.events(date: date)
+      if @calendar_failure_count.positive?
+        @logger.info("sukesan のイベント取得が復旧しました（連続失敗 #{@calendar_failure_count} 回）")
+        @calendar_failure_count = 0
+      end
+      { events: events, error: nil }
     rescue CalendarClient::ApiError => e
+      @calendar_failure_count += 1
       { events: nil, error: e.message }
     end
 
@@ -452,7 +474,9 @@ module Ak4Punch
       end
     end
 
-    # sukesan 障害による所定時刻フォールバックの通知（30分毎の再取得失敗で連打しない）。
+    # 起動時・日付変化時の取得失敗の通知。こちらは1回目から通知する
+    # （所定時刻フォールバック＋休暇判定不能という実害があるため）。
+    # 通知キーは定期再取得の抑制付き通知と共有するので、合わせて同日1通に収まる。
     def notify_sukesan_fallback(error)
       notify_once(:sukesan_fallback,
                   "sukesan からのイベント取得に失敗し、退勤は所定時刻にフォールバックしています（#{error}）")
