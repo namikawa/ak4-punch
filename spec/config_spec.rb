@@ -30,6 +30,47 @@ RSpec.describe Ak4Punch::Config do
     expect { described_class.new(data: {}, root: Dir.pwd) }.to raise_error(Ak4Punch::Config::Error)
   end
 
+  describe "所定時刻(work.clock_in / clock_out)の検証" do
+    def cfg_with(work)
+      described_class.new(data: { "company_id" => "x", "work" => work }, root: Dir.pwd)
+    end
+
+    it "HH:MM 形式（0埋めなし・境界値）を受理する" do
+      cfg = cfg_with("clock_in" => "9:30", "clock_out" => "23:59")
+      expect(cfg.clock_in_time).to eq "9:30"
+      expect(cfg.clock_out_time).to eq "23:59"
+      expect(cfg_with("clock_in" => "00:00", "clock_out" => "09:30").clock_in_time).to eq "00:00"
+    end
+
+    it "既定値（未設定時）も検証を通る" do
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.clock_in_time).to eq "09:30"
+      expect(cfg.clock_out_time).to eq "18:00"
+    end
+
+    it "時が範囲外ならエラー（どのキーがどの値で不正か分かる）" do
+      expect { cfg_with("clock_in" => "25:00") }
+        .to raise_error(Ak4Punch::Config::Error, /work\.clock_in の時刻指定が不正です.*25:00/)
+    end
+
+    it "分が範囲外ならエラー" do
+      expect { cfg_with("clock_out" => "12:60") }
+        .to raise_error(Ak4Punch::Config::Error, /work\.clock_out の時刻指定が不正です.*12:60/)
+    end
+
+    it "時刻でない文字列ならエラー（00:00 として黙って受理しない）" do
+      expect { cfg_with("clock_in" => "oops") }
+        .to raise_error(Ak4Punch::Config::Error, /work\.clock_in の時刻指定が不正です.*oops/)
+      expect { cfg_with("clock_out" => "9:xx") }
+        .to raise_error(Ak4Punch::Config::Error, /work\.clock_out の時刻指定が不正です.*9:xx/)
+    end
+
+    it "数値（YAML で引用符を付け忘れた場合）もエラー" do
+      expect { cfg_with("clock_in" => 930) }
+        .to raise_error(Ak4Punch::Config::Error, /work\.clock_in の時刻指定が不正です.*930/)
+    end
+  end
+
   describe "ランダム打刻ウィンドウ" do
     it "既定は 0（指定時刻ちょうど）" do
       cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)

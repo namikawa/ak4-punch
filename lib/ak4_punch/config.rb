@@ -12,6 +12,9 @@ module Ak4Punch
     # ランダム打刻ウィンドウの上限（分）。
     MAX_WINDOW_MINUTES = 30
 
+    # 所定時刻（work.clock_in / work.clock_out）の書式。時 0〜23 / 分 00〜59 の "HH:MM"。
+    TIME_FORMAT = /\A([01]?\d|2[0-3]):[0-5]\d\z/
+
     # カレンダー連動デーモンの既定値。
     DEFAULT_EXCLUDE_KEYWORDS = %w[会食 懇親会 飲み会 打ち上げ 歓迎会 送別会 忘年会 新年会].freeze
     DEFAULT_REFRESH_INTERVAL_MINUTES = 15
@@ -130,6 +133,20 @@ module Ak4Punch
     def validate!
       raise Error, "企業ID(AK4_COMPANY_ID)が未設定です。.env に設定してください。" if blank?(@company_id)
       raise Error, "エンドポイント(base_url)が未設定です。" if blank?(@base_url)
+      validate_time!("work.clock_in", @clock_in_time)
+      validate_time!("work.clock_out", @clock_out_time)
+    end
+
+    # 所定時刻は文字列のまま保持し、目標時刻の算出時に "HH:MM" として解釈する。
+    # 不正な値を黙って受理すると "oops" が 00:00（深夜打刻）になり、"25:00" は
+    # 計画作成中の例外になって当日の打刻が全て止まる。どちらも気づきにくいため、
+    # 起動時にエラーで停止して daemonctl log で即座に分かるようにする。
+    # （config.yml で引用符を付けずに 09:30 と書くと YAML が数値に解釈するので、
+    #  そのケースもここで弾かれる）
+    def validate_time!(key, value)
+      return if value.to_s.match?(TIME_FORMAT)
+
+      raise Error, "#{key} の時刻指定が不正です（HH:MM 形式で指定してください）: #{value}"
     end
 
     def blank?(value) = value.nil? || value.to_s.strip.empty?
