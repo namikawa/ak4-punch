@@ -374,6 +374,12 @@ module Ak4Punch
     # ただし断念・通知の前に AKASHI を read-only で確認し、既に打刻済みなら通知しない
     # （再起動でメモリ上の done が失われた場合や、窓超過中に手動打刻した場合の誤通知を防ぐ。
     #  打刻経路の冪等チェックは Stamper 内にあるが、give_up は Stamper を通らないためここで確認する）。
+    #
+    # 通知は「kind + 目標時刻」単位で同日デデュープする。recheck は当日の計画を作り直すため、
+    # 期限切れのまま未打刻の kind は何度でも再断念され、同じ内容の通知が繰り返されてしまう。
+    # キーを kind だけにしないのは、「断念 → カレンダー修正＋recheck で復活 → 新目標も逃して再断念」
+    # という2度目の正当な通知まで潰れ、直ったと誤認させる黙殺になるため（新目標の断念は必ず鳴らす）。
+    # ログ（warn）は間引かず毎回出す（事後の障害調査で全履歴が必要なため）。
     def give_up_punch(plan, now)
       if already_stamped?(plan.kind, now.to_date)
         @logger.info("#{label(plan.kind)}は既にAKASHIで打刻済みのため、スキップ通知は出しません" \
@@ -384,17 +390,20 @@ module Ak4Punch
 
       grace_min = @config.daemon_late_grace_minutes
       over_min = ((now - plan.target_at) / 60).floor
+      key = [:give_up, plan.kind, plan.target_at]
       if plan.attempted
         @logger.warn("#{label(plan.kind)}打刻はリトライ上限（目標+#{grace_min}分）に達したため諦めます" \
                      "（最後のエラー: #{plan.last_error}）。")
-        @notifier.notify("#{label(plan.kind)}打刻に失敗しました（最後のエラー: #{plan.last_error}）。" \
-                         "AKASHI で手動打刻してください")
+        notify_once(key,
+                    "#{label(plan.kind)}打刻に失敗しました（最後のエラー: #{plan.last_error}）。" \
+                    "AKASHI で手動打刻してください")
       else
         @logger.warn("#{label(plan.kind)}目標 #{fmt(plan.target_at)} を#{over_min}分超過" \
                      "（現在 #{fmt(now)}、grace #{grace_min}分）。誤時刻打刻を避けるため打刻せずスキップします。")
-        @notifier.notify("#{label(plan.kind)}打刻をスキップしました" \
-                         "（目標 #{plan.target_at.strftime('%H:%M')}／現在 #{now.strftime('%H:%M')}・#{over_min}分超過）。" \
-                         "AKASHI で手動打刻してください")
+        notify_once(key,
+                    "#{label(plan.kind)}打刻をスキップしました" \
+                    "（目標 #{plan.target_at.strftime('%H:%M')}／現在 #{now.strftime('%H:%M')}・#{over_min}分超過）。" \
+                    "AKASHI で手動打刻してください")
       end
       plan.done = true
     end
@@ -512,6 +521,7 @@ module Ak4Punch
     end
 
     # 同日1回だけ通知する（デデュープ。@notified_keys は日付変化でリセット）。
+    # key は Symbol、または事象を特定する組（例: [:give_up, kind, 目標時刻]）。
     def notify_once(key, message)
       return if @notified_keys.include?(key)
 

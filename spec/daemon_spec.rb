@@ -985,6 +985,31 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("19:00", 5)
       daemon.tick
       expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: t("19:10"))
+      # 期限切れのまま作り直された出勤（目標09:30）は再断念されるが、同一目標なので通知は1回だけ
+      expect(notifier).to have_received(:notify).with(/出勤打刻をスキップしました/).once
+    end
+
+    it "recheck で復活した新目標も逃したら、2回目の断念を通知する（黙殺しない）" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画: 退勤18:00（所定）
+
+      clock_time[:now] = t("18:11") # 1回目の断念（目標18:00）
+      daemon.tick
+
+      evs[:list] = [event(title: "実装", ends_at: t("18:30"))] # カレンダー修正 → 退勤目標18:30 で復活
+      daemon.request_recheck!
+      clock_time[:now] = t("18:15")
+      daemon.tick
+
+      clock_time[:now] = t("18:45") # 新目標+grace(18:40) も超過 → 2回目の断念
+      daemon.tick
+
+      expect(notifier).to have_received(:notify).with(/退勤打刻をスキップしました.*目標 18:00/).once
+      expect(notifier).to have_received(:notify).with(/退勤打刻をスキップしました.*目標 18:30/).once
     end
   end
 
