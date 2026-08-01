@@ -20,8 +20,8 @@
 ```bash
 bundle install
 
-# 1) 接続情報（機密）
-cp .env.example .env
+# 1) 接続情報（機密。他ユーザーが読めない権限で作成する）
+install -m 600 .env.example .env
 #   AK4_BASE_URL     … ログイン後URLのドメイン（通常 atnd.ak4.jp / AWJ系 atnd-awj.ak4.jp）
 #   AK4_COMPANY_ID   … 企業ID
 #   AK4_TOKEN        … マイページで発行したアクセストークン
@@ -45,6 +45,7 @@ bin/daemonctl install
 ```
 
 > `.env` / `config/config.yml` / `config/token.json` は `.gitignore` 済みです。
+> `.env` にはアクセストークン・APIキー・Webhook URL が入るため、他ユーザーが読めない権限（600）で作成してください（`config/token.json` は本ツールが 600 で作成します）。
 
 ## 日常運用
 
