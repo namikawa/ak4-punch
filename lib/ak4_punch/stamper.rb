@@ -8,20 +8,24 @@ module Ak4Punch
 
     Result = Struct.new(:status, :kind, :type, :message, :recorded_at, keyword_init: true)
 
-    # sleeper/rng は待機の副作用を差し替え可能にするため注入（テスト用）。
-    def initialize(config:, client:, calendar:, logger: nil, sleeper: Kernel.method(:sleep), rng: Random)
+    # sleeper/rng/clock は副作用（待機・現在時刻）を差し替え可能にするため注入（テスト用）。
+    def initialize(config:, client:, calendar:, logger: nil, sleeper: Kernel.method(:sleep), rng: Random,
+                   clock: -> { Ak4Punch.now })
       @config = config
       @client = client
       @calendar = calendar
       @logger = logger
       @sleeper = sleeper
       @rng = rng
+      @clock = clock
     end
 
     # kind: :in / :out
     # window_minutes: 0 なら指定時刻ちょうど。>0 なら 0〜N分のランダムな時刻まで待ってから打刻する
     # （AKASHI は記録時刻＝リクエスト到着時刻のため、待機＝記録時刻の後ろ倒し）。
-    def punch(kind:, date: Ak4Punch.today, force: false, dry_run: false, window_minutes: 0)
+    # deadline: この時刻を過ぎていたら打刻せず DeadlineExceeded にする（nil なら期限なし）。
+    #           Client へも渡し、送信直前でもう一度判定させる。
+    def punch(kind:, date: Ak4Punch.today, force: false, dry_run: false, window_minutes: 0, deadline: nil)
       type   = TYPE.fetch(kind)
       label  = KIND_LABELS.fetch(kind)
       window = window_minutes.to_i
@@ -44,7 +48,9 @@ module Ak4Punch
         return result(:skipped, kind, type, "#{date} は既に#{label}打刻済みのためスキップ")
       end
 
-      res = @client.post_stamp(type: type)
+      ensure_within_deadline!(deadline)
+
+      res = @client.post_stamp(type: type, deadline: deadline)
       result(:punched, kind, type, "#{label}を打刻しました", recorded_at: res[:stamped_at])
     end
 
@@ -67,6 +73,23 @@ module Ak4Punch
     end
 
     private
+
+    # 接続を開く前の早期中止（送信直前の最終判定は Client#post_stamp が行う）。
+    # AKASHI はリクエスト受信時刻で記録するため、呼び出し側が期限内と判断した後でも、
+    # 冪等チェックの GET（open 10秒 / read 20秒）やトークン再発行の途中で Mac がスリープすると、
+    # 復帰後に誤った時刻で打刻が成立してしまう
+    # （応答がスリープ前にカーネルへ届いていれば GET は復帰後に成功する）。
+    # 期限切れなら打刻せず中止し、記録時刻が狂うくらいなら未打刻を選ぶ。
+    def ensure_within_deadline!(deadline)
+      return if deadline.nil?
+
+      now = @clock.call
+      return if now <= deadline
+
+      raise DeadlineExceeded,
+            "打刻期限を超過したため打刻を中止しました" \
+            "（期限 #{deadline.strftime('%H:%M:%S')}／現在 #{now.strftime('%H:%M:%S')}）"
+    end
 
     # 冪等判定（次にこの打刻を行うべきか）: 当日の最終打刻＝在席状態で見る。
     #   出勤(:in) は在席中（最終打刻が出勤）なら済み / 退勤(:out) は退席中（最終打刻が出勤でない）なら済み。

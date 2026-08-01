@@ -14,6 +14,11 @@ module Ak4Punch
   # 打刻種別の表示名。ログ・Slack通知・CLI 出力で共通に使う。
   KIND_LABELS = { in: "出勤", out: "退勤" }.freeze
 
+  # 打刻期限（目標+grace）を過ぎたため打刻を中止した。
+  # 打刻経路の複数の段（Stamper の冪等チェック後・Client の接続確立後）で送出するため、
+  # モジュール直下に置いて共有する（下位の Client が上位の Stamper を参照しないように）。
+  class DeadlineExceeded < StandardError; end
+
   module_function
 
   def now = Time.now.getlocal(JST)

@@ -14,7 +14,7 @@ RSpec.describe Ak4Punch::Stamper do
   it "対象日で未打刻なら出勤を打刻する" do
     allow(calendar).to receive(:reason).with(workday).and_return(nil)
     allow(client).to receive(:latest_stamp_type).with(date: workday).and_return(nil)
-    expect(client).to receive(:post_stamp).with(type: 11).and_return({ stamped_at: "2026/07/08 09:30:01" })
+    expect(client).to receive(:post_stamp).with(type: 11, deadline: nil).and_return({ stamped_at: "2026/07/08 09:30:01" })
 
     result = stamper.punch(kind: :in, date: workday)
     expect(result.status).to eq :punched
@@ -42,7 +42,7 @@ RSpec.describe Ak4Punch::Stamper do
   it "前営業日の退勤が当日日付にあっても、当日出勤後(最終打刻=出勤)なら退勤を打刻する" do
     allow(calendar).to receive(:reason).with(workday).and_return(nil)
     allow(client).to receive(:latest_stamp_type).with(date: workday).and_return(11) # 在席中
-    expect(client).to receive(:post_stamp).with(type: 12).and_return({ stamped_at: "x" })
+    expect(client).to receive(:post_stamp).with(type: 12, deadline: nil).and_return({ stamped_at: "x" })
 
     result = stamper.punch(kind: :out, date: workday)
     expect(result.status).to eq :punched
@@ -69,7 +69,7 @@ RSpec.describe Ak4Punch::Stamper do
   it "force は対象日判定・重複チェックを無視して打刻する" do
     allow(calendar).to receive(:reason).with(holiday).and_return("祝日")
     expect(client).not_to receive(:latest_stamp_type)
-    expect(client).to receive(:post_stamp).with(type: 12).and_return({ stamped_at: "x" })
+    expect(client).to receive(:post_stamp).with(type: 12, deadline: nil).and_return({ stamped_at: "x" })
 
     result = stamper.punch(kind: :out, date: holiday, force: true)
     expect(result.status).to eq :punched
@@ -114,6 +114,60 @@ RSpec.describe Ak4Punch::Stamper do
     end
   end
 
+  describe "打刻期限(deadline)の直前判定" do
+    def at(hh, mm) = Time.new(2026, 7, 8, hh, mm, 0, "+09:00")
+
+    let(:deadline) { at(9, 40) } # 目標09:30 + grace10分 相当
+
+    # clock は可変の現在時刻を返す。冪等チェックの GET 応答で時刻を飛ばすと
+    # 「GET の途中でスリープして復帰した」状況になる。
+    def stamper_with(now)
+      described_class.new(config: config, client: client, calendar: calendar, clock: -> { now[:at] })
+    end
+
+    it "冪等チェックの途中で期限を過ぎたら POST せず中止する" do
+      now = { at: at(9, 35) }
+      allow(calendar).to receive(:reason).with(workday).and_return(nil)
+      allow(client).to receive(:latest_stamp_type).with(date: workday) do
+        now[:at] = at(9, 45) # GET の応答待ちの間にスリープし、復帰後に応答が返った
+        nil
+      end
+      expect(client).not_to receive(:post_stamp)
+
+      expect { stamper_with(now).punch(kind: :in, date: workday, deadline: deadline) }
+        .to raise_error(Ak4Punch::DeadlineExceeded, /打刻期限を超過.*09:40:00.*09:45:00/)
+    end
+
+    it "期限内なら打刻し、送信直前の最終判定のため Client にも deadline を渡す（境界の期限ちょうども打刻する）" do
+      now = { at: at(9, 40) }
+      allow(calendar).to receive(:reason).with(workday).and_return(nil)
+      allow(client).to receive(:latest_stamp_type).with(date: workday).and_return(nil)
+      expect(client).to receive(:post_stamp).with(type: 11, deadline: deadline)
+                                            .and_return({ stamped_at: "2026/07/08 09:40:00" })
+
+      result = stamper_with(now).punch(kind: :in, date: workday, deadline: deadline)
+      expect(result.status).to eq :punched
+    end
+
+    it "deadline 未指定なら期限判定せず打刻する（手動打刻は挙動不変）" do
+      now = { at: at(23, 59) } # 期限判定があれば必ず超過する時刻
+      allow(calendar).to receive(:reason).with(workday).and_return(nil)
+      allow(client).to receive(:latest_stamp_type).with(date: workday).and_return(nil)
+      expect(client).to receive(:post_stamp).with(type: 11, deadline: nil).and_return({ stamped_at: "x" })
+
+      expect(stamper_with(now).punch(kind: :in, date: workday).status).to eq :punched
+    end
+
+    it "force でも期限は判定する（誤時刻打刻は防ぐ）" do
+      now = { at: at(9, 45) }
+      allow(calendar).to receive(:reason).with(holiday).and_return("祝日")
+      expect(client).not_to receive(:post_stamp)
+
+      expect { stamper_with(now).punch(kind: :out, date: holiday, force: true, deadline: deadline) }
+        .to raise_error(Ak4Punch::DeadlineExceeded)
+    end
+  end
+
   describe "ランダム打刻ウィンドウ" do
     let(:slept) { [] }
     let(:sleeper) { ->(sec) { slept << sec } }
@@ -127,7 +181,7 @@ RSpec.describe Ak4Punch::Stamper do
       allow(calendar).to receive(:reason).with(workday).and_return(nil)
       allow(rng).to receive(:rand).with(0..300).and_return(123)
       allow(client).to receive(:latest_stamp_type).with(date: workday).and_return(11)
-      expect(client).to receive(:post_stamp).with(type: 12).and_return({ stamped_at: "x" })
+      expect(client).to receive(:post_stamp).with(type: 12, deadline: nil).and_return({ stamped_at: "x" })
 
       result = stamper.punch(kind: :out, date: workday, window_minutes: 5)
       expect(slept).to eq [123]

@@ -52,13 +52,32 @@ module Ak4Punch
       self
     end
 
+    # 一時ファイルへ書いてから rename で置き換える（atomic write）。
+    # 直接上書きすると書き込み途中の異常終了（電源断・強制終了）で JSON が壊れ、
+    # load が .env のシードトークンへ落ちてしまう。再発行済みならシードは失効している
+    # 可能性が高く、手動での再発行が必要になるため確実に「壊れた中身」を作らない。
+    # 一時ファイルは最初から 0600 で作る（後追いの chmod と違い一瞬も緩まず、umask にも左右されない）。
     def persist!
       FileUtils.mkdir_p(File.dirname(@path))
-      File.write(@path, JSON.pretty_generate(
+      json = JSON.pretty_generate(
         "token" => @token,
         "expired_at" => Ak4Punch.format_akashi_time(@expired_at),
-      ))
-      File.chmod(0o600, @path)
+      )
+      # 一時ファイル名は PID で一意にする。デーモンと手動コマンド（refresh_token 等）が
+      # 同時に保存しても互いの一時ファイルを掴まず、置き換えが常に rename 単位で完結する
+      # （1プロセス内はシングルスレッドなので PID だけで十分）。
+      tmp = "#{@path}.tmp.#{Process.pid}"
+      begin
+        File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |f|
+          f.write(json)
+          f.flush
+          f.fsync # rename 前にディスクへ確実に書き出す
+        end
+        File.rename(tmp, @path) # 同一ディレクトリ内の rename は原子的（権限 0600 も引き継がれる）
+      ensure
+        # 失敗時に書きかけの一時ファイルを残さない（成功時は rename 済みで存在しない）。
+        File.unlink(tmp) if File.exist?(tmp)
+      end
     end
   end
 end
