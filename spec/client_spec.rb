@@ -68,4 +68,52 @@ RSpec.describe Ak4Punch::Client do
     stub_request(:post, %r{/stamps\z}).to_raise(Errno::ECONNRESET)
     expect { client.post_stamp(type: 11) }.to raise_error(Ak4Punch::Client::ApiError, /通信エラー/)
   end
+
+  describe "打刻期限(deadline)の送信直前判定" do
+    def at(hh, mm) = Time.new(2026, 7, 8, hh, mm, 0, "+09:00")
+
+    let(:deadline) { at(9, 40) } # 目標09:30 + grace10分 相当
+
+    # 接続確立の途中でスリープして復帰した状況は WebMock では再現できないため、
+    # 「接続確立後に見た時刻」を注入 clock で表現して境界を検証する。
+    def client_at(now)
+      described_class.new(base_url: "https://atnd.ak4.jp/api/cooperation", company_id: "soldout",
+                          token: "tok", clock: -> { now })
+    end
+
+    let(:success_body) do
+      { success: true, response: { type: 11, stampedAt: "2026/07/08 09:30:01" } }.to_json
+    end
+
+    it "期限を過ぎていたら送信せずに中止する（HTTPリクエストが飛ばない）" do
+      stub = stub_request(:post, %r{/stamps\z}).to_return(status: 200, body: success_body)
+
+      expect { client_at(at(9, 45)).post_stamp(type: 11, deadline: deadline) }
+        .to raise_error(Ak4Punch::DeadlineExceeded, /打刻期限を超過.*09:40:00.*09:45:00/)
+      expect(stub).not_to have_been_requested
+    end
+
+    it "期限内なら従来どおり打刻する（境界の期限ちょうども送る）" do
+      stub = stub_request(:post, %r{/stamps\z}).to_return(status: 200, body: success_body)
+
+      res = client_at(at(9, 40)).post_stamp(type: 11, deadline: deadline)
+      expect(res[:stamped_at]).to eq "2026/07/08 09:30:01"
+      expect(stub).to have_been_requested
+    end
+
+    it "deadline 未指定なら期限判定せず送る（手動打刻は挙動不変）" do
+      stub = stub_request(:post, %r{/stamps\z}).to_return(status: 200, body: success_body)
+
+      res = client_at(at(23, 59)).post_stamp(type: 11) # 期限判定があれば必ず超過する時刻
+      expect(res[:stamped_at]).to eq "2026/07/08 09:30:01"
+      expect(stub).to have_been_requested
+    end
+
+    it "deadline 付きでも通信エラーは従来どおり ApiError にラップする" do
+      stub_request(:post, %r{/stamps\z}).to_raise(Errno::ECONNRESET)
+
+      expect { client_at(at(9, 35)).post_stamp(type: 11, deadline: deadline) }
+        .to raise_error(Ak4Punch::Client::ApiError, /通信エラー/)
+    end
+  end
 end

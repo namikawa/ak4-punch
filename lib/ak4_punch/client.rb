@@ -13,16 +13,21 @@ module Ak4Punch
 
     attr_accessor :token
 
-    def initialize(base_url:, company_id:, token:)
+    # clock は現在時刻の取得（打刻期限の判定用）。テストで差し替えられるよう注入する。
+    def initialize(base_url:, company_id:, token:, clock: -> { Ak4Punch.now })
       @base_url = base_url
       @company_id = company_id
       @token = token
+      @clock = clock
     end
 
     # 打刻実行(6.6)。stampedAt は API 側で無視されるため送らない
     # （記録時刻＝サーバ受信時刻）。type: 11=出勤 / 12=退勤。
-    def post_stamp(type:, timezone: Ak4Punch::JST)
-      json = request(:post, stamps_path, body: { token: @token, type: type, timezone: timezone })
+    # deadline: 指定すると接続確立後・送信直前に期限を再判定し、超過なら送らず中止する。
+    # 期限判定が要るのは打刻 POST だけ（打刻取得・トークン再発行は記録時刻に影響しない）。
+    def post_stamp(type:, timezone: Ak4Punch::JST, deadline: nil)
+      json = request(:post, stamps_path, body: { token: @token, type: type, timezone: timezone },
+                                         deadline: deadline)
       resp = json["response"] || {}
       { type: resp["type"], stamped_at: resp["stampedAt"], staff_id: resp["staff_id"] }
     end
@@ -57,7 +62,7 @@ module Ak4Punch
 
     def stamps_path = "/#{@company_id}/stamps"
 
-    def request(method, path, body: nil)
+    def request(method, path, body: nil, deadline: nil)
       uri = URI("#{@base_url.chomp('/')}#{path}")
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl = uri.scheme == "https"
@@ -76,9 +81,35 @@ module Ak4Punch
         req.body = JSON.generate(body)
       end
 
+      return parse_response(send_within_deadline(http, req, deadline)) if deadline
+
       parse_response(http.request(req))
     rescue SocketError, Timeout::Error, EOFError, OpenSSL::SSL::SSLError, SystemCallError => e
+      # DeadlineExceeded はここに含めない（通信エラーではなく意図的な中止のため、そのまま上げる）。
       raise ApiError, "通信エラー: #{e.class}: #{e.message}"
+    end
+
+    # 打刻 POST の最終関門。接続確立（DNS+TCP+TLS）を先に済ませてから期限を再判定し、
+    # 期限内だと確認できた直後にリクエストを書き出す。
+    # 接続確立中にスリープすると、TCP の再送は復帰後も続き、macOS の monotonic クロックは
+    # スリープ中に止まるので open_timeout（10秒）も生き残る。つまり「10秒で諦めるはず」の接続が
+    # 実時間では何時間も後に成立し得るため、確立後にもう一度時計を見る必要がある。
+    # ここまで来ると残るのは「判定 → リクエスト書き込み」の一瞬だけで、これは原理的に消せない残余。
+    # 誤時刻打刻の防衛線は fire_due_punches の窓判定 → Stamper の冪等チェック後の判定 →
+    # ここ（送信直前）の三段で、段階的に窓を狭めている。
+    def send_within_deadline(http, req, deadline)
+      http.start
+      now = @clock.call
+      if now > deadline
+        raise DeadlineExceeded,
+              "打刻期限を超過したため送信直前で中止しました" \
+              "（期限 #{deadline.strftime('%H:%M:%S')}／現在 #{now.strftime('%H:%M:%S')}）"
+      end
+
+      http.request(req)
+    ensure
+      # 明示的に開いた接続は必ず閉じる（ブロック形式の start と違い自動では閉じないため）。
+      http.finish if http.started?
     end
 
     def parse_response(res)

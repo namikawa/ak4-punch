@@ -155,7 +155,7 @@ RSpec.describe Ak4Punch::Daemon do
     it "Stamper が期限超過で中止したら done にせず、窓超過で断念を通知する" do
       allow(calendar_client).to receive(:events).and_return([])
       allow(stamper).to receive(:punch).and_raise(
-        Ak4Punch::Stamper::DeadlineExceeded,
+        Ak4Punch::DeadlineExceeded,
         "打刻期限を超過したため打刻を中止しました（期限 09:40:00／現在 09:45:00）",
       )
 

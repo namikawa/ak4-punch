@@ -4,10 +4,6 @@ module Ak4Punch
   # 1回分の打刻ユースケース（出勤 or 退勤）。
   # 対象日判定 → 冪等チェック → 打刻 の順で、実行時刻に記録する。
   class Stamper
-    # 打刻期限（deadline）を過ぎたため打刻を中止した。
-    # 呼び出し側（Daemon）は他の打刻失敗と同じくリトライ対象として扱う。
-    class DeadlineExceeded < StandardError; end
-
     TYPE = { in: 11, out: 12 }.freeze
 
     Result = Struct.new(:status, :kind, :type, :message, :recorded_at, keyword_init: true)
@@ -28,6 +24,7 @@ module Ak4Punch
     # window_minutes: 0 なら指定時刻ちょうど。>0 なら 0〜N分のランダムな時刻まで待ってから打刻する
     # （AKASHI は記録時刻＝リクエスト到着時刻のため、待機＝記録時刻の後ろ倒し）。
     # deadline: この時刻を過ぎていたら打刻せず DeadlineExceeded にする（nil なら期限なし）。
+    #           Client へも渡し、送信直前でもう一度判定させる。
     def punch(kind:, date: Ak4Punch.today, force: false, dry_run: false, window_minutes: 0, deadline: nil)
       type   = TYPE.fetch(kind)
       label  = KIND_LABELS.fetch(kind)
@@ -53,7 +50,7 @@ module Ak4Punch
 
       ensure_within_deadline!(deadline)
 
-      res = @client.post_stamp(type: type)
+      res = @client.post_stamp(type: type, deadline: deadline)
       result(:punched, kind, type, "#{label}を打刻しました", recorded_at: res[:stamped_at])
     end
 
@@ -77,9 +74,10 @@ module Ak4Punch
 
     private
 
-    # POST の直前に打刻期限を再判定する。AKASHI はリクエスト受信時刻で記録するため、
-    # 呼び出し側が期限内と判断した後でも、冪等チェックの GET（open 10秒 / read 20秒）や
-    # トークン再発行の途中で Mac がスリープすると、復帰後に誤った時刻で打刻が成立してしまう
+    # 接続を開く前の早期中止（送信直前の最終判定は Client#post_stamp が行う）。
+    # AKASHI はリクエスト受信時刻で記録するため、呼び出し側が期限内と判断した後でも、
+    # 冪等チェックの GET（open 10秒 / read 20秒）やトークン再発行の途中で Mac がスリープすると、
+    # 復帰後に誤った時刻で打刻が成立してしまう
     # （応答がスリープ前にカーネルへ届いていれば GET は復帰後に成功する）。
     # 期限切れなら打刻せず中止し、記録時刻が狂うくらいなら未打刻を選ぶ。
     def ensure_within_deadline!(deadline)
