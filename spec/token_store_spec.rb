@@ -59,6 +59,19 @@ RSpec.describe Ak4Punch::TokenStore do
       end
     end
 
+    it "一時ファイル名はプロセス毎に分ける（並行する別プロセスの保存と踏み合わない）" do
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "token.json")
+        renamed = []
+        allow(File).to receive(:rename) { |src, dst| renamed << [src, dst] } # 置き換えの引数を観察する
+
+        described_class.new(path: path, token: "t", expired_at: Time.now).persist!
+
+        expect(renamed).to eq [["#{path}.tmp.#{Process.pid}", path]]
+        expect(Dir.children(dir)).to be_empty # 一時ファイルは後始末される
+      end
+    end
+
     it "置き換えに失敗しても既存の token.json は壊れない" do
       Dir.mktmpdir do |dir|
         path = File.join(dir, "token.json")
@@ -68,6 +81,7 @@ RSpec.describe Ak4Punch::TokenStore do
         store = described_class.new(path: path, token: "new", expired_at: Time.now)
         expect { store.persist! }.to raise_error(Errno::EIO)
         expect(JSON.parse(File.read(path))["token"]).to eq "old"
+        expect(Dir.children(dir)).to eq ["token.json"] # 書きかけの一時ファイルも残らない
       end
     end
   end

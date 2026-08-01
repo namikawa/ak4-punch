@@ -63,13 +63,21 @@ module Ak4Punch
         "token" => @token,
         "expired_at" => Ak4Punch.format_akashi_time(@expired_at),
       )
-      tmp = "#{@path}.tmp"
-      File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |f|
-        f.write(json)
-        f.flush
-        f.fsync # rename 前にディスクへ確実に書き出す
+      # 一時ファイル名は PID で一意にする。デーモンと手動コマンド（refresh_token 等）が
+      # 同時に保存しても互いの一時ファイルを掴まず、置き換えが常に rename 単位で完結する
+      # （1プロセス内はシングルスレッドなので PID だけで十分）。
+      tmp = "#{@path}.tmp.#{Process.pid}"
+      begin
+        File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |f|
+          f.write(json)
+          f.flush
+          f.fsync # rename 前にディスクへ確実に書き出す
+        end
+        File.rename(tmp, @path) # 同一ディレクトリ内の rename は原子的（権限 0600 も引き継がれる）
+      ensure
+        # 失敗時に書きかけの一時ファイルを残さない（成功時は rename 済みで存在しない）。
+        File.unlink(tmp) if File.exist?(tmp)
       end
-      File.rename(tmp, @path) # 同一ディレクトリ内の rename は原子的（権限 0600 も引き継がれる）
     end
   end
 end
