@@ -38,13 +38,28 @@ RSpec.describe Ak4Punch::CalendarClient do
     expect(events[1].ends_at).to be_nil
   end
 
-  it "オフセットは文字列の値を信頼する（+09:00決め打ちにしない）" do
+  it "+09:00 以外のオフセット（海外タイムゾーンの招待）は JST に正規化する（瞬間は不変）" do
     stub_request(:get, %r{/events}).to_return(status: 200, body: {
       events: [{ id: "z", title: "UTC会議", ends_at: "2026-07-10T10:00:00+00:00", all_day: false }],
     }.to_json)
 
     ev = client.events(date: date).first
-    expect(ev.ends_at.utc_offset).to eq 0
+    expect(ev.ends_at.utc_offset).to eq 32_400
+    expect(ev.ends_at).to eq Time.new(2026, 7, 10, 19, 0, 0, "+09:00")
+  end
+
+  it "JST正規化により日跨ぎの日付判定が JST 基準になる" do
+    stub_request(:get, %r{/events}).to_return(status: 200, body: {
+      events: [{ id: "z", title: "NY会議", starts_at: "2026-07-10T11:00:00-04:00",
+                 ends_at: "2026-07-10T12:00:00-04:00", all_day: false }],
+    }.to_json)
+
+    ev = client.events(date: date).first
+    # -04:00 の 7/10 12:00 は JST では 7/11 01:00。当日判定・表示ともに JST の日付で行う。
+    expect(ev.ends_at.utc_offset).to eq 32_400
+    expect(ev.ends_at.to_date).to eq Date.new(2026, 7, 11)
+    expect(ev.ends_at.strftime("%Y-%m-%d %H:%M")).to eq "2026-07-11 01:00"
+    expect(ev.starts_at).to eq Time.new(2026, 7, 11, 0, 0, 0, "+09:00")
   end
 
   it "401 は ApiError（error.message を含む）" do

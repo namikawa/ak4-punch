@@ -22,7 +22,7 @@ module Ak4Punch
 
     EVENTS_PATH = "/api/v1/calendars/google/events"
 
-    # 1件のイベント。時刻は Time（オフセット付き）または nil。
+    # 1件のイベント。時刻は JST に正規化済みの Time または nil。
     Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true) do
       # ログ・CLI 表示用のタイトル。nil と空文字はプレースホルダに置き換える。
       def display_title = title.nil? || title.empty? ? "(タイトルなし)" : title
@@ -61,11 +61,14 @@ module Ak4Punch
       )
     end
 
-    # ISO8601（オフセット付き）をパース。オフセットは文字列の値を信頼する。
+    # ISO8601（オフセット付き）をパースし、JST に正規化する（瞬間は変えない）。
+    # Google カレンダーはイベント毎にタイムゾーンを持てるため、海外タイムゾーンの招待では
+    # +09:00 以外のオフセットで届く。そのまま下流に渡すと to_date が JST の日付とずれ、
+    # 当日判定（ClockOutPlanner）や表示が狂うので、境界であるここで揃えておく。
     def parse_time(str)
       return nil if str.nil? || str.to_s.strip.empty?
 
-      Time.iso8601(str)
+      Time.iso8601(str).getlocal(Ak4Punch::JST)
     rescue ArgumentError
       nil
     end
