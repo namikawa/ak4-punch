@@ -912,6 +912,78 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
+  describe "日次計画の作成失敗（原子化と次tickでの再試行）" do
+    it "組み立て中の想定外の例外では計画済みにせず、失敗通知は同日1回だけ" do
+      # ApiError（フォールバックで計画は完成する）ではなく想定外の例外を投げる
+      allow(calendar_client).to receive(:events).and_raise(RuntimeError, "想定外")
+      expect(stamper).not_to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成が失敗
+      clock_time[:now] = t("08:00", 30)
+      daemon.tick # 次の tick で再試行 → また失敗
+      clock_time[:now] = t("09:30", 5) # 計画があれば出勤 due になるタイミング
+      daemon.tick
+
+      # 失敗ログは tick 毎（＝再試行している証拠）、Slack 通知は同日1回だけ
+      expect(logger).to have_received(:error)
+        .with(/本日の打刻計画の作成に失敗しました（RuntimeError: 想定外）。次の tick で再試行します/).exactly(3).times
+      expect(notifier).to have_received(:notify)
+        .with(/本日の打刻計画の作成に失敗しました.*想定外.*次のtickで再試行します/).once
+    end
+
+    it "失敗が続いた後に成功した tick で計画が作られ、以降は正常に打刻する" do
+      calls = 0
+      allow(calendar_client).to receive(:events) do
+        calls += 1
+        raise "想定外" if calls <= 2
+
+        [event(title: "実装", ends_at: t("18:30"))]
+      end
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 失敗1
+      clock_time[:now] = t("08:00", 30)
+      daemon.tick # 失敗2
+      expect(logger).not_to have_received(:info).with(/出勤目標を設定/)
+
+      clock_time[:now] = t("08:01")
+      daemon.tick # 再試行が成功 → 計画作成（出勤09:30 / 退勤18:30）
+      expect(logger).to have_received(:info).with(/出勤目標を設定: 2026-07-10 09:30/)
+      expect(logger).to have_received(:info).with(/退勤目標を設定: 2026-07-10 18:30/)
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 計画どおり出勤を打刻（以降は失敗ログも出ない）
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0)
+      expect(logger).to have_received(:error).twice
+    end
+
+    it "日付が変わった直後の計画作成が失敗しても、前日の未打刻通知は重複しない" do
+      calls = 0
+      allow(calendar_client).to receive(:events) do
+        calls += 1
+        raise "想定外" if calls > 1 # 翌日の計画作成はすべて失敗する
+
+        [event(title: "実装", ends_at: t("18:30"))]
+      end
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 7/10 計画作成（出勤・退勤とも未打刻のまま日付を跨ぐ）
+
+      clock_time[:now] = t("08:00", day: 11)
+      daemon.tick # 日付遷移（前日未打刻を通知）→ 計画作成は失敗
+      clock_time[:now] = t("08:00", 30, day: 11)
+      daemon.tick # 再試行（日付遷移の副作用は繰り返さない）
+      clock_time[:now] = t("08:01", 0, day: 11)
+      daemon.tick
+
+      expect(notifier).to have_received(:notify).with(/昨日（2026-07-10）の出勤は打刻されませんでした/).once
+      expect(notifier).to have_received(:notify).with(/昨日（2026-07-10）の退勤は打刻されませんでした/).once
+      expect(notifier).to have_received(:notify).with(/本日の打刻計画の作成に失敗しました/).once
+    end
+  end
+
   describe "tick 毎に retry_pending を呼ぶ" do
     it "各 tick の冒頭で notifier.retry_pending が呼ばれる" do
       allow(calendar_client).to receive(:events).and_return([])

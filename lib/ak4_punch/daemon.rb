@@ -70,7 +70,8 @@ module Ak4Punch
       @clock = clock
       @sleeper = sleeper
 
-      @plan_date = nil          # 現在計画中の日付
+      @current_date = nil       # 日付遷移の副作用（前日未打刻の通知・状態リセット）を実施済みの日付
+      @plan_date = nil          # 計画の作成に成功した日付（失敗した日は進めず、次の tick で再試行する）
       @punch_plans = {}         # kind => PunchPlan（対象日のみ）
       @leave_event = nil        # 検知した休暇イベント（非nilの間、当日は「休暇日」として打刻しない）
       @last_refresh_at = nil    # 最後に sukesan を再取得した時刻
@@ -161,52 +162,93 @@ module Ak4Punch
 
       @recheck_requested = false
       @plan_date = nil # ensure_day_plan が同一日でも再計画する
+      # pmset 書き込み失敗で当日の起床予約を無効化していた場合も、再計画に合わせて再試行させる。
+      @wake_scheduler.reset!
       @logger.info("再チェック要求を受け付けました。本日の計画を再作成します")
     end
 
-    # 起動時・日付変化時に当日計画を作る。非対象日は計画なし（翌日待ち）。
-    # カレンダーに休暇イベントを検知した日も計画なし（休暇日として保持）。
+    # 起動時・日付変化時・再チェック要求時に当日計画を作る。
+    # 非対象日・休暇日は「計画なし（空の計画）」として成功扱いにする（翌日待ち）。
+    #
+    # 状態を2つに分けて持つ:
+    #   @current_date … 日付遷移の副作用（前日未打刻の通知・各種リセット）を実施済みの日付
+    #   @plan_date    … 計画の作成に成功した日付
+    # 計画の作成中に想定外の例外が出ても @plan_date は進めないため、次の tick で再試行される
+    # （以前は計画の完成前に「計画済み」としていたため、組み立て中の例外で当日の打刻が
+    #  全て止まり、通知もされないサイレント故障になっていた）。
     def ensure_day_plan(now)
       today = now.to_date
       return if @plan_date == today
 
+      # 日付遷移の副作用は1日1回だけ。再試行の tick で前日未打刻を再通知したり、
+      # @notified_keys をリセットして失敗通知を tick 毎に連打したりしないようにする。
+      start_new_day(today) if @current_date != today
+
+      build_and_apply_day_plan(now, today)
+    rescue StandardError => e
+      # @plan_date を進めないので次の tick で再試行される。同日1回だけ通知する。
+      @logger.error("本日の打刻計画の作成に失敗しました（#{e.class}: #{e.message}）。次の tick で再試行します。")
+      notify_once(:day_plan_failed,
+                  "本日の打刻計画の作成に失敗しました（#{e.class}: #{e.message}）。次のtickで再試行します")
+    end
+
+    # 日付が変わったときの副作用（前日分の後始末と当日用の状態リセット）。
+    def start_new_day(today)
       # 前日の計画を破棄する前に、未打刻のまま日付を跨いだ分がないか確認して通知する。
       # 制約: デーモン再起動でメモリ（@punch_plans）が消えるため、再起動を挟いだ場合は検知できない。
-      notify_unpunched_from_previous_day if @plan_date
+      notify_unpunched_from_previous_day(@current_date) if @current_date
 
-      @plan_date = today
+      @current_date = today
       @punch_plans = {}
       @leave_event = nil
       @last_refresh_at = nil
       @calendar_failure_count = 0 # 前日の連続失敗を持ち越さない
       @notified_keys = [] # 同日デデュープを日付変化でリセット
       @wake_scheduler.reset!
+    end
 
+    # 当日計画を組み立てて状態に反映する。計画はローカルで組み立ててから反映し、
+    # 全て成功した最後に @plan_date を進める（部分状態のまま「計画済み」にしない）。
+    def build_and_apply_day_plan(now, today)
       reason = @calendar.reason(today)
       if reason
         @logger.info("#{today} は対象日ではないため計画しません（#{reason}）。翌日を待機します。")
         # 計画なし＝当日 targets は空。起床予約は tick 末尾の突き合わせで
         # 翌営業日ブートストラップのみが維持される（既存の予約は消さない）。
+        @punch_plans = {}
+        @leave_event = nil
+        @plan_date = today
         return
       end
 
       # sukesan の取得は1回だけ行い、休暇判定と退勤計画で共用する（二重 fetch 回避）。
       # 取得失敗時は休暇判定不能のため通常営業日として扱う（退勤は所定時刻フォールバック）。
+      # 取得失敗（CalendarClient::ApiError）はフォールバックで計画が完成するため成功扱いで、
+      # 再試行の対象になるのは想定外の例外だけ。
       fetched = @config.calendar_enabled ? fetch_events(today) : { events: nil, error: nil }
+      leave = fetched[:events] ? detect_leave(fetched[:events]) : nil
+      unless leave
+        in_target = in_target_at(today)
+        out = plan_clock_out(date: today, events: fetched[:events], error: fetched[:error])
+      end
+
       notify_sukesan_fallback(fetched[:error]) if fetched[:error]
-      if fetched[:events] && (leave = detect_leave(fetched[:events]))
+
+      # 休暇日は打刻計画を持たない（再チェックで休暇が消えていれば下の通常計画に戻る）。
+      if leave
         @leave_event = leave
+        @punch_plans = {}
         @logger.info("休暇イベント『#{leave.title}』を検知したため、本日は打刻しません")
         # 計画なし＝tick 末尾の突き合わせで翌営業日ブートストラップのみが維持される。
+        @plan_date = today
         return
       end
 
-      in_target = in_target_at(today)
+      @leave_event = nil # 再チェックで休暇状態を解除できるよう毎回明示的に設定する
       @punch_plans[:in] = PunchPlan.new(kind: :in, target_at: in_target, done: false)
       @logger.info("出勤目標を設定: #{fmt(in_target)}")
-
-      out = plan_clock_out(date: today, events: fetched[:events], error: fetched[:error])
       set_out_plan(out, now)
+      @plan_date = today
     end
 
     # refresh 間隔ごとに sukesan を再取得して退勤目標を再計算する。
@@ -462,8 +504,7 @@ module Ak4Punch
     # 未打刻のまま一度も起きずに0時を跨いだケース（誤時刻打刻ガードで grace 窓を逃した等）を拾う。
     # 休暇日は @punch_plans が空なので誤報しない。通知は SlackNotifier の再送（pending）機構に乗る
     # （起床直後で Wi-Fi 未接続でも、後の tick で届く）。
-    def notify_unpunched_from_previous_day
-      prev_date = @plan_date
+    def notify_unpunched_from_previous_day(prev_date)
       @punch_plans.each_value do |plan|
         # done でなくても AKASHI に打刻があれば（再起動後の突き合わせ・手動打刻など）通知しない。
         next if plan.done? || already_stamped?(plan.kind, prev_date)
