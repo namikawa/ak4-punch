@@ -155,13 +155,17 @@ module Ak4Punch
     end
 
     # SIGUSR1 のフラグを検知したら当日の計画を破棄して完全再計画する
-    # （休暇状態も破棄 → カレンダー再取得 → 再判定。冪等チェックは Stamper 側にあるため
-    #  打刻済みの分が二重打刻されることはない）。
+    # （休暇状態も打刻計画も破棄 → カレンダー再取得 → 再判定）。
+    # 打刻済み・断念済みの分まで作り直すが、実際の二重打刻は Stamper の冪等チェックが、
+    # 断念時の誤通知は give_up_punch 前の AKASHI 確認（already_stamped?）が防ぐ。
+    # 逆に状態を引き継ぐと、grace 超過で断念（done）した退勤をカレンダー修正＋recheck で
+    # 復活させられなくなる。
     def consume_recheck_request
       return unless @recheck_requested
 
       @recheck_requested = false
-      @plan_date = nil # ensure_day_plan が同一日でも再計画する
+      @plan_date = nil  # ensure_day_plan が同一日でも再計画する
+      @punch_plans = {} # 当日の計画を破棄して完全に作り直す（断念済み・打刻済みの状態も引き継がない）
       # pmset 書き込み失敗で当日の起床予約を無効化していた場合も、再計画に合わせて再試行させる。
       @wake_scheduler.reset!
       @logger.info("再チェック要求を受け付けました。本日の計画を再作成します")
@@ -295,8 +299,10 @@ module Ak4Punch
     end
 
     # 退勤計画を @punch_plans[:out] に反映する。
-    # 目標が同じならリトライ状態（attempted/last_error/final_checked）を引き継ぎ、
+    # 目標が同じなら完了・リトライ状態（done/attempted/last_error/final_checked）を引き継ぎ、
     # 目標が変わったらリセットする（新目標では改めて最終チェック→打刻の順で進む）。
+    # done を目標一致でゲートするのは、断念（done）した目標の状態が別の目標に伝染して
+    # 「打刻もされず起床予約もされない」計画になるのを防ぐため。
     def set_out_plan(out, now)
       @last_refresh_at = now
       target = out[:target]
@@ -310,7 +316,7 @@ module Ak4Punch
       end
 
       @punch_plans[:out] = PunchPlan.new(
-        kind: :out, target_at: target, done: existing&.done? || false,
+        kind: :out, target_at: target, done: same_target ? existing.done? : false,
         attempted: same_target ? existing.attempted : false,
         last_error: same_target ? existing.last_error : nil,
         final_checked: same_target ? existing.final_checked : false,

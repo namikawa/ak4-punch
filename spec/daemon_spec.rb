@@ -962,6 +962,32 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
+  describe "recheck による完全再計画" do
+    it "grace 超過で断念した退勤も、カレンダー修正＋recheck で新目標を作り直して打刻する" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画: 出勤09:30 / 退勤18:00（イベントなし→所定）
+
+      clock_time[:now] = t("18:11") # 退勤目標+grace 超過 → 断念（done=true・スキップ通知）
+      daemon.tick
+      expect(notifier).to have_received(:notify).with(/退勤打刻をスキップしました/).once
+
+      evs[:list] = [event(title: "実装", ends_at: t("19:00"))] # カレンダーを修正して再チェック
+      daemon.request_recheck!
+      clock_time[:now] = t("18:15")
+      daemon.tick # 断念済みの状態を引き継がず、新目標 19:00 で計画し直す
+      expect(logger).to have_received(:info).with(/退勤目標を設定: 2026-07-10 19:00/)
+      expect(wake_scheduler).to have_received(:reschedule).with([t("19:00"), t("09:30", day: 11)])
+
+      clock_time[:now] = t("19:00", 5)
+      daemon.tick
+      expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: t("19:10"))
+    end
+  end
+
   describe "日次計画の作成失敗（原子化と次tickでの再試行）" do
     it "組み立て中の想定外の例外では計画済みにせず、失敗通知は同日1回だけ" do
       # ApiError（フォールバックで計画は完成する）ではなく想定外の例外を投げる
