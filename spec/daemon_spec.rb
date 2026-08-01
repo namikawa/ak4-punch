@@ -112,6 +112,25 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
     end
 
+    it "tick 冒頭は grace 内でも、打刻直前の再取得で窓を超えていたら打刻しない（tick 途中のスリープ対策）" do
+      allow(calendar_client).to receive(:events).and_return([])
+      # @clock の呼び出し順: ①計画 tick の冒頭 ②打刻 tick の冒頭（grace 内）
+      # ③打刻直前の取り直し（窓超過＝この間にスリープした）。以降は最後の値を返す。
+      times = [t("08:00"), t("09:35"), t("09:45")]
+      d = described_class.new(
+        config: config, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: -> { times.length > 1 ? times.shift : times.first }, sleeper: ->(_s) {},
+      )
+
+      d.tick # 計画作成（出勤09:30）
+      expect(stamper).not_to receive(:punch)
+      d.tick # due だが打刻直前の再判定で窓超過 → 断念
+
+      expect(notifier).to have_received(:notify)
+        .with(/出勤打刻をスキップしました.*目標 09:30.*現在 09:45.*15分超過/).once
+    end
+
     it "grace 内（目標+grace ちょうど手前）なら打刻する" do
       allow(calendar_client).to receive(:events).and_return([])
       daemon.tick

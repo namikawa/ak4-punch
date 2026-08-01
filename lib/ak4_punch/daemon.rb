@@ -343,7 +343,16 @@ module Ak4Punch
           plan.final_checked = true
         end
 
-        ok, error = execute_punch(kind, now)
+        # 打刻の直前に時計を取り直して窓を再判定する。tick 冒頭の now のままだと、
+        # tick の途中で Mac がスリープ（プロセス凍結）した場合に、復帰後の実時刻が
+        # 窓を超えていても「grace 内」と誤判定して誤った時刻で打刻してしまうため。
+        punch_now = @clock.call
+        if punch_now > plan.target_at + grace
+          give_up_punch(plan, punch_now)
+          next
+        end
+
+        ok, error = execute_punch(kind, punch_now)
         if ok
           plan.done = true
         else
