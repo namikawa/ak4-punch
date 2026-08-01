@@ -352,7 +352,7 @@ module Ak4Punch
           next
         end
 
-        ok, error = execute_punch(kind, punch_now)
+        ok, error = execute_punch(kind, punch_now, deadline: plan.target_at + grace)
         if ok
           plan.done = true
         else
@@ -476,9 +476,13 @@ module Ak4Punch
 
     # 実際の打刻。トークン更新（CLI#run_punch 相当）→ Stamper#punch（window=0 で即時）。
     # 揺らぎは目標時刻に織込済みのため window は 0 で呼ぶ。冪等・対象日判定は Stamper に委ねる。
+    # deadline（目標+grace）も渡し、トークン再発行や冪等チェックの GET の途中でスリープした
+    # 場合の誤時刻打刻を POST の直前で止める。中止（Stamper::DeadlineExceeded）は他の打刻失敗と
+    # 同じ扱いで返し、次の tick で窓超過と判定されて give_up_punch が通知する
+    # （専用の通知経路は作らない）。
     # 戻り値: [成功(true/false), エラー内容(String or nil)]。
     # 成功には「打刻済みで冪等スキップ」も含む。失敗（例外）は呼び出し側がリトライする。
-    def execute_punch(kind, now)
+    def execute_punch(kind, now, deadline:)
       if @token_store.needs_refresh?(now: now)
         @logger.info("トークンの有効期限が近いため再発行します")
         begin
@@ -493,7 +497,7 @@ module Ak4Punch
         end
       end
 
-      @stamper.punch(kind: kind, date: now.to_date, window_minutes: 0)
+      @stamper.punch(kind: kind, date: now.to_date, window_minutes: 0, deadline: deadline)
       [true, nil]
     rescue StandardError => e
       message = "#{e.class}: #{e.message}"
