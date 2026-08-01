@@ -46,6 +46,32 @@ RSpec.describe Ak4Punch::TokenStore do
     end
   end
 
+  describe "#persist!（atomic write）" do
+    it "所有者のみ読み書き可(0600)の正しいJSONを書く" do
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "token.json")
+        described_class.new(path: path, token: "t", expired_at: Time.new(2026, 8, 31, 0, 0, 0, "+09:00")).persist!
+
+        expect(File.stat(path).mode & 0o777).to eq 0o600
+        expect(JSON.parse(File.read(path)))
+          .to eq("token" => "t", "expired_at" => "2026/08/31 00:00:00")
+        expect(Dir.children(dir)).to eq ["token.json"] # 一時ファイルは残らない
+      end
+    end
+
+    it "置き換えに失敗しても既存の token.json は壊れない" do
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "token.json")
+        File.write(path, JSON.pretty_generate("token" => "old", "expired_at" => "2026/08/01 00:00:00"))
+        allow(File).to receive(:rename).and_raise(Errno::EIO)
+
+        store = described_class.new(path: path, token: "new", expired_at: Time.now)
+        expect { store.persist! }.to raise_error(Errno::EIO)
+        expect(JSON.parse(File.read(path))["token"]).to eq "old"
+      end
+    end
+  end
+
   it "再発行結果が空トークンなら例外" do
     Dir.mktmpdir do |dir|
       store = described_class.load(path: File.join(dir, "token.json"), seed_token: "seed")
