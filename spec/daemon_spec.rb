@@ -194,6 +194,54 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
     end
 
+    it "新目標が既に「目標+grace」を過ぎている場合は退勤目標を更新せず既存の目標を維持する（恒久スキップ防止）" do
+      evs = { list: [event(title: "夕会", starts_at: t("18:30"), ends_at: t("19:00"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 退勤目標 19:00
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻（以降の tick で出勤の窓超過が混ざらないようにする）
+
+      # 18:45 に会議が削除される。新目標は所定 18:00 に戻るが、grace(10分)を過ぎているので
+      # 採用すると同じ tick で give_up＝退勤が打刻されないまま終わってしまう。
+      evs[:list] = []
+      clock_time[:now] = t("18:45")
+      daemon.tick
+
+      expect(logger).to have_received(:warn).with(/退勤目標の更新を見送ります.*既に打刻期限切れ/)
+      expect(logger).not_to have_received(:info).with(/退勤目標を更新/)
+      expect(notifier).not_to have_received(:notify)
+      expect(stamper).not_to have_received(:punch).with(hash_including(kind: :out))
+
+      # 既存の目標（19:00）はそのまま生きており、到達時に打刻される
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("19:00", 5)
+      daemon.tick
+    end
+
+    it "会議の短縮で退勤目標が前倒しされても、grace 内なら採用してその tick で打刻する" do
+      evs = { list: [event(title: "夕会", starts_at: t("18:30"), ends_at: t("19:00"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 退勤目標 19:00
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      # 18:40 の再取得で「18:35 に短縮された」ことを検知する。新目標 18:35 は過去だが
+      # grace(10分)内なので、19:00 まで待たずに採用してその場で打刻する。
+      evs[:list] = [event(title: "夕会", starts_at: t("18:30"), ends_at: t("18:35"))]
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("18:40")
+      daemon.tick
+
+      expect(logger).to have_received(:info).with(/退勤目標を更新.*19:00.*18:35/)
+      expect(logger).not_to have_received(:warn).with(/退勤目標の更新を見送ります/)
+    end
+
     it "refresh 間隔前は再取得しない" do
       allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
       clock_time[:now] = t("08:00")
