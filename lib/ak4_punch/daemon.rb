@@ -314,10 +314,16 @@ module Ak4Punch
     # 目標が同じなら完了・リトライ状態（done/attempted/last_error）を引き継ぎ、
     # 目標が変わったらリセットする。final_checked は出勤では使わないため常に false。
     #
-    # 既存計画の更新で新目標が現在時刻以前になる場合は、更新せず既存の目標を維持する。
-    # 例: 9:20 に 9:00 開始の会議が追加されると新目標が 08:55（過去）になり、grace 超過と
-    # 判定されて出勤が恒久スキップ（give_up で done 確定）になってしまうため。
-    # 退勤側で「定期再取得の失敗で目標を巻き戻さない」としているのと同じクラスの事故を防ぐ。
+    # 既存計画の更新で、新目標を採用しても give_up にしかならない場合
+    # （既に「新目標 + grace」を過ぎている）は更新せず、既存の目標を維持する。
+    # 例: 9:40 に 9:00 開始の会議が追加されると新目標は 08:55 になるが、grace(10分)を
+    # 過ぎているので採用した瞬間に窓超過と判定され、出勤が恒久スキップ（give_up で done 確定）
+    # になってしまう。退勤側の「定期再取得の失敗で目標を巻き戻さない」と同じクラスの事故を防ぐ。
+    #
+    # 判定を「現在時刻以前」ではなく grace 込みにしているのは、目標〜目標+grace の帯なら
+    # 新目標を採用した方が良いため。refresh_if_due は fire_due_punches より前に走るので、
+    # 同じ tick で即座に打刻され「予定の開始までに打刻する」目的に適う（見送ると、本来より
+    # 遅い既存目標まで待つことになる）。
     # 起動時の新規作成（既存計画なし）は、目標が過去でもそのまま計画する（従来どおり
     # grace 内なら打刻し、超過していれば give_up の経路に乗せる）。
     def set_in_plan(plan_result, now)
@@ -325,8 +331,8 @@ module Ak4Punch
       existing = @punch_plans[:in]
       same_target = !existing.nil? && existing.target_at == target
 
-      if existing && !same_target && target <= now
-        @logger.warn("出勤目標の更新を見送ります（新目標 #{fmt(target)} は現在時刻以前）。" \
+      if existing && !same_target && now > target + (@config.daemon_late_grace_minutes * 60)
+        @logger.warn("出勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
                      "現在の目標 #{fmt(existing.target_at)} を維持します（#{plan_result[:summary]}）")
         return
       end
@@ -632,23 +638,25 @@ module Ak4Punch
       nil
     end
 
-    # その日の朝に Mac を起こす時刻。daemon.morning_wake_at が設定されていれば
-    # min(その時刻, 所定出勤時刻)、未設定なら従来どおり所定出勤時刻。
+    # その日の朝に Mac を起こす時刻。出勤アンカーの下限（ClockInPlanner の earliest_at）も
+    # これと同じ値を使い、「Mac が確実に起きている時刻以降に始まる予定しかアンカーにしない」
+    # という不変条件を1本で保つ。
+    #   daemon.morning_wake_at 設定あり → min(その時刻, 所定出勤時刻)
+    #   未設定                          → 所定出勤時刻
     # min を取るのは、morning_wake_at を所定より遅く設定してしまっても
     # 従来より起床が遅くならない（出勤に間に合う）ようにするため。
-    # 出勤目標は「min(所定+ウィンドウ, 最初の業務イベント開始) − 揺らぎ」で、
-    # 下限は earliest_at（= morning_wake_at）に抑えてあるため、この起床時刻より
-    # 大きく前倒しされることはない。
+    # 未設定時に nil（下限なし）にしないのは、深夜の予定（例 00:30）をアンカーにしてしまい、
+    # 寝ている Mac では grace 超過で出勤が打刻されず、起きていれば 00:29 に打刻される、
+    # という従来（所定＋揺らぎ固定）より危険な挙動になるため。
+    # 代償として morning_wake_at 未設定だと下限＝所定出勤時刻になり、所定より前に始まる
+    # 予定はアンカーにならない（＝出勤のカレンダー連動が実質無効。この設定が有効化スイッチを兼ねる）。
+    # 出勤目標は plan_clock_in でこの時刻にクランプするため、これを下回らない。
     def morning_wake_time(date)
-      wake = morning_wake_at(date)
       default = clock_in_default_at(date)
-      wake ? [wake, default].min : default
-    end
-
-    # 出勤アンカーの下限（= 朝の起床時刻）を date 上の Time で返す。未設定なら nil（下限なし）。
-    def morning_wake_at(date)
       hhmm = @config.daemon_morning_wake_at
-      hhmm.nil? ? nil : time_on(date, hhmm)
+      return default if hhmm.nil?
+
+      [time_on(date, hhmm), default].min
     end
 
     # 出勤の目標時刻を計算する。events は取得済みイベント配列
@@ -656,27 +664,29 @@ module Ak4Punch
     # 取得自体は呼び出し側が fetch_events で行い、休暇判定・退勤計画と共用する。
     #
     # 出勤は「締切ベース」で決める: 打刻締切 = min(所定出勤時刻+ウィンドウ, 最初の業務イベント開始)、
-    # 目標 = 締切 − 揺らぎ。予定なしの日の範囲（所定〜所定+ウィンドウ）は従来と変わらない。
+    # 目標 = 締切 − 揺らぎ（朝の起床時刻でクランプ）。
+    # 予定なしの日の範囲（所定〜所定+ウィンドウ）は従来と変わらない。
     # 返り値: { target:, plan:(Plan or nil), deadline:, summary:(String), error:(String or nil) }
     def plan_clock_in(date:, events:, error: nil)
       default = clock_in_deadline_at(date)
+      earliest = morning_wake_time(date) # アンカーの下限 兼 目標のクランプ下限
 
       # 連動OFFなら所定の締切（−揺らぎ）を使う（sukesan にはアクセスしない前提）。
       unless @config.calendar_enabled
-        return { target: apply_jitter_before(default, date, :in), plan: nil, deadline: default,
+        return { target: in_target_at(default, date, earliest), plan: nil, deadline: default,
                  summary: "カレンダー連動OFF（所定時刻）", error: nil }
       end
 
       if events.nil?
         @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定出勤時刻へフォールバックします。")
         summary = "sukesan 障害のため所定時刻へフォールバック"
-        return { target: apply_jitter_before(default, date, :in), plan: nil, deadline: default,
+        return { target: in_target_at(default, date, earliest), plan: nil, deadline: default,
                  summary: summary, error: error }
       end
 
       plan = ClockInPlanner.new(exclude_keywords: @config.calendar_clock_in_exclude_keywords)
                            .plan(events: events, date: date, default_deadline: default,
-                                 earliest_at: morning_wake_at(date))
+                                 earliest_at: earliest)
       summary =
         if plan.source == :calendar
           "採用: #{start_event_label(plan.adopted_event)}"
@@ -684,8 +694,17 @@ module Ak4Punch
           "所定時刻（#{plan.fallback_reason}）"
         end
 
-      { target: apply_jitter_before(plan.deadline_at, date, :in), plan: plan,
+      { target: in_target_at(plan.deadline_at, date, earliest), plan: plan,
         deadline: plan.deadline_at, summary: summary, error: nil }
+    end
+
+    # 出勤の目標時刻 = 締切 − 揺らぎ。ただし朝の起床時刻より前には出さない（クランプ）。
+    # 締切は下限（＝起床時刻）ちょうどまで下がりうるため、そこから揺らぎを引くと起床前になり、
+    # 「ウィンドウ − wake_lead > grace」の設定では起床した時点で既に grace 超過＝出勤が
+    # 恒久スキップになってしまう。クランプは連動OFF・取得失敗の経路にも一律で適用する
+    # （それらは締切が所定+ウィンドウなので実質 no-op）。
+    def in_target_at(deadline, date, earliest)
+      [apply_jitter_before(deadline, date, :in), earliest].max
     end
 
     # 退勤の目標時刻を計算する。events は取得済みイベント配列

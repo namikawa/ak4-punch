@@ -294,11 +294,10 @@ module Ak4Punch
         if plan.considered_events.empty?
           puts "  (対象イベントなし)"
         else
-          excluded_ids = plan.excluded_events.map(&:id)
           plan.considered_events.each do |ev|
             mark =
-              if plan.adopted_event && ev.id == plan.adopted_event.id then "採用 ←"
-              elsif excluded_ids.include?(ev.id) then "除外"
+              if ev.equal?(plan.adopted_event) then "採用 ←"
+              elsif same_event?(plan.excluded_events, ev) then "除外"
               else "対象外"
               end
             puts "  #{ev.starts_at&.strftime('%H:%M')}-#{ev.ends_at.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
@@ -361,18 +360,21 @@ module Ak4Punch
         return
       end
 
-      excluded_ids = plan.excluded_events.map(&:id)
-      too_early_ids = plan.too_early_events.map(&:id)
       listed.each do |ev|
         mark =
-          if plan.adopted_event && ev.id == plan.adopted_event.id then "採用 ←"
-          elsif excluded_ids.include?(ev.id) then "除外"
-          elsif too_early_ids.include?(ev.id) then "早すぎ"
+          if ev.equal?(plan.adopted_event) then "採用 ←"
+          elsif same_event?(plan.excluded_events, ev) then "除外"
+          elsif same_event?(plan.too_early_events, ev) then "早すぎ"
           else "対象外"
           end
         puts "  #{ev.starts_at.strftime('%H:%M')}-#{ev.ends_at&.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
       end
     end
+
+    # イベント一覧のマーク判定。sukesan が id を返さない（nil）ことがあり、Event は Struct で
+    # == が値比較になるため、id や == ではなくオブジェクト同一性で照合する
+    # （Planner が返す配列は取得したイベント配列と同じオブジェクトを保持している）。
+    def same_event?(list, event) = list.any? { |e| e.equal?(event) }
 
     def build_calendar(cfg)
       WorkCalendar.new(

@@ -122,8 +122,9 @@ module Ak4Punch
       @daemon_manage_wake        = dae.fetch("manage_wake", true)
       @daemon_late_grace_minutes = positive_int(dae.fetch("late_grace_minutes", DEFAULT_LATE_GRACE_MINUTES),
                                                 DEFAULT_LATE_GRACE_MINUTES)
-      # 翌営業日に Mac を起こす時刻("HH:MM")。出勤目標の下限（この時刻より前に始まる予定は
-      # 出勤のアンカーに採用しない）も兼ねる。未設定(nil)なら従来どおり所定出勤時刻に起床し、下限もなし。
+      # 翌営業日に Mac を起こす時刻("HH:MM")。出勤アンカーの下限（この時刻より前に始まる予定は
+      # 出勤の締切に採用しない）も兼ねる。未設定(nil)なら起床も下限も所定出勤時刻になる
+      # （＝所定より前に始まる予定はアンカーにならず、出勤のカレンダー連動は実質無効）。
       @daemon_morning_wake_at = dae["morning_wake_at"]
 
       validate!

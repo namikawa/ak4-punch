@@ -1174,13 +1174,38 @@ RSpec.describe Ak4Punch::Daemon do
     end
 
     it "出勤側も判断根拠（in_plan / in_deadline）を返す" do
+      # 朝の予定をアンカーにするには下限（morning_wake_at）を所定より前に置く必要がある
+      cfg = Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
+          "calendar" => { "enabled" => true },
+          "daemon" => { "manage_wake" => false, "morning_wake_at" => "07:45" },
+        },
+        root: Dir.pwd,
+      )
+      d = described_class.new(
+        config: cfg, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      )
       allow(calendar_client).to receive(:events).with(date: date)
         .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
-      day = daemon.build_day_plan(date: date)
+      day = d.build_day_plan(date: date)
       expect(day[:in_plan].adopted_event.title).to eq "定例会議"
       expect(day[:in_deadline]).to eq t("09:00")
       expect(day[:in_target]).to eq t("09:00") # window=0 なので揺らぎなし
       expect(day[:in_error]).to be_nil
+    end
+
+    it "morning_wake_at 未設定なら下限が所定出勤時刻になり、朝の予定はアンカーにならない" do
+      allow(calendar_client).to receive(:events).with(date: date)
+        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+      day = daemon.build_day_plan(date: date) # 既定 config は morning_wake_at 未設定
+      expect(day[:in_plan].adopted_event).to be_nil
+      expect(day[:in_plan].too_early_events.map(&:title)).to eq ["定例会議"]
+      expect(day[:in_deadline]).to eq t("09:30") # 所定の締切のまま
+      expect(day[:in_target]).to eq t("09:30")
     end
 
     it "取得失敗時は out_error を持ち所定時刻へフォールバック" do
@@ -1282,6 +1307,53 @@ RSpec.describe Ak4Punch::Daemon do
         .with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}.*全て下限時刻（07:45）より前/)
     end
 
+    it "下限ちょうどに始まる予定でも、出勤目標は起床時刻より前には出ない（クランプ）" do
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "早朝レビュー", starts_at: t("07:45"), ends_at: t("08:30"))])
+
+      clock_time[:now] = t("07:00")
+      daemon.tick
+
+      # 締切は 07:45。素直に揺らぎを引くと 07:45 より前になるが、起床時刻でクランプされる
+      expect(in_target("07:45")).to be < t("07:45")
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を設定: #{fmt_t(t('07:45'))}（採用: 早朝レビュー 07:45〜）/)
+    end
+
+    context "morning_wake_at 未設定（下限＝所定出勤時刻）" do
+      let(:config) do
+        Ak4Punch::Config.new(
+          data: {
+            "company_id" => "x",
+            "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
+            "calendar" => { "enabled" => true, "clock_in_exclude_keywords" => %w[移動 私用] },
+            "daemon" => { "late_grace_minutes" => 10, "manage_wake" => true, "wake_lead_minutes" => 1 },
+          },
+          root: Dir.pwd,
+        )
+      end
+
+      it "深夜イベントをアンカーにせず所定の締切のままにする（下限が消えない）" do
+        allow(calendar_client).to receive(:events)
+          .and_return([event(title: "深夜バッチ対応", starts_at: t("00:30"), ends_at: t("01:00"))])
+
+        clock_time[:now] = t("00:05")
+        daemon.tick
+
+        expect(logger).to have_received(:info)
+          .with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}.*全て下限時刻（09:25）より前/)
+      end
+
+      it "所定より前に始まる朝の予定もアンカーにならない（出勤の連動は実質無効）" do
+        allow(calendar_client).to receive(:events)
+          .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+
+        clock_time[:now] = t("08:00")
+        daemon.tick
+        expect(logger).to have_received(:info).with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}/)
+      end
+    end
+
     it "揺らぎは日毎に固定で、定期再取得しても目標が動かない" do
       allow(calendar_client).to receive(:events)
         .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
@@ -1328,7 +1400,7 @@ RSpec.describe Ak4Punch::Daemon do
         .with(/出勤目標を更新: #{fmt_t(in_target('09:10'))} → #{fmt_t(in_target('09:30'))}/)
     end
 
-    it "新しい出勤目標が現在時刻以前になる場合は更新せず既存の目標を維持する（恒久スキップ防止）" do
+    it "新目標が既に「目標+grace」を過ぎている場合は更新せず既存の目標を維持する（恒久スキップ防止）" do
       evs = { list: [] }
       allow(calendar_client).to receive(:events) { evs[:list] }
       allow(stamper).to receive(:punch)
@@ -1336,18 +1408,38 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("08:00")
       daemon.tick # 所定の締切 09:30 → 目標 09:25〜09:30
 
-      # 09:20 に「09:00 開始」の会議が追加される（新目標は過去になる）
+      # 09:20 に「09:00 開始」の会議が追加される（新目標 08:59:32 + grace10分 は既に経過）
       evs[:list] = [event(title: "後から入った会議", starts_at: t("09:00"), ends_at: t("09:50"))]
       clock_time[:now] = t("09:20")
       daemon.tick
 
-      expect(logger).to have_received(:warn).with(/出勤目標の更新を見送ります.*現在時刻以前/)
+      expect(logger).to have_received(:warn).with(/出勤目標の更新を見送ります.*既に打刻期限切れ/)
       expect(logger).not_to have_received(:info).with(/出勤目標を更新/)
+      expect(stamper).not_to have_received(:punch).with(hash_including(kind: :in))
 
       # 既存の目標（09:25〜09:30）はそのまま生きており、到達時に打刻される
       expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
       clock_time[:now] = in_target("09:30") + 5
       daemon.tick
+    end
+
+    it "新目標が過去でも grace 内なら採用し、その tick で即座に打刻する" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 所定の締切 09:30 → 目標 09:29:32
+
+      # 09:03 に「09:00 開始」の会議が追加される。新目標 08:59:32 は過去だが grace(10分)内なので、
+      # 既存目標(09:29:32)まで待たずに採用し、同じ tick で打刻する（予定の開始までに打刻する）。
+      evs[:list] = [event(title: "後から入った会議", starts_at: t("09:00"), ends_at: t("09:50"))]
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("09:03")
+      daemon.tick
+
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を更新: #{fmt_t(in_target('09:30'))} → #{fmt_t(in_target('09:00'))}/)
+      expect(logger).not_to have_received(:warn).with(/出勤目標の更新を見送ります/)
     end
 
     it "出勤打刻済みなら定期再取得で出勤目標を作り直さない" do
