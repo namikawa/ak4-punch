@@ -310,7 +310,15 @@ module Ak4Punch
       set_out_plan(plan_clock_out(date: now.to_date, events: fetched[:events]), now) if pending.include?(:out)
     end
 
-    # 目標時刻の窓（目標〜目標+grace）を過ぎていて、もう打刻できないか。
+    # 打刻期限（目標時刻の窓の終端 ＝ 目標 + grace）。grace の解釈をここ1箇所に閉じ込める。
+    # 参照元は2つある: ① unreachable_target?（give_up の発火判定と、既存計画の更新ガード）
+    # ② execute_punch から Stamper / Client に渡し、POST 直前に再判定させる deadline。
+    # この2つは必ず同じ端でなければならない。片方だけ動かすと、デーモンは窓が開いていると
+    # 判断するのに Stamper が DeadlineExceeded で拒み続け、tick 毎のリトライを重ねた末に
+    # 「リトライ上限に達した」という実態と違う内容で通知されることになる。
+    def punch_deadline_at(target) = target + (@config.daemon_late_grace_minutes * 60)
+
+    # 打刻期限（punch_deadline_at）を過ぎていて、もう打刻できないか。
     # fire_due_punches の give_up 発火条件そのものであり、set_in_plan / set_out_plan の
     # 「到達不能な新目標では更新を見送る」ガードの正しさは、この2つが同じ規則であることに
     # 依っている（片方だけ変えるとガードが黙って意味を失う）。必ずこの述語を共有すること。
@@ -325,7 +333,7 @@ module Ak4Punch
     # late_grace_minutes を refresh_interval_minutes より広く取っておくと、この
     # 「前倒しの取りこぼし」が構造的に起きない。
     def unreachable_target?(target, now)
-      now > target + (@config.daemon_late_grace_minutes * 60)
+      now > punch_deadline_at(target)
     end
 
     # 出勤計画を @punch_plans[:in] に反映する（set_out_plan の鏡像）。
@@ -412,7 +420,6 @@ module Ak4Punch
     def fire_due_punches(now)
       return if @leave_event # 休暇日は打刻しない
 
-      grace = @config.daemon_late_grace_minutes * 60
       KINDS.each do |kind|
         plan = @punch_plans[kind]
         next if plan.nil? || plan.done?
@@ -441,7 +448,7 @@ module Ak4Punch
           next
         end
 
-        ok, error = execute_punch(kind, punch_now, deadline: plan.target_at + grace)
+        ok, error = execute_punch(kind, punch_now, deadline: punch_deadline_at(plan.target_at))
         if ok
           plan.done = true
         else
