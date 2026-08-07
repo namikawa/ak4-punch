@@ -37,9 +37,9 @@ RSpec.describe Ak4Punch::Daemon do
   let(:clock_time) { { now: t("08:00") } }
   let(:clock) { -> { clock_time[:now] } }
 
-  def event(title:, ends_at:, all_day: false, id: nil)
+  def event(title:, ends_at:, starts_at: nil, all_day: false, id: nil)
     Ak4Punch::CalendarClient::Event.new(
-      id: id || "e#{title}", title: title, starts_at: nil, ends_at: ends_at,
+      id: id || "e#{title}", title: title, starts_at: starts_at, ends_at: ends_at,
       location: nil, all_day: all_day,
     )
   end
@@ -240,7 +240,7 @@ RSpec.describe Ak4Punch::Daemon do
       # 巻き戻らず 20:00 のまま維持され、退勤スキップ（恒久 done）が起きないこと。
       clock_time[:now] = t("18:20")
       daemon.tick
-      expect(logger).to have_received(:warn).with(/退勤の定期再取得に失敗.*20:00.*維持/).at_least(:once)
+      expect(logger).to have_received(:warn).with(/定期再取得に失敗.*退勤 20:00.*維持/).at_least(:once)
       expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
 
       # 維持された目標 20:00 に達したら退勤打刻される（巻き戻っていたら done 済みで打刻されない）。
@@ -270,7 +270,8 @@ RSpec.describe Ak4Punch::Daemon do
         clock_time[:now] = t("08:16") # refresh 間隔(15分)経過 → 再取得1回目が失敗
         daemon.tick
 
-        expect(logger).to have_received(:warn).with(/退勤の定期再取得に失敗.*20:00.*維持/).once
+        expect(logger).to have_received(:warn)
+          .with(/定期再取得に失敗.*出勤 09:30・退勤 20:00.*維持/).once
         expect(notifier).not_to have_received(:notify)
       end
 
@@ -285,10 +286,10 @@ RSpec.describe Ak4Punch::Daemon do
         end
 
         expect(notifier).to have_received(:notify)
-          .with(/sukesan からのイベント再取得に3回連続で失敗しています。退勤目標は直近の値（20:00）のまま維持します（接続拒否）/)
+          .with(/sukesan からのイベント再取得に3回連続で失敗しています。打刻目標は直近の値（出勤 09:30・退勤 20:00）のまま維持します（接続拒否）/)
           .once
         # 失敗ログ自体は間引かず毎回出す（障害調査で全履歴が必要なため）
-        expect(logger).to have_received(:warn).with(/退勤の定期再取得に失敗/).exactly(5).times
+        expect(logger).to have_received(:warn).with(/定期再取得に失敗/).exactly(5).times
       end
 
       it "途中で取得が成功したらカウントをリセットし、その後2回失敗しても通知しない" do
@@ -598,7 +599,7 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
 
       expect(notifier).to have_received(:notify)
-        .with(/sukesan からのイベント取得に失敗し、退勤は所定時刻にフォールバック.*接続拒否/).once
+        .with(/sukesan からのイベント取得に失敗し、出勤・退勤とも所定時刻にフォールバック.*接続拒否/).once
     end
   end
 
@@ -1172,11 +1173,368 @@ RSpec.describe Ak4Punch::Daemon do
       expect(day[:out_plan].adopted_event.title).to eq "実装"
     end
 
+    it "出勤側も判断根拠（in_plan / in_deadline）を返す" do
+      # 朝の予定をアンカーにするには下限（morning_wake_at）を所定より前に置く必要がある
+      cfg = Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
+          "calendar" => { "enabled" => true },
+          "daemon" => { "manage_wake" => false, "morning_wake_at" => "07:45" },
+        },
+        root: Dir.pwd,
+      )
+      d = described_class.new(
+        config: cfg, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      )
+      allow(calendar_client).to receive(:events).with(date: date)
+        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+      day = d.build_day_plan(date: date)
+      expect(day[:in_plan].adopted_event.title).to eq "定例会議"
+      expect(day[:in_deadline]).to eq t("09:00")
+      expect(day[:in_target]).to eq t("09:00") # window=0 なので揺らぎなし
+      expect(day[:in_error]).to be_nil
+    end
+
+    it "morning_wake_at 未設定なら下限が所定出勤時刻になり、朝の予定はアンカーにならない" do
+      allow(calendar_client).to receive(:events).with(date: date)
+        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+      day = daemon.build_day_plan(date: date) # 既定 config は morning_wake_at 未設定
+      expect(day[:in_plan].adopted_event).to be_nil
+      expect(day[:in_plan].too_early_events.map(&:title)).to eq ["定例会議"]
+      expect(day[:in_deadline]).to eq t("09:30") # 所定の締切のまま
+      expect(day[:in_target]).to eq t("09:30")
+    end
+
     it "取得失敗時は out_error を持ち所定時刻へフォールバック" do
       allow(calendar_client).to receive(:events).and_raise(Ak4Punch::CalendarClient::ApiError, "接続拒否")
       day = daemon.build_day_plan(date: date)
       expect(day[:out_error]).to include "接続拒否"
       expect(day[:out_target]).to eq t("18:00")
+      expect(day[:in_error]).to include "接続拒否"
+      expect(day[:in_target]).to eq t("09:30")
+    end
+  end
+
+  describe "出勤のカレンダー連動" do
+    # 実運用に近い設定: 所定 09:25 + ウィンドウ5分 → 所定の打刻締切は 09:30。
+    # 目標は「締切 − 日毎固定の揺らぎ」なので 09:25〜09:30 に収まる。
+    let(:config) do
+      Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
+          "calendar" => {
+            "enabled" => true, "exclude_keywords" => ["会食"],
+            "clock_in_exclude_keywords" => %w[移動 私用], "refresh_interval_minutes" => 15,
+          },
+          "daemon" => {
+            "tick_seconds" => 30, "late_grace_minutes" => 10, "manage_wake" => true,
+            "wake_lead_minutes" => 1, "morning_wake_at" => "07:45",
+          },
+        },
+        root: Dir.pwd,
+      )
+    end
+
+    # 日毎・kind毎に固定の揺らぎ秒（Daemon と同じ導出）。目標＝締切−この秒数。
+    def jitter(kind, window: 5, day: 10)
+      seed = Date.new(2026, 7, day).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
+      Random.new(seed).rand(0..(window * 60))
+    end
+
+    def in_target(deadline_hhmm, day: 10)
+      t(deadline_hhmm, day: day) - jitter(:in, day: day)
+    end
+
+    # ログ（Daemon#fmt）と同じ書式
+    def fmt_t(time) = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    it "予定がない日は所定の締切（所定+ウィンドウ）から手前に揺らぐ" do
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+
+      expect(logger).to have_received(:info).with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}/)
+      expect(in_target("09:30")).to be_between(t("09:25"), t("09:30"))
+
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = in_target("09:30") + 5
+      daemon.tick
+    end
+
+    it "朝の予定があれば その開始時刻を締切にして手前に揺らぐ（予定までに打刻を済ませる）" do
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      expect(logger).to have_received(:info).with(/出勤目標を設定.*採用: 定例会議 09:00〜/)
+
+      # 09:00 の会議までに打刻される（従来の 09:25〜09:30 ではない）
+      expect(stamper).not_to receive(:punch).with(hash_including(kind: :in))
+      clock_time[:now] = in_target("09:00") - 1
+      daemon.tick
+    end
+
+    it "先頭の移動・私用は連続してスキップし、最初の業務イベントを締切にする" do
+      allow(calendar_client).to receive(:events).and_return(
+        [
+          event(title: "移動", starts_at: t("08:00"), ends_at: t("08:30")),
+          event(title: "私用", starts_at: t("08:30"), ends_at: t("08:45")),
+          event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00")),
+        ],
+      )
+
+      clock_time[:now] = t("07:50")
+      daemon.tick
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を設定: #{fmt_t(in_target('09:00'))}.*採用: 定例会議/)
+    end
+
+    it "morning_wake_at より前に始まる予定はアンカーにしない（所定の締切のまま）" do
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "海外定例", starts_at: t("06:00"), ends_at: t("07:00"))])
+
+      clock_time[:now] = t("05:00")
+      daemon.tick
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}.*全て下限時刻（07:45）より前/)
+    end
+
+    it "下限ちょうどに始まる予定でも、出勤目標は起床時刻より前には出ない（クランプ）" do
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "早朝レビュー", starts_at: t("07:45"), ends_at: t("08:30"))])
+
+      clock_time[:now] = t("07:00")
+      daemon.tick
+
+      # 締切は 07:45。素直に揺らぎを引くと 07:45 より前になるが、起床時刻でクランプされる
+      expect(in_target("07:45")).to be < t("07:45")
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を設定: #{fmt_t(t('07:45'))}（採用: 早朝レビュー 07:45〜）/)
+    end
+
+    context "morning_wake_at 未設定（下限＝所定出勤時刻）" do
+      let(:config) do
+        Ak4Punch::Config.new(
+          data: {
+            "company_id" => "x",
+            "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
+            "calendar" => { "enabled" => true, "clock_in_exclude_keywords" => %w[移動 私用] },
+            "daemon" => { "late_grace_minutes" => 10, "manage_wake" => true, "wake_lead_minutes" => 1 },
+          },
+          root: Dir.pwd,
+        )
+      end
+
+      it "深夜イベントをアンカーにせず所定の締切のままにする（下限が消えない）" do
+        allow(calendar_client).to receive(:events)
+          .and_return([event(title: "深夜バッチ対応", starts_at: t("00:30"), ends_at: t("01:00"))])
+
+        clock_time[:now] = t("00:05")
+        daemon.tick
+
+        expect(logger).to have_received(:info)
+          .with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}.*全て下限時刻（09:25）より前/)
+      end
+
+      it "所定より前に始まる朝の予定もアンカーにならない（出勤の連動は実質無効）" do
+        allow(calendar_client).to receive(:events)
+          .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+
+        clock_time[:now] = t("08:00")
+        daemon.tick
+        expect(logger).to have_received(:info).with(/出勤目標を設定: #{fmt_t(in_target('09:30'))}/)
+      end
+    end
+
+    it "揺らぎは日毎に固定で、定期再取得しても目標が動かない" do
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = t("08:20") # refresh 間隔(15分)経過 → 再取得（同じイベント）
+      daemon.tick
+      clock_time[:now] = t("08:40")
+      daemon.tick
+
+      expect(calendar_client).to have_received(:events).exactly(3).times
+      expect(logger).not_to have_received(:info).with(/出勤目標を更新/)
+    end
+
+    it "定期再取得で朝の予定が追加されたら出勤目標を前倒しする" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 予定なし → 所定の締切 09:30
+
+      evs[:list] = [event(title: "急な打合せ", starts_at: t("09:10"), ends_at: t("09:40"))]
+      clock_time[:now] = t("08:20")
+      daemon.tick
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を更新: #{fmt_t(in_target('09:30'))} → #{fmt_t(in_target('09:10'))}/)
+      expect(wake_scheduler).to have_received(:reschedule)
+        .with([in_target("09:10"), t("18:00") + jitter(:out), t("07:45", day: 11)])
+    end
+
+    it "定期再取得で朝の予定が消えたら所定の締切に戻す（後ろ倒しは現在時刻より後なら反映する）" do
+      evs = { list: [event(title: "急な打合せ", starts_at: t("09:10"), ends_at: t("09:40"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+
+      evs[:list] = [] # 会議がキャンセルされた
+      clock_time[:now] = t("08:20")
+      daemon.tick
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を更新: #{fmt_t(in_target('09:10'))} → #{fmt_t(in_target('09:30'))}/)
+    end
+
+    it "新目標が既に「目標+grace」を過ぎている場合は更新せず既存の目標を維持する（恒久スキップ防止）" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 所定の締切 09:30 → 目標 09:25〜09:30
+
+      # 09:20 に「09:00 開始」の会議が追加される（新目標 08:59:32 + grace10分 は既に経過）
+      evs[:list] = [event(title: "後から入った会議", starts_at: t("09:00"), ends_at: t("09:50"))]
+      clock_time[:now] = t("09:20")
+      daemon.tick
+
+      expect(logger).to have_received(:warn).with(/出勤目標の更新を見送ります.*既に打刻期限切れ/)
+      expect(logger).not_to have_received(:info).with(/出勤目標を更新/)
+      expect(stamper).not_to have_received(:punch).with(hash_including(kind: :in))
+
+      # 既存の目標（09:25〜09:30）はそのまま生きており、到達時に打刻される
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = in_target("09:30") + 5
+      daemon.tick
+    end
+
+    it "新目標が過去でも grace 内なら採用し、その tick で即座に打刻する" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 所定の締切 09:30 → 目標 09:29:32
+
+      # 09:03 に「09:00 開始」の会議が追加される。新目標 08:59:32 は過去だが grace(10分)内なので、
+      # 既存目標(09:29:32)まで待たずに採用し、同じ tick で打刻する（予定の開始までに打刻する）。
+      evs[:list] = [event(title: "後から入った会議", starts_at: t("09:00"), ends_at: t("09:50"))]
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("09:03")
+      daemon.tick
+
+      expect(logger).to have_received(:info)
+        .with(/出勤目標を更新: #{fmt_t(in_target('09:30'))} → #{fmt_t(in_target('09:00'))}/)
+      expect(logger).not_to have_received(:warn).with(/出勤目標の更新を見送ります/)
+    end
+
+    it "出勤打刻済みなら定期再取得で出勤目標を作り直さない" do
+      evs = { list: [] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+      clock_time[:now] = in_target("09:30") + 5
+      daemon.tick # 出勤打刻 → done
+
+      evs[:list] = [event(title: "夕方の打合せ", starts_at: t("17:00"), ends_at: t("19:00"))]
+      clock_time[:now] = t("10:00")
+      daemon.tick # 再取得（退勤目標だけ更新される）
+
+      expect(logger).not_to have_received(:info).with(/出勤目標を更新/)
+      expect(logger).to have_received(:info).with(/退勤目標を更新/)
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything).once
+    end
+
+    it "定期再取得に失敗しても出勤目標は直近の値のまま維持する" do
+      calls = 0
+      allow(calendar_client).to receive(:events) do
+        calls += 1
+        raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if calls > 1
+
+        [event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))]
+      end
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 出勤目標 = 09:00 − 揺らぎ
+
+      clock_time[:now] = t("08:20") # 再取得が失敗
+      daemon.tick
+      expect(logger).to have_received(:warn)
+        .with(/定期再取得に失敗.*出勤 #{in_target('09:00').strftime('%H:%M')}.*維持/)
+
+      # 所定の締切（09:30）へ巻き戻っていない＝維持された目標で打刻される
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = in_target("09:00") + 5
+      daemon.tick
+    end
+
+    it "翌営業日のブートストラップ起床は morning_wake_at になる" do
+      allow(calendar_client).to receive(:events).and_return([])
+
+      # 当日の目標2つ + 翌営業日(7/11)の朝 07:45
+      expect(wake_scheduler).to receive(:reschedule)
+        .with([in_target("09:30"), t("18:00") + jitter(:out), t("07:45", day: 11)])
+      clock_time[:now] = t("08:00")
+      daemon.tick
+    end
+  end
+
+  describe "ブートストラップ起床時刻（morning_wake_at）" do
+    def wake_daemon(daemon_config)
+      cfg = Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:25", "clock_out" => "18:00" },
+          "calendar" => { "enabled" => true },
+          "daemon" => { "manage_wake" => true, "wake_lead_minutes" => 1 }.merge(daemon_config),
+        },
+        root: Dir.pwd,
+      )
+      described_class.new(
+        config: cfg, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      )
+    end
+
+    before { allow(calendar_client).to receive(:events).and_return([]) }
+
+    it "未設定なら従来どおり翌営業日の所定出勤時刻を予約する" do
+      expect(wake_scheduler).to receive(:reschedule)
+        .with([t("09:25"), t("18:00"), t("09:25", day: 11)])
+      clock_time[:now] = t("08:00")
+      wake_daemon({}).tick
+    end
+
+    it "所定より早い morning_wake_at を設定するとその時刻を予約する" do
+      expect(wake_scheduler).to receive(:reschedule)
+        .with([t("09:25"), t("18:00"), t("07:45", day: 11)])
+      clock_time[:now] = t("08:00")
+      wake_daemon("morning_wake_at" => "07:45").tick
+    end
+
+    it "所定より遅い morning_wake_at を設定しても所定出勤時刻より遅くはしない（min を取る）" do
+      expect(wake_scheduler).to receive(:reschedule)
+        .with([t("09:25"), t("18:00"), t("09:25", day: 11)])
+      clock_time[:now] = t("08:00")
+      wake_daemon("morning_wake_at" => "10:00").tick
     end
   end
 end

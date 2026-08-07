@@ -17,6 +17,8 @@ module Ak4Punch
 
     # カレンダー連動デーモンの既定値。
     DEFAULT_EXCLUDE_KEYWORDS = %w[会食 懇親会 飲み会 打ち上げ 歓迎会 送別会 忘年会 新年会].freeze
+    # 出勤側（朝の先頭イベントのスキップ）の除外キーワード。退勤側とは目的が違うため独立させる。
+    DEFAULT_CLOCK_IN_EXCLUDE_KEYWORDS = %w[移動 私用].freeze
     DEFAULT_REFRESH_INTERVAL_MINUTES = 15
     # 定期再取得が何回連続で失敗したら Slack に通知するか
     # （DarkWake 中の無通信など一過性の失敗で鳴らさないための閾値）。
@@ -38,11 +40,12 @@ module Ak4Punch
                 :exclude_dates, :extra_workdays,
                 :check_existing, :token_path, :token_refresh_threshold_days,
                 :sukesan_base_url, :sukesan_api_key,
-                :calendar_enabled, :calendar_exclude_keywords, :calendar_refresh_interval_minutes,
+                :calendar_enabled, :calendar_exclude_keywords, :calendar_clock_in_exclude_keywords,
+                :calendar_refresh_interval_minutes,
                 :calendar_refresh_failure_notify_threshold,
                 :calendar_leave_keywords, :calendar_leave_min_duration_hours,
                 :daemon_tick_seconds, :daemon_wake_lead_minutes,
-                :daemon_manage_wake, :daemon_late_grace_minutes,
+                :daemon_manage_wake, :daemon_late_grace_minutes, :daemon_morning_wake_at,
                 :slack_webhook_url, :slack_mention
 
     def self.load(config_path:, root:)
@@ -92,6 +95,10 @@ module Ak4Punch
       @calendar_enabled = cal.fetch("enabled", false)
       kw = cal["exclude_keywords"]
       @calendar_exclude_keywords = kw.nil? ? DEFAULT_EXCLUDE_KEYWORDS.dup : Array(kw).map(&:to_s)
+      # 出勤側は「朝の先頭から飛ばすイベント」の判定に使う（移動・私用など、出社前の予定）。
+      ikw = cal["clock_in_exclude_keywords"]
+      @calendar_clock_in_exclude_keywords =
+        ikw.nil? ? DEFAULT_CLOCK_IN_EXCLUDE_KEYWORDS.dup : Array(ikw).map(&:to_s)
       @calendar_refresh_interval_minutes =
         positive_int(cal.fetch("refresh_interval_minutes", DEFAULT_REFRESH_INTERVAL_MINUTES),
                      DEFAULT_REFRESH_INTERVAL_MINUTES)
@@ -115,6 +122,10 @@ module Ak4Punch
       @daemon_manage_wake        = dae.fetch("manage_wake", true)
       @daemon_late_grace_minutes = positive_int(dae.fetch("late_grace_minutes", DEFAULT_LATE_GRACE_MINUTES),
                                                 DEFAULT_LATE_GRACE_MINUTES)
+      # 翌営業日に Mac を起こす時刻("HH:MM")。出勤アンカーの下限（この時刻より前に始まる予定は
+      # 出勤の締切に採用しない）も兼ねる。未設定(nil)なら起床も下限も所定出勤時刻になる
+      # （＝所定より前に始まる予定はアンカーにならず、出勤のカレンダー連動は実質無効）。
+      @daemon_morning_wake_at = dae["morning_wake_at"]
 
       validate!
     end
@@ -135,6 +146,8 @@ module Ak4Punch
       raise Error, "エンドポイント(base_url)が未設定です。" if blank?(@base_url)
       validate_time!("work.clock_in", @clock_in_time)
       validate_time!("work.clock_out", @clock_out_time)
+      # 任意項目。設定されている場合だけ書式を検証する（未設定＝従来動作）。
+      validate_time!("daemon.morning_wake_at", @daemon_morning_wake_at) unless @daemon_morning_wake_at.nil?
     end
 
     # 所定時刻は文字列のまま保持し、目標時刻の算出時に "HH:MM" として解釈する。
