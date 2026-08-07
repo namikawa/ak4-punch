@@ -259,7 +259,7 @@ module Ak4Punch
 
       @leave_event = nil # 再チェックで休暇状態を解除できるよう毎回明示的に設定する
       set_in_plan(in_plan, now)
-      set_out_plan(out)
+      set_out_plan(out, now)
       @plan_date = today
     end
 
@@ -307,23 +307,36 @@ module Ak4Punch
       return if switch_to_leave_day?(fetched[:events])
 
       set_in_plan(plan_clock_in(date: now.to_date, events: fetched[:events]), now) if pending.include?(:in)
-      set_out_plan(plan_clock_out(date: now.to_date, events: fetched[:events])) if pending.include?(:out)
+      set_out_plan(plan_clock_out(date: now.to_date, events: fetched[:events]), now) if pending.include?(:out)
+    end
+
+    # 目標時刻の窓（目標〜目標+grace）を過ぎていて、もう打刻できないか。
+    # fire_due_punches の give_up 発火条件そのものであり、set_in_plan / set_out_plan の
+    # 「到達不能な新目標では更新を見送る」ガードの正しさは、この2つが同じ規則であることに
+    # 依っている（片方だけ変えるとガードが黙って意味を失う）。必ずこの述語を共有すること。
+    #
+    # 既存計画の更新で採用してはいけない新目標＝この述語が true になる目標。
+    # 採用しても fire_due_punches が即座に窓超過と判定して give_up（done 確定）にするだけなので、
+    # まだ到達可能な既存目標を潰して打刻機会を失うことになる。出勤・退勤で共通の規則。
+    #
+    # 判定を「現在時刻以前」ではなく grace 込みにしているのは、目標〜目標+grace の帯なら
+    # 新目標を採用した方が良いため。refresh_if_due は fire_due_punches より前に走るので、
+    # 同じ tick で速やかに打刻される（見送ると、本来より遅い既存目標まで待つことになる）。
+    # late_grace_minutes を refresh_interval_minutes より広く取っておくと、この
+    # 「前倒しの取りこぼし」が構造的に起きない。
+    def unreachable_target?(target, now)
+      now > target + (@config.daemon_late_grace_minutes * 60)
     end
 
     # 出勤計画を @punch_plans[:in] に反映する（set_out_plan の鏡像）。
     # 目標が同じなら完了・リトライ状態（done/attempted/last_error）を引き継ぎ、
     # 目標が変わったらリセットする。final_checked は出勤では使わないため常に false。
     #
-    # 既存計画の更新で、新目標を採用しても give_up にしかならない場合
-    # （既に「新目標 + grace」を過ぎている）は更新せず、既存の目標を維持する。
+    # 既存計画の更新で、新目標が到達不能（unreachable_target?）なら更新せず既存の目標を維持する。
     # 例: 9:40 に 9:00 開始の会議が追加されると新目標は 08:55 になるが、grace(10分)を
     # 過ぎているので採用した瞬間に窓超過と判定され、出勤が恒久スキップ（give_up で done 確定）
     # になってしまう。退勤側の「定期再取得の失敗で目標を巻き戻さない」と同じクラスの事故を防ぐ。
-    #
-    # 判定を「現在時刻以前」ではなく grace 込みにしているのは、目標〜目標+grace の帯なら
-    # 新目標を採用した方が良いため。refresh_if_due は fire_due_punches より前に走るので、
-    # 同じ tick で即座に打刻され「予定の開始までに打刻する」目的に適う（見送ると、本来より
-    # 遅い既存目標まで待つことになる）。
+    # 逆に grace 内の前倒しは採用する（同じ tick で打刻され「予定の開始までに打刻する」目的に適う）。
     # 起動時の新規作成（既存計画なし）は、目標が過去でもそのまま計画する（従来どおり
     # grace 内なら打刻し、超過していれば give_up の経路に乗せる）。
     def set_in_plan(plan_result, now)
@@ -331,7 +344,7 @@ module Ak4Punch
       existing = @punch_plans[:in]
       same_target = !existing.nil? && existing.target_at == target
 
-      if existing && !same_target && now > target + (@config.daemon_late_grace_minutes * 60)
+      if existing && !same_target && unreachable_target?(target, now)
         @logger.warn("出勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
                      "現在の目標 #{fmt(existing.target_at)} を維持します（#{plan_result[:summary]}）")
         return
@@ -356,12 +369,28 @@ module Ak4Punch
     # 目標が変わったらリセットする（新目標では改めて最終チェック→打刻の順で進む）。
     # done を目標一致でゲートするのは、断念（done）した目標の状態が別の目標に伝染して
     # 「打刻もされず起床予約もされない」計画になるのを防ぐため。
-    # 出勤と違い「新目標が現在以前なら見送る」ガードは持たない。会議が短縮されて目標が
-    # 前倒しされた場合は、grace 窓内で速やかに打刻するのが正しい挙動のため。
-    def set_out_plan(out)
+    #
+    # 出勤と同じく、既存計画の更新で新目標が到達不能（unreachable_target?）なら見送る。
+    # 会議が短縮されて目標が前倒しされた場合は、これまでどおり grace 窓内で速やかに打刻する。
+    # 見送るのは「採用した瞬間に give_up にしかならない」場合だけ。
+    # 例: 18:30-19:00 の会議で退勤目標が 19:01 の日に、18:45 にその会議が削除されると
+    # 新目標は所定へ戻って 18:01 になるが、grace を過ぎているので採用した瞬間に窓超過と
+    # 判定され、退勤が打刻されないまま「目標 18:01／現在 18:45・44分超過」と通知される。
+    # give_up は「Mac がスリープして窓を逃した」ときの誤時刻打刻ガードであり、デーモン自身の
+    # 再計画が作った過去目標をこの経路に流すのは筋が違う（通知も寝過ごしたように読めて誤解を招く）。
+    # 既存目標（19:01）で打刻すると記録は遅れるが、正解の 18:00 は既に過ぎていて AKASHI は
+    # 遡って打刻できない以上どの選択肢でも誤記録になるため、打刻されず手動対応を強いるより
+    # 既存目標で打刻する方を採る。
+    def set_out_plan(out, now)
       target = out[:target]
       existing = @punch_plans[:out]
       same_target = !existing.nil? && existing.target_at == target
+
+      if existing && !same_target && unreachable_target?(target, now)
+        @logger.warn("退勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
+                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{out[:summary]}）")
+        return
+      end
 
       if existing && !same_target
         @logger.info("退勤目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{out[:summary]}）")
@@ -389,7 +418,7 @@ module Ak4Punch
         next if plan.nil? || plan.done?
         next if now < plan.target_at # まだ
 
-        if now > plan.target_at + grace
+        if unreachable_target?(plan.target_at, now)
           give_up_punch(plan, now)
           next
         end
@@ -407,7 +436,7 @@ module Ak4Punch
         # tick の途中で Mac がスリープ（プロセス凍結）した場合に、復帰後の実時刻が
         # 窓を超えていても「grace 内」と誤判定して誤った時刻で打刻してしまうため。
         punch_now = @clock.call
-        if punch_now > plan.target_at + grace
+        if unreachable_target?(plan.target_at, punch_now)
           give_up_punch(plan, punch_now)
           next
         end
@@ -503,7 +532,8 @@ module Ak4Punch
       return false if out[:target] <= now
 
       @logger.info("退勤直前チェック: 目標が後ろ倒しされたため打刻を延期します")
-      set_out_plan(out) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
+      # 新目標は now より後（上のガードで確認済み）なので、set_out_plan の到達不能ガードには掛からない。
+      set_out_plan(out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
       true
     end
 
