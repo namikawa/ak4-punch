@@ -221,6 +221,31 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
     end
 
+    it "維持した既存目標も期限切れなら、その目標で正当に断念して通知する（ガードは give_up を潰さない）" do
+      evs = { list: [event(title: "夕会", starts_at: t("18:30"), ends_at: t("19:00"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 退勤目標 19:00
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      # Mac が寝ていて 19:40 に起床。その間に会議も削除されている。
+      # 新目標（所定 18:00）は到達不能なので見送るが、維持した 19:00 も既に期限切れなので断念する。
+      evs[:list] = []
+      clock_time[:now] = t("19:40")
+      daemon.tick
+
+      expect(logger).to have_received(:warn).with(/退勤目標の更新を見送ります.*既に打刻期限切れ/)
+      expect(stamper).not_to have_received(:punch).with(hash_including(kind: :out))
+      # 通知は維持した目標（19:00）基準になり、実態と合う
+      # （見送らないと目標が 18:00 に化けて「1時間40分超過」という誤った内容になる）
+      expect(notifier).to have_received(:notify)
+        .with(/退勤打刻をスキップしました（目標 19:00／現在 19:40・40分超過）/).once
+      expect(notifier).not_to have_received(:notify).with(/目標 18:00/)
+    end
+
     it "会議の短縮で退勤目標が前倒しされても、grace 内なら採用してその tick で打刻する" do
       evs = { list: [event(title: "夕会", starts_at: t("18:30"), ends_at: t("19:00"))] }
       allow(calendar_client).to receive(:events) { evs[:list] }

@@ -310,7 +310,12 @@ module Ak4Punch
       set_out_plan(plan_clock_out(date: now.to_date, events: fetched[:events]), now) if pending.include?(:out)
     end
 
-    # 既存計画の更新で採用してはいけない新目標か（既に「新目標 + grace」を過ぎている）。
+    # 目標時刻の窓（目標〜目標+grace）を過ぎていて、もう打刻できないか。
+    # fire_due_punches の give_up 発火条件そのものであり、set_in_plan / set_out_plan の
+    # 「到達不能な新目標では更新を見送る」ガードの正しさは、この2つが同じ規則であることに
+    # 依っている（片方だけ変えるとガードが黙って意味を失う）。必ずこの述語を共有すること。
+    #
+    # 既存計画の更新で採用してはいけない新目標＝この述語が true になる目標。
     # 採用しても fire_due_punches が即座に窓超過と判定して give_up（done 確定）にするだけなので、
     # まだ到達可能な既存目標を潰して打刻機会を失うことになる。出勤・退勤で共通の規則。
     #
@@ -413,7 +418,7 @@ module Ak4Punch
         next if plan.nil? || plan.done?
         next if now < plan.target_at # まだ
 
-        if now > plan.target_at + grace
+        if unreachable_target?(plan.target_at, now)
           give_up_punch(plan, now)
           next
         end
@@ -431,7 +436,7 @@ module Ak4Punch
         # tick の途中で Mac がスリープ（プロセス凍結）した場合に、復帰後の実時刻が
         # 窓を超えていても「grace 内」と誤判定して誤った時刻で打刻してしまうため。
         punch_now = @clock.call
-        if punch_now > plan.target_at + grace
+        if unreachable_target?(plan.target_at, punch_now)
           give_up_punch(plan, punch_now)
           next
         end
