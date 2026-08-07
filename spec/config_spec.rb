@@ -114,12 +114,15 @@ RSpec.describe Ak4Punch::Config do
       cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
       expect(cfg.calendar_enabled).to be false
       expect(cfg.calendar_exclude_keywords).to eq described_class::DEFAULT_EXCLUDE_KEYWORDS
+      expect(cfg.calendar_clock_in_exclude_keywords).to eq described_class::DEFAULT_CLOCK_IN_EXCLUDE_KEYWORDS
+      expect(cfg.calendar_clock_in_exclude_keywords).to eq %w[移動 私用]
       expect(cfg.calendar_refresh_interval_minutes).to eq 15
       expect(cfg.calendar_refresh_failure_notify_threshold).to eq 3
       expect(cfg.daemon_tick_seconds).to eq 30
       expect(cfg.daemon_wake_lead_minutes).to eq 1
       expect(cfg.daemon_manage_wake).to be true
       expect(cfg.daemon_late_grace_minutes).to eq 10
+      expect(cfg.daemon_morning_wake_at).to be_nil # 未設定なら従来動作（所定出勤時刻に起床・下限なし）
       expect(cfg.sukesan_base_url).to eq "http://127.0.0.1:3000"
     end
 
@@ -130,24 +133,28 @@ RSpec.describe Ak4Punch::Config do
           "calendar" => {
             "enabled" => true,
             "exclude_keywords" => %w[飲み会 打ち上げ],
+            "clock_in_exclude_keywords" => %w[移動 通院],
             "refresh_interval_minutes" => 5,
             "refresh_failure_notify_threshold" => 6,
           },
           "daemon" => {
             "tick_seconds" => 60, "wake_lead_minutes" => 2,
             "manage_wake" => false, "late_grace_minutes" => 20,
+            "morning_wake_at" => "07:45",
           },
         },
         root: Dir.pwd,
       )
       expect(cfg.calendar_enabled).to be true
       expect(cfg.calendar_exclude_keywords).to eq %w[飲み会 打ち上げ]
+      expect(cfg.calendar_clock_in_exclude_keywords).to eq %w[移動 通院]
       expect(cfg.calendar_refresh_interval_minutes).to eq 5
       expect(cfg.calendar_refresh_failure_notify_threshold).to eq 6
       expect(cfg.daemon_tick_seconds).to eq 60
       expect(cfg.daemon_wake_lead_minutes).to eq 2
       expect(cfg.daemon_manage_wake).to be false
       expect(cfg.daemon_late_grace_minutes).to eq 20
+      expect(cfg.daemon_morning_wake_at).to eq "07:45"
     end
 
     it "不正な数値（0以下）は既定値へフォールバック" do
@@ -184,6 +191,46 @@ RSpec.describe Ak4Punch::Config do
         root: Dir.pwd,
       )
       expect(cfg.calendar_exclude_keywords).to eq []
+    end
+
+    it "clock_in_exclude_keywords を空配列にすると出勤側の除外なしにできる" do
+      cfg = described_class.new(
+        data: { "company_id" => "x", "calendar" => { "clock_in_exclude_keywords" => [] } },
+        root: Dir.pwd,
+      )
+      expect(cfg.calendar_clock_in_exclude_keywords).to eq []
+      # 退勤側の既定には影響しない（独立した設定）
+      expect(cfg.calendar_exclude_keywords).to eq described_class::DEFAULT_EXCLUDE_KEYWORDS
+    end
+
+    describe "daemon.morning_wake_at の検証" do
+      def cfg_with_wake(value)
+        described_class.new(
+          data: { "company_id" => "x", "daemon" => { "morning_wake_at" => value } },
+          root: Dir.pwd,
+        )
+      end
+
+      it "HH:MM 形式を受理する" do
+        expect(cfg_with_wake("7:05").daemon_morning_wake_at).to eq "7:05"
+        expect(cfg_with_wake("07:45").daemon_morning_wake_at).to eq "07:45"
+      end
+
+      it "時刻でない文字列はエラー（どのキーがどの値で不正か分かる）" do
+        expect { cfg_with_wake("あさ") }
+          .to raise_error(Ak4Punch::Config::Error, /daemon\.morning_wake_at の時刻指定が不正です.*あさ/)
+      end
+
+      it "範囲外・数値（YAML で引用符を付け忘れた場合）もエラー" do
+        expect { cfg_with_wake("24:00") }
+          .to raise_error(Ak4Punch::Config::Error, /daemon\.morning_wake_at の時刻指定が不正です.*24:00/)
+        expect { cfg_with_wake(745) }
+          .to raise_error(Ak4Punch::Config::Error, /daemon\.morning_wake_at の時刻指定が不正です.*745/)
+      end
+
+      it "未設定（nil）はエラーにしない" do
+        expect(cfg_with_wake(nil).daemon_morning_wake_at).to be_nil
+      end
     end
   end
 

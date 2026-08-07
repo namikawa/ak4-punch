@@ -280,9 +280,10 @@ module Ak4Punch
         return
       end
 
-      puts "出勤目標: #{day[:in_target].strftime('%H:%M:%S')}（所定 #{cfg.clock_in_time}#{cfg.clock_in_window.positive? ? "+0〜#{cfg.clock_in_window}分揺らぎ" : ''}）"
+      print_in_plan(day, cfg)
       puts
 
+      puts "[退勤]"
       plan = day[:out_plan]
       if day[:out_error]
         puts "カレンダー取得: 失敗（#{day[:out_error]}）→ 所定退勤時刻へフォールバック"
@@ -315,6 +316,62 @@ module Ak4Punch
       puts
       out_window = cfg.clock_out_window.positive? ? "+0〜#{cfg.clock_out_window}分揺らぎ" : ""
       puts "退勤目標: #{day[:out_target].strftime('%H:%M:%S')}#{out_window.empty? ? '' : "（#{out_window}）"}"
+    end
+
+    # `punch plan` の出勤側（カレンダー連動の判断根拠＋打刻締切と目標）を出力する。
+    # 出勤は「締切 −0〜N分揺らぎ」で決まるため、退勤側と違い締切も表示する。
+    def print_in_plan(day, cfg)
+      puts "[出勤]"
+      plan = day[:in_plan]
+      if day[:in_error]
+        puts "カレンダー取得: 失敗（#{day[:in_error]}）→ 所定出勤時刻へフォールバック"
+      elsif !cfg.calendar_enabled
+        puts "カレンダー連動: OFF（config の calendar.enabled=false）→ 所定出勤時刻"
+      elsif plan
+        print_in_events(plan)
+        puts
+        if plan.source == :calendar
+          puts "採用イベント: #{plan.adopted_event.display_title}（開始 #{plan.adopted_event.starts_at.strftime('%H:%M')}）"
+          puts "フォールバック: #{plan.fallback_reason}" if plan.fallback_reason
+        else
+          puts "採用イベントなし → 所定の出勤締切（理由: #{plan.fallback_reason}）"
+        end
+      end
+
+      puts
+      deadline = day[:in_deadline]
+      adopted = plan&.adopted_event
+      note =
+        if adopted && deadline == adopted.starts_at
+          "採用イベントの開始"
+        else
+          "所定 #{cfg.clock_in_time} + ウィンドウ#{cfg.clock_in_window}分"
+        end
+      puts "打刻締切: #{deadline.strftime('%H:%M:%S')}（#{note}）"
+      in_window = cfg.clock_in_window.positive? ? "締切 −0〜#{cfg.clock_in_window}分揺らぎ" : "揺らぎなし"
+      puts "出勤目標: #{day[:in_target].strftime('%H:%M:%S')}（#{in_window}）"
+    end
+
+    # 出勤判定に使ったイベント一覧（当日・開始時刻ありのみ・開始昇順）を採否のマーク付きで出力する。
+    def print_in_events(plan)
+      puts "取得イベント（当日・開始時刻ありのみ・開始昇順）:"
+      listed = (plan.too_early_events + plan.considered_events).sort_by(&:starts_at)
+      if listed.empty?
+        puts "  (対象イベントなし)"
+        return
+      end
+
+      excluded_ids = plan.excluded_events.map(&:id)
+      too_early_ids = plan.too_early_events.map(&:id)
+      listed.each do |ev|
+        mark =
+          if plan.adopted_event && ev.id == plan.adopted_event.id then "採用 ←"
+          elsif excluded_ids.include?(ev.id) then "除外"
+          elsif too_early_ids.include?(ev.id) then "早すぎ"
+          else "対象外"
+          end
+        puts "  #{ev.starts_at.strftime('%H:%M')}-#{ev.ends_at&.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
+      end
     end
 
     def build_calendar(cfg)
