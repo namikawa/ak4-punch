@@ -234,34 +234,21 @@ RSpec.describe Ak4Punch::Config do
     end
   end
 
-  describe "休暇の自動検知設定" do
+  describe "休暇イベントのキーワード設定" do
     it "既定値を持つ（未設定時）" do
       cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
-      expect(cfg.calendar_leave_keywords).to eq %w[休暇 有給 年休 全休 休み]
-      expect(cfg.calendar_leave_min_duration_hours).to eq 4
+      expect(cfg.calendar_leave_keywords).to eq %w[休み 休暇]
     end
 
     it "config の値で上書きできる" do
       cfg = described_class.new(
-        data: {
-          "company_id" => "x",
-          "calendar" => { "leave_keywords" => %w[休暇 PTO], "leave_min_duration_hours" => 6 },
-        },
+        data: { "company_id" => "x", "calendar" => { "leave_keywords" => %w[休暇 PTO] } },
         root: Dir.pwd,
       )
       expect(cfg.calendar_leave_keywords).to eq %w[休暇 PTO]
-      expect(cfg.calendar_leave_min_duration_hours).to eq 6
     end
 
-    it "不正な数値（0以下）は既定値へフォールバック" do
-      cfg = described_class.new(
-        data: { "company_id" => "x", "calendar" => { "leave_min_duration_hours" => 0 } },
-        root: Dir.pwd,
-      )
-      expect(cfg.calendar_leave_min_duration_hours).to eq 4
-    end
-
-    it "leave_keywords を空配列にすると休暇検知なしにできる" do
+    it "leave_keywords を空配列にすると休暇の判定なしにできる" do
       cfg = described_class.new(
         data: { "company_id" => "x", "calendar" => { "leave_keywords" => [] } },
         root: Dir.pwd,
