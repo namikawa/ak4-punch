@@ -269,20 +269,33 @@ module Ak4Punch
         return
       end
 
-      if (leave = day[:leave_event])
-        duration =
-          if leave.all_day
-            "終日"
-          else
-            format("%g時間", (leave.ends_at - leave.starts_at) / 3600.0)
-          end
-        puts "休暇検知: イベント『#{leave.title}』（#{duration}）→ この日は打刻しません"
+      print_leave_periods(day)
+
+      if day[:full_leave]
+        puts "全休: 休暇イベントで当日の勤務時間がなくなるため、この日は打刻しません"
         return
       end
 
       print_in_plan(day, cfg)
       puts
+      print_out_plan(day, cfg)
+    end
 
+    # 休暇として扱ったイベントの一覧。キーワード部分一致・時間の閾値なしで拾うため
+    # 「休み明けMTG」のようなタイトルも休暇になる。取りこぼし・拾いすぎに気づけるよう、
+    # 半休の日（通常の計画を表示する日）でも必ず併記する。
+    def print_leave_periods(day)
+      periods = day[:leave_periods]
+      return if periods.nil? || periods.empty?
+
+      puts "[休暇として扱ったイベント]"
+      periods.each { |p| puts "  #{p.range_label} #{p.event.display_title}" }
+      puts "  ※ 出勤締切・退勤基準がこの時間帯に入っていたら、時間帯の外へ押し出します"
+      puts
+    end
+
+    # `punch plan` の退勤側（カレンダー連動の判断根拠＋基準時刻と目標）を出力する。
+    def print_out_plan(day, cfg)
       puts "[退勤]"
       plan = day[:out_plan]
       if day[:out_error]
@@ -290,7 +303,7 @@ module Ak4Punch
       elsif !cfg.calendar_enabled
         puts "カレンダー連動: OFF（config の calendar.enabled=false）→ 所定退勤時刻"
       elsif plan
-        puts "取得イベント（当日・終了時刻ありのみ・終了昇順）:"
+        puts "取得イベント（当日・終了時刻ありのみ・終了昇順／休暇イベントは除外済み）:"
         if plan.considered_events.empty?
           puts "  (対象イベントなし)"
         else
@@ -313,6 +326,8 @@ module Ak4Punch
       end
 
       puts
+      puts "退勤基準: #{day[:out_base].strftime('%H:%M:%S')}"
+      print_leave_shifts(day[:out_leave_shifts])
       out_window = cfg.clock_out_window.positive? ? "+0〜#{cfg.clock_out_window}分揺らぎ" : ""
       puts "退勤目標: #{day[:out_target].strftime('%H:%M:%S')}#{out_window.empty? ? '' : "（#{out_window}）"}"
     end
@@ -340,20 +355,29 @@ module Ak4Punch
       puts
       deadline = day[:in_deadline]
       adopted = plan&.adopted_event
+      shifts = day[:in_leave_shifts]
       note =
-        if adopted && deadline == adopted.starts_at
+        if shifts && !shifts.empty?
+          "休暇の時間帯の外へ後ろ倒し"
+        elsif adopted && deadline == adopted.starts_at
           "採用イベントの開始"
         else
           "所定 #{cfg.clock_in_time} + ウィンドウ#{cfg.clock_in_window}分"
         end
       puts "打刻締切: #{deadline.strftime('%H:%M:%S')}（#{note}）"
+      print_leave_shifts(shifts)
       in_window = cfg.clock_in_window.positive? ? "締切 −0〜#{cfg.clock_in_window}分揺らぎ" : "揺らぎなし"
       puts "出勤目標: #{day[:in_target].strftime('%H:%M:%S')}（#{in_window}）"
     end
 
+    # 休暇による押し出しの根拠（どのイベントで、どこからどこへ動かしたか）。
+    def print_leave_shifts(shifts)
+      Array(shifts).each { |s| puts "  #{s.label}" }
+    end
+
     # 出勤判定に使ったイベント一覧（当日・開始時刻ありのみ・開始昇順）を採否のマーク付きで出力する。
     def print_in_events(plan)
-      puts "取得イベント（当日・開始時刻ありのみ・開始昇順）:"
+      puts "取得イベント（当日・開始時刻ありのみ・開始昇順／休暇イベントは除外済み）:"
       listed = (plan.too_early_events + plan.considered_events).sort_by(&:starts_at)
       if listed.empty?
         puts "  (対象イベントなし)"

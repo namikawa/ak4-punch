@@ -817,7 +817,7 @@ RSpec.describe Ak4Punch::Daemon do
       expect(notifier).not_to have_received(:notify)
     end
 
-    it "最終チェックで休暇イベントを検知したら打刻を中止する" do
+    it "最終チェックで全休（終日休暇）になっていたら打刻を中止する" do
       evs = { list: [event(title: "実装", ends_at: t("18:30"))] }
       allow(calendar_client).to receive(:events) { evs[:list] }
       allow(stamper).to receive(:punch)
@@ -825,33 +825,190 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("08:00")
       daemon.tick # 通常計画（退勤18:30）
 
-      evs[:list] = [event(title: "午後休暇", ends_at: nil, all_day: true)] # 直前に休暇イベントが入った
+      evs[:list] = [event(title: "午後休暇", ends_at: nil, all_day: true)] # 直前に終日の休暇イベントが入った
       clock_time[:now] = t("18:30", 10)
-      daemon.tick # due → 最終チェックで休暇検知 → 中止
-      expect(logger).to have_received(:warn).with(/休暇イベント『午後休暇』を検知したため、以降の打刻を中止します/)
+      daemon.tick # due → 最終チェックで全休判定 → 中止
+      expect(logger).to have_received(:warn)
+        .with(/休暇イベント『午後休暇』\(終日\) により本日の勤務時間がなくなったため、以降の打刻を中止します/)
       expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
 
-      # 以降の tick でも打刻されない（休暇日として保持）
+      # 以降の tick でも打刻されない（全休日として保持）
       clock_time[:now] = t("18:35")
       daemon.tick
       expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
     end
+
+    # 日中に休暇が追加され、到達不能な新目標（＝休暇の開始）では計画を更新できない日。
+    # 定期再取得が走らないと「見送り → 旧目標のまま打刻」の連鎖を再現できないため間隔を戻す。
+    context "現在時刻が休暇の時間帯に入っているとき" do
+      let(:config) do
+        Ak4Punch::Config.new(
+          data: {
+            "company_id" => "x",
+            "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
+            "calendar" => { "enabled" => true, "exclude_keywords" => ["会食"], "refresh_interval_minutes" => 15 },
+            "daemon" => { "tick_seconds" => 30, "late_grace_minutes" => 10, "manage_wake" => true,
+                          "wake_lead_minutes" => 1 },
+          },
+          root: Dir.pwd,
+        )
+      end
+
+      it "休暇を反映した目標が期限切れなら退勤打刻を中止する（旧目標での誤打刻を防ぐ）" do
+        evs = { list: [event(title: "実装", starts_at: t("10:00"), ends_at: t("18:30"))] }
+        allow(calendar_client).to receive(:events) { evs[:list] }
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        evs[:list] << event(title: "休暇", starts_at: t("15:00"), ends_at: t("19:00"))
+        clock_time[:now] = t("17:00")
+        daemon.tick # 定期再取得: 新目標 15:00 は期限切れ → 更新を見送り、旧目標 18:30 のまま
+        expect(logger).to have_received(:warn).with(/退勤目標の更新を見送ります（新目標 2026-07-10 15:00:00/)
+
+        clock_time[:now] = t("18:30", 10)
+        daemon.tick # due → 最終チェックで「現在は休暇の時間帯・新目標は期限切れ」→ 中止
+        expect(logger).to have_received(:warn)
+          .with(/現在時刻が休暇『休暇』\(15:00-19:00\)の時間帯で.*目標 2026-07-10 15:00:00 は既に打刻期限切れ.*中止します/)
+        expect(stamper).not_to have_received(:punch)
+          .with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+        expect(notifier).to have_received(:notify)
+          .with(/退勤打刻を中止しました（現在 18:30 は休暇『休暇』\(15:00-19:00\)の時間帯で.*退勤目標 15:00 は打刻期限切れです）/).once
+
+        # 中止した退勤は done 扱い（tick 毎に sukesan を叩き直さず、窓超過の断念通知も出さない）
+        clock_time[:now] = t("18:45")
+        daemon.tick
+        expect(notifier).to have_received(:notify).once
+      end
+    end
+
+    it "午後休の正常系（目標が休暇の時間帯の中）では中止せず打刻する" do
+      # 退勤基準＝休暇の開始 15:00、目標＝基準+揺らぎなので、目標自体が休暇の時間帯に入る。
+      # 期限内に到達した打刻は実行しなければならない。
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "午後休暇", starts_at: t("15:00"), ends_at: t("19:00"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 出勤09:30 / 退勤基準18:00 → 休暇で 15:00 へ前倒し
+      expect(logger).to have_received(:info)
+        .with(/退勤目標を設定: 2026-07-10 15:00:00.*休暇『午後休暇』\(15:00-19:00\) により 18:00 → 15:00/)
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("15:00", 5)
+      daemon.tick
+      expect(notifier).not_to have_received(:notify)
+    end
   end
 
-  describe "休暇の自動検知" do
+  # 「休暇」イベントは『その時間帯は勤務しない』の意味。打刻の基準時刻がその時間帯に
+  # 入っていたら休暇の外へ押し出す（出勤＝終了へ後ろ倒し／退勤＝開始へ前倒し）。
+  # 所定は 出勤締切 09:30（clock_in 09:30 + window 0）/ 退勤基準 18:00。
+  describe "休暇イベントの時間帯を打刻計画に反映する" do
+    # [出勤締切, 退勤基準, 全休か] を返す
+    def plan_for(events)
+      allow(calendar_client).to receive(:events).with(date: date).and_return(events)
+      day = daemon.build_day_plan(date: date)
+      [day[:in_deadline], day[:out_base], day[:full_leave]]
+    end
+
+    def span(title, from, to)
+      event(title: title, starts_at: t(from), ends_at: t(to))
+    end
+
+    it "休暇なし → 所定どおり" do
+      expect(plan_for([])).to eq [t("09:30"), t("18:00"), false]
+    end
+
+    it "休暇 12:00-19:00（午後休）→ 退勤は休暇の開始へ前倒し" do
+      expect(plan_for([span("休暇", "12:00", "19:00")])).to eq [t("09:30"), t("12:00"), false]
+    end
+
+    it "休暇 15:00-18:00 → 退勤基準（所定18:00）は休暇の終端に一致するので前倒しする" do
+      expect(plan_for([span("休暇", "15:00", "18:00")])).to eq [t("09:30"), t("15:00"), false]
+    end
+
+    it "休暇 15:00-18:30 → 退勤は休暇の開始へ前倒し" do
+      expect(plan_for([span("休暇", "15:00", "18:30")])).to eq [t("09:30"), t("15:00"), false]
+    end
+
+    it "休暇 15:00-19:00 ＋ 会議 19:00-20:00 → 退勤は会議の終了（中抜け扱い・押し出しなし）" do
+      events = [span("休暇", "15:00", "19:00"), span("会議", "19:00", "20:00")]
+      expect(plan_for(events)).to eq [t("09:30"), t("20:00"), false]
+    end
+
+    it "休暇 15:00-17:00（中抜け）→ 所定退勤のまま" do
+      expect(plan_for([span("休暇", "15:00", "17:00")])).to eq [t("09:30"), t("18:00"), false]
+    end
+
+    it "休暇 09:00-13:00（午前休）→ 出勤締切は休暇の終了へ後ろ倒し" do
+      expect(plan_for([span("休暇", "09:00", "13:00")])).to eq [t("13:00"), t("18:00"), false]
+    end
+
+    it "休暇 09:00-18:00 → 出勤締切 >= 退勤基準 になり全休" do
+      expect(plan_for([span("休暇", "09:00", "18:00")]).last).to be true
+    end
+
+    it "終日休暇 → 全休（00:00〜翌00:00 の休暇として押し出された帰結）" do
+      expect(plan_for([event(title: "夏季休暇", ends_at: nil, all_day: true)]).last).to be true
+    end
+
+    it "「昼休み」12:00-13:00 は休暇だが打刻には影響しない" do
+      expect(plan_for([span("昼休み", "12:00", "13:00")])).to eq [t("09:30"), t("18:00"), false]
+    end
+
+    it "午前休 09:00-12:00 ＋ 午後休 13:00-19:00 → 出勤12:00 / 退勤13:00" do
+      events = [span("午前休み", "09:00", "12:00"), span("午後休み", "13:00", "19:00")]
+      expect(plan_for(events)).to eq [t("12:00"), t("13:00"), false]
+    end
+
+    it "業務イベントと休暇が混在する日（午後休）も業務イベント側は従来どおり評価する" do
+      events = [
+        span("MTG準備", "09:30", "11:00"),
+        span("会食", "11:00", "12:00"), # 退勤側の除外キーワード
+        span("休暇", "12:00", "19:00"),
+      ]
+      expect(plan_for(events)).to eq [t("09:30"), t("12:00"), false]
+    end
+
+    it "休暇イベントは業務イベントの判定から除外される（退勤の採用候補にならない）" do
+      allow(calendar_client).to receive(:events).and_return([span("休暇", "15:00", "20:00")])
+      day = daemon.build_day_plan(date: date)
+      expect(day[:out_plan].considered_events).to be_empty
+      expect(day[:in_plan].considered_events).to be_empty
+    end
+
+    it "押し出しの根拠（どのイベントでどこからどこへ動かしたか）を返す" do
+      allow(calendar_client).to receive(:events).and_return([span("午後休暇", "12:00", "19:00")])
+      day = daemon.build_day_plan(date: date)
+      expect(day[:out_leave_shifts].map(&:label))
+        .to eq ["休暇『午後休暇』(12:00-19:00) により 18:00 → 12:00"]
+      expect(day[:in_leave_shifts]).to be_empty
+      expect(day[:leave_periods].map(&:label)).to eq ["『午後休暇』(12:00-19:00)"]
+    end
+  end
+
+  describe "全休（休暇で勤務時間がなくなる日）" do
     let(:leave_event) { event(title: "夏季休暇", ends_at: nil, all_day: true) }
 
-    it "計画時に休暇を検知したら打刻計画を作らず、以降のtickでも再取得・打刻しない" do
+    it "計画時に全休と判定したら打刻計画を作らず、以降のtickでも再取得・打刻しない" do
       allow(calendar_client).to receive(:events).and_return([leave_event])
       expect(stamper).not_to receive(:punch)
 
       clock_time[:now] = t("08:00")
-      daemon.tick # 計画時に休暇検知
-      expect(logger).to have_received(:info).with(/休暇イベント『夏季休暇』を検知したため、本日は打刻しません/)
+      daemon.tick # 計画時に全休判定
+      expect(logger).to have_received(:info)
+        .with(/休暇イベント『夏季休暇』\(終日\) により本日は勤務時間がないため、打刻しません/)
       # 打刻計画なし＝翌営業日ブートストラップのみ予約される
       expect(wake_scheduler).to have_received(:reschedule).with([t("09:30", day: 11)])
 
-      # 休暇日として保持中: refresh も due 判定も停止（fetch は計画時の1回だけ）
+      # 全休日として保持中: refresh も due 判定も停止（fetch は計画時の1回だけ）
       clock_time[:now] = t("09:30", 5)
       daemon.tick
       clock_time[:now] = t("18:00", 5)
@@ -859,7 +1016,7 @@ RSpec.describe Ak4Punch::Daemon do
       expect(calendar_client).to have_received(:events).once
     end
 
-    it "日中の再取得で休暇を検知したら残りの打刻を中止する（打刻済み分はそのまま）" do
+    it "日中の再取得で全休になったら残りの打刻を中止する（打刻済み分はそのまま）" do
       evs = { list: [event(title: "実装", ends_at: t("18:30"))] }
       allow(calendar_client).to receive(:events) { evs[:list] }
       allow(stamper).to receive(:punch)
@@ -870,11 +1027,11 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("09:30", 5)
       daemon.tick # 出勤打刻
 
-      evs[:list] = [leave_event] # 出勤後に休暇イベントが入った
+      evs[:list] = [leave_event] # 出勤後に終日の休暇イベントが入った
       clock_time[:now] = t("10:00")
-      daemon.tick # refresh 間隔経過 → 再取得で休暇検知
+      daemon.tick # refresh 間隔経過 → 再取得で全休判定
       expect(logger).to have_received(:warn)
-        .with(/休暇イベント『夏季休暇』を検知したため、以降の打刻を中止します。打刻済みの分は手動で削除してください/)
+        .with(/休暇イベント『夏季休暇』\(終日\) により本日の勤務時間がなくなったため、以降の打刻を中止します。打刻済みの分は手動で削除してください/)
 
       clock_time[:now] = t("18:30", 5)
       daemon.tick # 退勤は打刻されない
@@ -882,13 +1039,34 @@ RSpec.describe Ak4Punch::Daemon do
       expect(stamper).not_to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
     end
 
-    it "recheck 要求で再計画し、休暇イベントが消えていれば通常計画に復帰する" do
-      evs = { list: [event(title: "全休", ends_at: nil, all_day: true)] }
+    it "日中の再取得で午後休が入ったら全休にはせず退勤目標だけ前倒しする" do
+      evs = { list: [event(title: "実装", starts_at: t("10:00"), ends_at: t("18:30"))] }
       allow(calendar_client).to receive(:events) { evs[:list] }
       allow(stamper).to receive(:punch)
 
       clock_time[:now] = t("08:00")
-      daemon.tick # 休暇日として計画なし
+      daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      evs[:list] = [event(title: "午後休み", starts_at: t("15:00"), ends_at: t("19:00"))]
+      clock_time[:now] = t("14:00")
+      daemon.tick # 再取得 → 退勤基準18:00 が休暇に入るので 15:00 へ前倒し
+      expect(logger).to have_received(:info)
+        .with(/退勤目標を更新: 2026-07-10 18:30:00 → 2026-07-10 15:00:00.*休暇『午後休み』\(15:00-19:00\) により 18:00 → 15:00/)
+
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("15:00", 5)
+      daemon.tick
+    end
+
+    it "recheck 要求で再計画し、休暇イベントが消えていれば通常計画に復帰する" do
+      evs = { list: [event(title: "休暇", ends_at: nil, all_day: true)] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 全休日として計画なし
 
       evs[:list] = [] # カレンダー修正（休暇イベントを削除）
       daemon.request_recheck!
@@ -912,7 +1090,7 @@ RSpec.describe Ak4Punch::Daemon do
       expect(logger).to have_received(:info).with(/退勤目標を設定.*フォールバック/)
     end
 
-    it "calendar_enabled=false なら休暇検知しない（fetch もせず通常打刻）" do
+    it "calendar_enabled=false なら休暇判定しない（fetch もせず通常打刻）" do
       cfg = Ak4Punch::Config.new(
         data: {
           "company_id" => "x",
@@ -938,16 +1116,18 @@ RSpec.describe Ak4Punch::Daemon do
       expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
     end
 
-    it "build_day_plan は検知した休暇イベントを leave_event として返す" do
+    it "build_day_plan は全休フラグと休暇イベントの時間帯を返す" do
       allow(calendar_client).to receive(:events).and_return([leave_event])
       day = daemon.build_day_plan(date: date)
-      expect(day[:leave_event]&.title).to eq "夏季休暇"
+      expect(day[:full_leave]).to be true
+      expect(day[:leave_periods].map { |p| p.event.title }).to eq ["夏季休暇"]
     end
 
-    it "build_day_plan は休暇がなければ leave_event なし" do
+    it "build_day_plan は休暇がなければ全休でなく休暇イベントも空" do
       allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
       day = daemon.build_day_plan(date: date)
-      expect(day[:leave_event]).to be_nil
+      expect(day[:full_leave]).to be false
+      expect(day[:leave_periods]).to be_empty
     end
   end
 
@@ -1009,13 +1189,13 @@ RSpec.describe Ak4Punch::Daemon do
       expect(logger).not_to have_received(:warn).with(/未打刻のまま日付が変わりました/)
     end
 
-    it "前日が休暇日なら計画が無いので通知しない" do
+    it "前日が全休日なら計画が無いので通知しない" do
       leave = event(title: "夏季休暇", ends_at: nil, all_day: true)
       allow(calendar_client).to receive(:events).and_return([leave])
       expect(stamper).not_to receive(:punch)
 
       clock_time[:now] = t("08:00")
-      daemon.tick # 休暇日として計画なし
+      daemon.tick # 全休日として計画なし
 
       clock_time[:now] = t("08:00", day: 11) # 翌日
       daemon.tick
