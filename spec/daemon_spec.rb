@@ -840,7 +840,7 @@ RSpec.describe Ak4Punch::Daemon do
 
     # 日中に休暇が追加され、到達不能な新目標（＝休暇の開始）では計画を更新できない日。
     # 定期再取得が走らないと「見送り → 旧目標のまま打刻」の連鎖を再現できないため間隔を戻す。
-    context "現在時刻が休暇の時間帯に入っているとき" do
+    context "定期再取得が走る設定" do
       let(:config) do
         Ak4Punch::Config.new(
           data: {
@@ -854,7 +854,7 @@ RSpec.describe Ak4Punch::Daemon do
         )
       end
 
-      it "休暇を反映した目標が期限切れなら退勤打刻を中止する（旧目標での誤打刻を防ぐ）" do
+      it "休暇を知らない古い目標のまま due になったら退勤打刻を中止する" do
         evs = { list: [event(title: "実装", starts_at: t("10:00"), ends_at: t("18:30"))] }
         allow(calendar_client).to receive(:events) { evs[:list] }
         allow(stamper).to receive(:punch)
@@ -870,18 +870,224 @@ RSpec.describe Ak4Punch::Daemon do
         expect(logger).to have_received(:warn).with(/退勤目標の更新を見送ります（新目標 2026-07-10 15:00:00/)
 
         clock_time[:now] = t("18:30", 10)
-        daemon.tick # due → 最終チェックで「現在は休暇の時間帯・新目標は期限切れ」→ 中止
+        daemon.tick # due → POST 直前の休暇ゲートで「現在は休暇の時間帯・目標は休暇を反映していない」→ 中止
         expect(logger).to have_received(:warn)
-          .with(/現在時刻が休暇『休暇』\(15:00-19:00\)の時間帯で.*目標 2026-07-10 15:00:00 は既に打刻期限切れ.*中止します/)
+          .with(/現在時刻が休暇『休暇』\(15:00-19:00\)の時間帯のため、退勤打刻を中止します。現在の退勤目標 18:30 は、.*目標 15:00 と一致しません/)
         expect(stamper).not_to have_received(:punch)
           .with(kind: :out, date: date, window_minutes: 0, deadline: anything)
         expect(notifier).to have_received(:notify)
-          .with(/退勤打刻を中止しました（現在 18:30 は休暇『休暇』\(15:00-19:00\)の時間帯で.*退勤目標 15:00 は打刻期限切れです）/).once
+          .with(/退勤打刻を中止しました（現在 18:30 は休暇『休暇』\(15:00-19:00\)の時間帯です。現在の退勤目標 18:30 は、.*目標 15:00 と一致しません/).once
 
         # 中止した退勤は done 扱い（tick 毎に sukesan を叩き直さず、窓超過の断念通知も出さない）
         clock_time[:now] = t("18:45")
         daemon.tick
         expect(notifier).to have_received(:notify).once
+      end
+
+      it "直前取得が失敗しても、当日把握済みの休暇で中止する（把握済みの休暇を無視して打刻しない）" do
+        # 上と同じ日で、打刻の瞬間だけ sukesan が落ちるケース。DarkWake（Wi-Fi 未接続で
+        # sukesan が Google に到達できない）で構造的に起こりうる。
+        evs = { list: [event(title: "実装", starts_at: t("10:00"), ends_at: t("18:30"))], fail: false }
+        allow(calendar_client).to receive(:events) do
+          raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+          evs[:list]
+        end
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        evs[:list] << event(title: "休暇", starts_at: t("15:00"), ends_at: t("19:00"))
+        clock_time[:now] = t("17:00")
+        daemon.tick # 定期再取得で休暇を把握（新目標 15:00 は期限切れなので採用は見送り）
+
+        evs[:fail] = true # ここから sukesan が落ちる
+        clock_time[:now] = t("18:30", 10)
+        daemon.tick # due → 直前取得は失敗するが 17:00 時点の休暇情報で中止
+
+        expect(stamper).not_to have_received(:punch)
+          .with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+        # 判定材料は 17:00（最後に取得できた時点）の休暇情報であることがログ・通知から分かる
+        expect(logger).to have_received(:warn)
+          .with(/休暇『休暇』\(15:00-19:00\)の時間帯のため、退勤打刻を中止します。現在の退勤目標 18:30 は、17:00 時点の休暇を反映した目標 15:00 と一致しません/)
+        expect(notifier).to have_received(:notify)
+          .with(/現在 18:30 は休暇『休暇』\(15:00-19:00\)の時間帯です。現在の退勤目標 18:30 は、17:00 時点の休暇を反映した目標 15:00 と一致しません/).once
+
+        # 中止した退勤は done 扱い（通知は同日1回だけ・窓超過の断念通知も出さない）
+        clock_time[:now] = t("18:45")
+        daemon.tick
+        expect(notifier).to have_received(:notify).once
+      end
+
+      it "recheck 後のフォールバック計画が休暇を知らない目標なら退勤打刻を中止する" do
+        # 中抜けの日（休暇15:00-19:00 ＋ 会議19:00-20:00）の退勤目標は 20:00。
+        # recheck の取得が失敗すると計画だけ所定 18:00 へ作り直され、休暇を知らない目標になる。
+        # 直前チェックの中で「目標が期限切れか」だけを見ていると 20:00 は期限切れでないため
+        # すり抜けてしまう。ゲートは「現在の目標が休暇を反映した目標と一致するか」で判定する。
+        evs = { fail: false }
+        allow(calendar_client).to receive(:events) do
+          raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+          [event(title: "休暇", starts_at: t("15:00"), ends_at: t("19:00")),
+           event(title: "夜会議", starts_at: t("19:00"), ends_at: t("20:00"))]
+        end
+        allow(stamper).to receive(:punch)
+        allow(stamper).to receive(:punch_recorded?).with(:in, date).and_return(true) # 出勤は打刻済み
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 中抜け扱いで退勤目標 20:00
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        evs[:fail] = true
+        daemon.request_recheck!
+        clock_time[:now] = t("17:00")
+        daemon.tick # recheck の取得も失敗 → 計画だけ所定 18:00 へ作り直される
+        expect(logger).to have_received(:info).with(/退勤目標を設定: 2026-07-10 18:00:00.*フォールバック/)
+
+        clock_time[:now] = t("18:00", 5)
+        daemon.tick # due → 直前取得も失敗 → ゲートが「18:00 ≠ 20:00」を検知して中止
+        expect(stamper).not_to have_received(:punch)
+          .with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+        expect(notifier).to have_received(:notify)
+          .with(/退勤打刻を中止しました.*現在の退勤目標 18:00 は、.*休暇を反映した目標 20:00 と一致しません/).once
+      end
+
+      it "リトライ中に休暇を把握したら、次の打刻試行をゲートで止める" do
+        # 直前チェックは同一目標につき初回 due 時しか走らない（final_checked）。
+        # 休暇の中止判定をそこに置くと、リトライ経路が素通しになる。
+        evs = { list: [event(title: "会議", starts_at: t("17:00"), ends_at: t("18:25"))], fail: false }
+        allow(calendar_client).to receive(:events) do
+          raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+          evs[:list]
+        end
+        out_calls = 0
+        allow(stamper).to receive(:punch) do |kind:, **|
+          next :ok unless kind == :out
+
+          out_calls += 1
+          raise Ak4Punch::Client::ApiError, "一時エラー"
+        end
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 退勤目標 18:25
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+        clock_time[:now] = t("18:15")
+        daemon.tick # 定期再取得（休暇なし・目標は 18:25 のまま）
+
+        evs[:fail] = true
+        clock_time[:now] = t("18:25", 5)
+        daemon.tick # due → 直前取得は失敗 → 現在の目標のまま POST し、失敗してリトライへ
+        expect(out_calls).to eq 1
+
+        evs[:fail] = false
+        evs[:list] << event(title: "休暇", starts_at: t("15:00"), ends_at: t("19:00"))
+        clock_time[:now] = t("18:31")
+        daemon.tick # 定期再取得で休暇を把握（新目標 15:00 は到達不能で計画は 18:25 のまま）
+
+        expect(out_calls).to eq 1 # リトライの POST はゲートで止まる（打刻期限 18:35 の内側）
+        expect(notifier).to have_received(:notify)
+          .with(/退勤打刻を中止しました.*現在の退勤目標 18:25 は、18:31 時点の休暇を反映した目標 15:00 と一致しません/).once
+      end
+
+      it "recheck で計画を復活させた後、別の目標で再び中止したときも通知する" do
+        # 通知キーが kind 固定だと2回目の中止が握り潰される（give_up_punch と同じく目標時刻を含める）。
+        evs = { list: [event(title: "会議", starts_at: t("17:00"), ends_at: t("18:30"))] }
+        allow(calendar_client).to receive(:events) { evs[:list] }
+        allow(stamper).to receive(:punch)
+        allow(stamper).to receive(:punch_recorded?).with(:in, date).and_return(true)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 退勤目標 18:30
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        evs[:list] << event(title: "休暇", starts_at: t("15:00"), ends_at: t("21:00"))
+        clock_time[:now] = t("17:30")
+        daemon.tick # 再取得: 新目標 15:00 は到達不能 → 旧目標 18:30 のまま
+
+        clock_time[:now] = t("18:30", 5)
+        daemon.tick # 中止（1回目）
+        expect(notifier).to have_received(:notify).with(/退勤打刻を中止しました/).once
+
+        # カレンダーを直して recheck（休暇を削除し、会議を 19:10 まで延長）
+        evs[:list] = [event(title: "会議", starts_at: t("17:00"), ends_at: t("19:10"))]
+        daemon.request_recheck!
+        clock_time[:now] = t("18:31")
+        daemon.tick # 計画復活（退勤目標 19:10）
+        expect(logger).to have_received(:info).with(/退勤目標を設定: 2026-07-10 19:10:00/)
+
+        # 再び休暇が入り、また休暇を知らない目標が残る
+        evs[:list] << event(title: "休暇", starts_at: t("15:00"), ends_at: t("21:00"))
+        clock_time[:now] = t("18:50")
+        daemon.tick # 再取得: 新目標 15:00 は到達不能 → 旧目標 19:10 のまま
+
+        clock_time[:now] = t("19:10", 5)
+        daemon.tick # 中止（2回目・目標が違うので通知は握り潰されない）
+        expect(notifier).to have_received(:notify).with(/退勤打刻を中止しました/).twice
+      end
+
+      it "中抜けの日（休暇の後ろに予定がある）は休暇の外の目標なので打刻する（過剰中止しない）" do
+        allow(calendar_client).to receive(:events).and_return(
+          [event(title: "休暇", starts_at: t("15:00"), ends_at: t("19:00")),
+           event(title: "夜会議", starts_at: t("19:00"), ends_at: t("20:00"))],
+        )
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 退勤目標 20:00（休暇の外）
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+        clock_time[:now] = t("20:00", 5)
+        daemon.tick
+        expect(notifier).not_to have_received(:notify)
+      end
+
+      it "午後休の正常系は直前取得が失敗しても打刻する（過剰中止しない）" do
+        # 退勤目標＝休暇の開始+揺らぎで必ず休暇の時間帯の中に入るため、
+        # 「現在が休暇の時間帯」だけで中止すると半休の日が毎回打刻されなくなる。
+        evs = { fail: false }
+        allow(calendar_client).to receive(:events) do
+          raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+          [event(title: "午後休暇", starts_at: t("15:00"), ends_at: t("19:00"))]
+        end
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 出勤09:30 / 退勤15:00（休暇の開始へ前倒し）
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        evs[:fail] = true
+        expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+        clock_time[:now] = t("15:00", 5)
+        daemon.tick # due → 直前取得は失敗するが、把握済みの目標は期限内なので打刻する
+        expect(logger).to have_received(:warn).with(/退勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します/)
+      end
+
+      it "当日ずっと取得に失敗している日は従来どおり現在の目標のまま打刻する" do
+        # 判定材料（当日の取得成功）が一度もないため、休暇の有無は分からない。
+        allow(calendar_client).to receive(:events)
+          .and_raise(Ak4Punch::CalendarClient::ApiError, "接続拒否")
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 所定へフォールバック（出勤09:30 / 退勤18:00）
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤打刻
+
+        expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+        clock_time[:now] = t("18:00", 5)
+        daemon.tick
+        expect(logger).to have_received(:warn).with(/退勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します/)
       end
     end
 
@@ -991,6 +1197,69 @@ RSpec.describe Ak4Punch::Daemon do
         .to eq ["休暇『午後休暇』(12:00-19:00) により 18:00 → 12:00"]
       expect(day[:in_leave_shifts]).to be_empty
       expect(day[:leave_periods].map(&:label)).to eq ["『午後休暇』(12:00-19:00)"]
+    end
+  end
+
+  # 揺らぎ（jitter）と休暇境界の相互作用を固定する。上の表は window=0 で押し出し自体を
+  # 見ているため、ここで揺らぎを載せた実運用相当の設定を検証する。
+  #
+  # 設計判断（ユーザー承認済み）: 揺らぎは常に勤務時間を広げる向き（出勤＝締切から手前、
+  # 退勤＝基準から後ろ）で、休暇の境界でも向きを反転しない。したがって休暇で押し出した
+  # 締切・基準から揺らいだ目標は、休暇の時間帯の内側に入る（午前休なら休暇終了の直前に出勤、
+  # 午後休なら休暇開始の直後に退勤）。「休暇境界では揺らぎを反転して常に休暇の外側にする」
+  # 案は検討のうえ不採用。これは意図した挙動なので、黙って変えないこと。
+  describe "揺らぎと休暇境界" do
+    # 実運用に近い設定: 所定 09:25 + ウィンドウ5分 → 所定の打刻締切は 09:30 / 退勤は 18:00。
+    let(:config) do
+      Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
+          "calendar" => { "enabled" => true, "exclude_keywords" => ["会食"] },
+          "daemon" => { "manage_wake" => false, "late_grace_minutes" => 10, "morning_wake_at" => "07:45" },
+        },
+        root: Dir.pwd,
+      )
+    end
+
+    # 日毎・kind毎に固定の揺らぎ秒（Daemon と同じ導出）
+    def jitter(kind, window: 5, day: 10)
+      seed = Date.new(2026, 7, day).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
+      Random.new(seed).rand(0..(window * 60))
+    end
+
+    def leaves_of(events)
+      Ak4Punch::LeaveSchedule.build(events: events, keywords: config.calendar_leave_keywords, date: date)
+    end
+
+    it "午前休は「休暇の終了 − 揺らぎ」に出勤する（目標は休暇の時間帯の内側）" do
+      events = [event(title: "午前休み", starts_at: t("09:00"), ends_at: t("13:00"))]
+      allow(calendar_client).to receive(:events).and_return(events)
+
+      day = daemon.build_day_plan(date: date)
+      expect(day[:in_deadline]).to eq t("13:00")               # 所定の締切 09:30 が休暇の外へ後ろ倒し
+      expect(day[:in_target]).to eq t("13:00") - jitter(:in)   # 揺らぎは締切から手前＝休暇側へ戻る
+      expect(day[:in_target]).to be_between(t("12:55"), t("13:00"))
+      expect(leaves_of(events).covers?(day[:in_target])).to be true
+    end
+
+    it "午後休は「休暇の開始 + 揺らぎ」に退勤する（目標は休暇の時間帯の内側）" do
+      events = [event(title: "午後休暇", starts_at: t("12:00"), ends_at: t("19:00"))]
+      allow(calendar_client).to receive(:events).and_return(events)
+
+      day = daemon.build_day_plan(date: date)
+      expect(day[:out_base]).to eq t("12:00")                  # 所定 18:00 が休暇の外へ前倒し
+      expect(day[:out_target]).to eq t("12:00") + jitter(:out) # 揺らぎは基準から後ろ＝休暇側へ入る
+      expect(day[:out_target]).to be_between(t("12:00"), t("12:05"))
+      expect(leaves_of(events).covers?(day[:out_target])).to be true
+    end
+
+    it "休暇のない日は従来どおり所定の締切・基準から揺らぐ" do
+      allow(calendar_client).to receive(:events).and_return([])
+
+      day = daemon.build_day_plan(date: date)
+      expect(day[:in_target]).to eq t("09:30") - jitter(:in)
+      expect(day[:out_target]).to eq t("18:00") + jitter(:out)
     end
   end
 
@@ -1128,6 +1397,123 @@ RSpec.describe Ak4Punch::Daemon do
       day = daemon.build_day_plan(date: date)
       expect(day[:full_leave]).to be false
       expect(day[:leave_periods]).to be_empty
+    end
+  end
+
+  # POST 直前の休暇ゲートは出勤・退勤で対称に効く（退勤側の詳細は「退勤直前の最終チェック」を参照）。
+  # ここでは出勤側と、打刻済みだった場合の通知抑止を検証する。
+  describe "休暇ゲート（出勤側）" do
+    it "全休日に recheck の取得が失敗して所定の計画に戻っても、出勤打刻をゲートで止める" do
+      # 全休判定 → recheck の取得失敗で leaves が空になり、所定フォールバックの計画に戻る日。
+      # 計画・@leave_day は復元できないが、当日把握済みの休暇情報（snapshot）でゲートが止める。
+      evs = { fail: false }
+      allow(calendar_client).to receive(:events) do
+        raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+        [event(title: "夏季休暇", ends_at: nil, all_day: true)]
+      end
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 全休判定（休暇情報を保持）
+
+      evs[:fail] = true
+      daemon.request_recheck!
+      clock_time[:now] = t("09:00")
+      daemon.tick # recheck の取得も失敗 → 所定フォールバックの計画（出勤09:30）が作られる
+      expect(logger).to have_received(:info).with(/出勤目標を設定: 2026-07-10 09:30:00.*フォールバック/)
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # due → ゲートが「09:30 ≠ 休暇を反映した目標」を検知して中止
+      expect(stamper).not_to have_received(:punch)
+        .with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      expect(notifier).to have_received(:notify)
+        .with(%r{出勤打刻を中止しました.*現在の出勤目標 09:30 は、.*休暇を反映した目標 07/11 00:00 と一致しません}).once
+    end
+
+    it "午前休の日に recheck の取得が失敗して所定の計画に戻っても、出勤打刻をゲートで止める" do
+      evs = { fail: false }
+      allow(calendar_client).to receive(:events) do
+        raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+        [event(title: "午前休み", starts_at: t("09:00"), ends_at: t("13:00"))]
+      end
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 出勤目標 13:00（休暇の終了へ後ろ倒し）
+      expect(logger).to have_received(:info).with(/出勤目標を設定: 2026-07-10 13:00:00/)
+
+      evs[:fail] = true
+      daemon.request_recheck!
+      clock_time[:now] = t("09:05")
+      daemon.tick # recheck の取得も失敗 → 所定 09:30 の計画に作り直される
+
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # due → ゲートが「09:30 ≠ 13:00」を検知して中止
+      expect(stamper).not_to have_received(:punch)
+        .with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      expect(notifier).to have_received(:notify)
+        .with(/出勤打刻を中止しました.*現在の出勤目標 09:30 は、.*休暇を反映した目標 13:00 と一致しません/).once
+    end
+
+    it "午前休の正常系（目標が休暇の時間帯の内側）は通常どおり出勤打刻する（過剰中止しない）" do
+      allow(calendar_client).to receive(:events)
+        .and_return([event(title: "午前休み", starts_at: t("09:00"), ends_at: t("13:00"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 出勤目標 13:00（＝休暇の終了。揺らぎがあれば休暇の内側に入る）
+
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("13:00") # 休暇の終端＝閉区間の内側で due になる
+      daemon.tick
+      expect(notifier).not_to have_received(:notify)
+    end
+
+    it "休暇のない日は snapshot があってもゲートに掛からない" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick
+
+      expect(stamper).to receive(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+      expect(notifier).not_to have_received(:notify)
+    end
+  end
+
+  describe "休暇ゲートの中止通知" do
+    it "既に AKASHI に打刻があるときは中止するが通知しない（give_up_punch と同じ扱い）" do
+      # 午後休の日に退勤まで打刻済み → recheck の取得失敗で所定 18:00 の計画が作り直される。
+      # 打刻済みなのに「手動打刻してください」と誤報しないこと。
+      evs = { fail: false }
+      allow(calendar_client).to receive(:events) do
+        raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if evs[:fail]
+
+        [event(title: "午後休暇", starts_at: t("15:00"), ends_at: t("19:00"))]
+      end
+      allow(stamper).to receive(:punch)
+      allow(stamper).to receive(:punch_recorded?).and_return(true) # 出勤・退勤とも AKASHI に記録済み
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 出勤09:30 / 退勤15:00
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+      clock_time[:now] = t("15:00", 5)
+      daemon.tick # 退勤打刻（午後休の正常系）
+
+      evs[:fail] = true
+      daemon.request_recheck!
+      clock_time[:now] = t("16:00")
+      daemon.tick # recheck の取得失敗 → 打刻済み状態が破棄され、所定 18:00 の計画に戻る
+
+      clock_time[:now] = t("18:00", 5)
+      daemon.tick # ゲートで中止（18:00 ≠ 15:00）するが、打刻済みなので通知しない
+      expect(logger).to have_received(:info).with(/退勤は既にAKASHIで打刻済みのため、中止通知は出しません/)
+      expect(notifier).not_to have_received(:notify).with(/打刻を中止しました/)
     end
   end
 

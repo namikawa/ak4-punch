@@ -22,8 +22,9 @@ module Ak4Punch
   #     （出勤は休暇の終了へ後ろ倒し／退勤は休暇の開始へ前倒し）。押し出しの結果
   #     「出勤締切 >= 退勤基準」になった日は勤務時間ゼロ＝全休として打刻しない
   #     （AKASHI は休暇申請日でも打刻を受理するため、この判定が誤打刻を防ぐ主手段）。
-  #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害/休暇中のため退勤中止）
+  #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害/休暇中のため打刻中止）
   #     のみ Slack に通知する。成功・全休スキップ・目標変更は通知しない。
+  #     休暇中の打刻中止は、既に AKASHI に記録があれば通知しない（give_up と同じ扱い）。
   #     ただし定期再取得の失敗は実害がないため、連続失敗が閾値に達するまで通知しない
   #     （DarkWake 中の無通信による一過性の失敗で鳴らさない）。
   #   - 長い sleep はせず tick で進める（Mac スリープ復帰後に正しく追随するため）。
@@ -39,6 +40,21 @@ module Ak4Punch
     PunchPlan = Struct.new(:kind, :target_at, :done,
                            :attempted, :last_error, :final_checked, keyword_init: true) do
       def done? = done == true
+    end
+
+    # 当日「最後に sukesan から取得できたときの休暇情報」。取得に失敗した tick でも
+    # 休暇中かどうかを判定できるようにするために保持する（POST 直前の休暇ゲートの判定材料）。
+    #   leaves:     そのときの LeaveSchedule
+    #   in_target:  そのとき計算した休暇反映後の出勤目標
+    #   out_target: そのとき計算した休暇反映後の退勤目標
+    #   fetched_at: 取得した時刻（ログ・通知で「いつ時点の情報か」を示す）
+    # 各 target が「実際に採用された @punch_plans[kind].target_at」ではないのが肝。
+    # 日中に休暇が入って新目標が到達不能になった日は、set_in_plan/set_out_plan が更新を見送って
+    # 旧目標（休暇を知らない目標）が残る。まさにその日を止めるための情報なので、
+    # 採用されたかどうかに関わらず「休暇を反映して計算した目標」を持っておく必要がある。
+    LeaveSnapshot = Struct.new(:leaves, :in_target, :out_target, :fetched_at, keyword_init: true) do
+      # kind に対応する「休暇を反映して計算した目標」。
+      def target_for(kind) = kind == :in ? in_target : out_target
     end
 
     # プロセス生存確認（シグナル0は送達せず存在チェックのみ）。
@@ -82,6 +98,7 @@ module Ak4Punch
       @plan_date = nil          # 計画の作成に成功した日付（失敗した日は進めず、次の tick で再試行する）
       @punch_plans = {}         # kind => PunchPlan（対象日のみ）
       @leave_day = false        # 全休（休暇で当日の勤務時間がゼロ）。true の間は再取得も打刻もしない
+      @leave_snapshot = nil     # 当日最後に取得できた休暇情報（直前取得が失敗した時の判定に使う）
       @last_refresh_at = nil    # 最後に sukesan を再取得した時刻
       @calendar_failure_count = 0 # sukesan 取得の連続失敗回数（成功でリセット。定期再取得の通知判定に使う）
       @notified_keys = []       # 当日通知済みのイベント種別（同日デデュープ用。日付変化でリセット）
@@ -221,6 +238,7 @@ module Ak4Punch
       @current_date = today
       @punch_plans = {}
       @leave_day = false
+      @leave_snapshot = nil # 前日の休暇情報を持ち越さない
       @last_refresh_at = nil
       @calendar_failure_count = 0 # 前日の連続失敗を持ち越さない
       @notified_keys = [] # 同日デデュープを日付変化でリセット
@@ -250,6 +268,7 @@ module Ak4Punch
       leaves = leave_schedule(fetched[:events], today)
       in_plan = plan_clock_in(date: today, events: fetched[:events], leaves: leaves, error: fetched[:error])
       out = plan_clock_out(date: today, events: fetched[:events], leaves: leaves, error: fetched[:error])
+      remember_leaves(leaves, in_plan, out, now) if fetched[:events]
 
       notify_sukesan_fallback(fetched[:error]) if fetched[:error]
 
@@ -317,6 +336,7 @@ module Ak4Punch
       leaves = leave_schedule(fetched[:events], date)
       in_plan = plan_clock_in(date: date, events: fetched[:events], leaves: leaves)
       out = plan_clock_out(date: date, events: fetched[:events], leaves: leaves)
+      remember_leaves(leaves, in_plan, out, now)
       return if switch_to_full_leave?(leaves, in_plan, out)
 
       set_in_plan(in_plan, now) if pending.include?(:in)
@@ -461,6 +481,12 @@ module Ak4Punch
           next
         end
 
+        # 休暇ゲート（POST 直前の単一判定）。出勤・退勤とも、初回もリトライも必ず通す。
+        # 休暇による中止の判定はここ1箇所だけに置く。直前チェック（退勤のみ・初回のみ）の中に
+        # 置くと、そこを通らない経路（出勤全般・recheck 後の計画作り直し・打刻失敗のリトライ）が
+        # 素通しになる。
+        next if abort_punch_in_leave?(plan, punch_now)
+
         ok, error = execute_punch(kind, punch_now, deadline: punch_deadline_at(plan.target_at))
         if ok
           plan.done = true
@@ -534,7 +560,9 @@ module Ak4Punch
       fetched = fetch_events(now.to_date)
 
       # 再取得失敗は安全側（打刻機会を逃さない）に倒し、現在の目標のまま打刻する。
-      # 計画も更新しない（フォールバック値で目標を上書きしない）。
+      # 計画も更新しない（フォールバック値で目標を上書きしない。過去バグ 5843f72）。
+      # 当日すでに把握している休暇の判定は POST 直前の休暇ゲート（abort_punch_in_leave?）が
+      # @leave_snapshot で行うため、ここでは何もしない（この経路も必ずゲートを通る）。
       if fetched[:error]
         @logger.warn("退勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します")
         return false
@@ -547,6 +575,7 @@ module Ak4Punch
       leaves = leave_schedule(fetched[:events], date)
       in_plan = plan_clock_in(date: date, events: fetched[:events], leaves: leaves)
       out = plan_clock_out(date: date, events: fetched[:events], leaves: leaves)
+      remember_leaves(leaves, in_plan, out, now)
 
       # まず全休判定（休暇で勤務時間が消えていたら以降の打刻を中止）。
       return true if switch_to_full_leave?(leaves, in_plan, out)
@@ -561,26 +590,67 @@ module Ak4Punch
         return true
       end
 
-      abort_out_in_leave?(now, leaves, out)
+      # 休暇による中止はここでは判定しない（POST 直前の休暇ゲートに一本化している）。
+      false
     end
 
-    # いま打刻すると「休暇の時間帯に退勤した」記録になる場合に打刻を中止する（true を返す）。
-    # 条件は「現在時刻が休暇の時間帯の中」かつ「休暇を織り込んだ新目標が既に打刻期限切れ」。
-    # 例: 17:00 に「休暇 15:00-19:00」を追加した日。新目標は 15:00 になるが到達不能なので
-    # set_out_plan の更新ガードで旧目標 18:00 が残り、この判定がないと 18:00 に打刻してしまう。
-    # 期限切れを条件に加えるのは半休の正常系を止めないため: 午後休の退勤基準は休暇の開始時刻に
-    # なり、そこへ揺らぎ（+0〜N分）を足した目標は必ず休暇の時間帯の中に入る。
-    # 目標として正しく到達した打刻（＝期限内）は、休暇の時間帯にあっても実行してよい。
-    def abort_out_in_leave?(now, leaves, out)
-      return false unless leaves.covers?(now) && unreachable_target?(out[:target], now)
+    # 当日最後に取得できた休暇情報（@leave_snapshot）を保存する。
+    # POST 直前の休暇ゲートはこれを唯一の判定材料にする。
+    def remember_leaves(leaves, in_plan, out, now)
+      @leave_snapshot = LeaveSnapshot.new(leaves: leaves, in_target: in_plan[:target],
+                                          out_target: out[:target], fetched_at: now)
+    end
 
-      @logger.warn("退勤直前チェック: 現在時刻が休暇#{leaves.labels}の時間帯で、" \
-                   "休暇を反映した目標 #{fmt(out[:target])} は既に打刻期限切れのため、退勤打刻を中止します")
-      # 次の tick で毎回 sukesan を叩き直さないよう done にする（窓超過の断念通知も出さない）。
-      @punch_plans[:out]&.done = true
-      notify_once([:leave_abort, :out],
-                  "退勤打刻を中止しました（現在 #{now.strftime('%H:%M')} は休暇#{leaves.labels}の時間帯で、" \
-                  "休暇を反映した退勤目標 #{out[:target].strftime('%H:%M')} は打刻期限切れです）。" \
+    # 出勤・退勤の POST の直前に必ず通す休暇ゲート。休暇による中止判定はこの1箇所だけに置く。
+    #
+    # 規則: 現在時刻が把握済みの休暇の時間帯に入っているなら打刻しない。ただし現在の計画の
+    # 目標が snapshot の同じ kind の目標と一致し、かつ期限内なら打刻してよい。
+    #
+    # 「一致」が肝。一致するということは、いま打刻しようとしている目標が休暇を反映して
+    # 計算されたものだという意味になり、半休の正常系だけが通る（午前休は「休暇の終了−揺らぎ」、
+    # 午後休は「休暇の開始+揺らぎ」なので、目標自体が休暇の時間帯の中に入る）。
+    # 不一致は「休暇を知らない古い目標を持っている」ことの証拠なので中止する。
+    # これで次の3つが kind を問わず同じ規則で塞がる:
+    #   ① 日中に休暇が入り、新目標が到達不能で set_in_plan/set_out_plan が更新を見送った日
+    #   ② recheck 直後の取得失敗で、所定フォールバックの計画に作り直された日（全休日・半休日とも）
+    #   ③ 打刻失敗のリトライ中に定期再取得で休暇を把握した日（退勤の直前チェックを通らない経路）
+    # snapshot が無い日（当日一度も取得に成功していない）は判定材料がないので打刻する。
+    def abort_punch_in_leave?(plan, now)
+      snapshot = @leave_snapshot
+      return false if snapshot.nil?
+      return false unless snapshot.leaves.covers?(now)
+
+      planned = snapshot.target_for(plan.kind)
+      return false if plan.target_at == planned && !unreachable_target?(plan.target_at, now)
+
+      # 中止は確定。ここから先は通知の要否だけを判断する。
+      # 既に AKASHI に記録がある場合は通知しない（give_up_punch と同じ慣行）。recheck で
+      # 打刻済み状態が破棄されて計画が作り直された日に「手動打刻してください」と誤報しないため。
+      if already_stamped?(plan.kind, now.to_date)
+        @logger.info("#{label(plan.kind)}は既にAKASHIで打刻済みのため、中止通知は出しません" \
+                     "（目標 #{fmt(plan.target_at)}）。")
+        plan.done = true
+        return true
+      end
+
+      # 期限切れの分岐は呼び出し側（fire_due_punches）が先に give_up で処理するため通常は通らないが、
+      # ゲートの規則を単独で読めるようにここでも判定する。
+      reason =
+        if plan.target_at == planned
+          "#{label(plan.kind)}目標 #{hhmm(plan.target_at)} は既に打刻期限切れです"
+        else
+          "現在の#{label(plan.kind)}目標 #{hhmm(plan.target_at)} は、#{hhmm(snapshot.fetched_at)} 時点の" \
+            "休暇を反映した目標 #{hhmm(planned, base: now)} と一致しません（休暇を知らない古い目標です）"
+        end
+      @logger.warn("現在時刻が休暇#{snapshot.leaves.labels}の時間帯のため、" \
+                   "#{label(plan.kind)}打刻を中止します。#{reason}")
+      # 次の tick で毎回やり直さないよう done にする（窓超過の断念通知も出さない）。復帰は punch recheck。
+      plan.done = true
+      # 通知キーに kind と目標時刻を含める（give_up_punch と同じ慣行）。recheck で計画を復活させた
+      # 後の別目標での中止は、同じ日でも改めて通知する必要があるため。
+      notify_once([:leave_abort, plan.kind, plan.target_at],
+                  "#{label(plan.kind)}打刻を中止しました（現在 #{hhmm(now)} は" \
+                  "休暇#{snapshot.leaves.labels}の時間帯です。#{reason}）。" \
                   "必要であれば AKASHI で手動打刻してください")
       true
     end
@@ -883,5 +953,8 @@ module Ak4Punch
 
     def label(kind) = KIND_LABELS.fetch(kind)
     def fmt(time) = time.strftime("%Y-%m-%d %H:%M:%S")
+    # 当日内の時刻だけを示せばよい場面（休暇ゲートのログ・通知）用の短い書式。
+    # base を渡すと日を跨いだ時刻には日付が付く（終日休暇の目標は翌日 00:00 になるため）。
+    def hhmm(time, base: nil) = LeaveSchedule.hhmm(time, base: base)
   end
 end
