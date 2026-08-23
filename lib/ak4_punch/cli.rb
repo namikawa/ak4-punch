@@ -119,17 +119,24 @@ module Ak4Punch
       pmset = WakeScheduler::PMSET
       puts <<~GUIDE
         # ===== sudoers 設定（pmset の自動起床予約を無パスワードで許可）=====
-        # デーモンが `sudo -n pmset schedule ...` を実行できるようにします。
+        # デーモンが実行するのは起床予約の追加（`sudo -n pmset schedule wake <日時>`）だけです。
+        # 予約状態の読み取り（`pmset -g sched`）は sudo なしで実行するため、許可は要りません。
         # 下記1行を /etc/sudoers.d/ak4-punch に設置してください（visudo で構文検証されます）:
 
-        #{user} ALL=(root) NOPASSWD: #{pmset} schedule *
+        #{user} ALL=(root) NOPASSWD: #{pmset} schedule wake *
 
         # 設置手順:
         sudo visudo -f /etc/sudoers.d/ak4-punch
         #   → 上記の1行を貼り付けて保存
+        #   → 以前の `#{pmset} schedule *` を設置済みの場合は、上記の行に置き換えてください
+        #     （置き換えなくても許可範囲が広いだけなので、そのままでも動作は継続します）
 
-        # 確認（パスワードを聞かれずに実行できればOK）:
-        sudo -n #{pmset} -g sched
+        # 確認（許可されているかを表示するだけ。起床予約は作りません）:
+        sudo -n -l #{pmset} schedule wake "01/01/2030 00:00:00"
+        #   → 許可されていれば上のコマンドがそのまま表示されます（日時はダミー）。
+        #     未設定ならパスワードを求められて（-n のため）非0で終了します。
+        #   ※ 日時のダミー引数は省略できません。sudoers は引数を1つの文字列として照合するため、
+        #     末尾の `*` は「引数が1つ以上ある」場合にだけ一致します。
 
         # ※ pmset の実パスは環境により異なる場合があります。上は #{pmset} を前提にしています。
         #   異なる場合は `which pmset` の結果に置き換えてください。

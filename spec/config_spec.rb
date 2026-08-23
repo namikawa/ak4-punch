@@ -122,7 +122,9 @@ RSpec.describe Ak4Punch::Config do
       expect(cfg.daemon_wake_lead_minutes).to eq 1
       expect(cfg.daemon_manage_wake).to be true
       expect(cfg.daemon_late_grace_minutes).to eq 10
-      expect(cfg.daemon_morning_wake_at).to be_nil # 未設定なら従来動作（所定出勤時刻に起床・下限なし）
+      # 未設定なら従来動作（起床時刻・出勤アンカーの下限とも所定出勤時刻。
+      # 下限が無くなるのではなく、所定より前に始まる予定がアンカーにならない＝出勤の連動が実質無効になる）
+      expect(cfg.daemon_morning_wake_at).to be_nil
       expect(cfg.sukesan_base_url).to eq "http://127.0.0.1:3000"
     end
 
