@@ -917,9 +917,34 @@ module Ak4Punch
       base, shifts = leaves.push_before(base)
       summary = "#{summary}／#{shifts.map(&:label).join('、')}" unless shifts.empty?
 
-      { target: apply_jitter(base, date, :out), plan: plan, base: base,
+      jittered = apply_jitter(base, date, :out)
+      target = out_target_at(jittered, base, date)
+      summary = "#{summary}／揺らぎ後 #{hhmm(jittered, base: base)} が翌日になるため基準時刻に戻す" if target != jittered
+
+      { target: target, plan: plan, base: base,
         summary: summary, error: error, leave_shifts: shifts }
     end
+
+    # 退勤の目標時刻 = 基準 + 揺らぎ。ただし揺らぎ後が翌日に出る日は揺らぎを落として基準そのものにする。
+    # 目標が翌日に出ると、日付が変わった最初の tick で当日の計画が破棄される（start_new_day）ため
+    # その日の退勤は必ず未打刻になる。基準（base）が当日内でも「基準+揺らぎ」は翌日に跨りうる
+    # （実測: 23:59 終了のイベント + clock_out_window 5分 で 12日サンプル中8日が翌日になった。
+    #  例 2026-07-10 は揺らぎ183秒で翌日 00:02:03）。設定由来の跨ぎは Config が起動時に弾くが、
+    # カレンダー由来はここで押さえる必要がある。
+    #
+    # 「当日内に収める」（23:59:59 で頭を押さえる）のでは足りない。fire_due_punches は
+    # 目標到達後（now >= target）に発火し、tick は daemon.tick_seconds（既定30秒）間隔なので、
+    # 目標が日付変更の直前だと発火機会がほぼ無く、tick の位相次第で結局打刻されない
+    # （23:59:59 なら窓は1秒＝30通りの位相のうち1通りだけ。基準 23:59:00 に戻せば窓は60秒になり
+    #  どの位相でも1回は tick が入る）。揺らぎの忠実さより「そもそも打刻されること」を優先する。
+    #
+    # 基準は「最終業務イベントの終了（または所定退勤時刻）」なので、そこへ落としても
+    # target >= base（退勤基準より前には打刻しない）は等号で保たれる。揺らぎは日付と kind から
+    # 決まる決定論的な値のままで、この分岐も基準が同じなら同じ結果になるため
+    # 「再取得のたびに目標がブレない」不変条件も壊さない。
+    # 基準自体が 23:59:59 付近だと窓は縮むが、それはイベントの終了時刻そのものが
+    # 日付変更の直前という打つ手のない縮退ケース。
+    def out_target_at(jittered, base, date) = jittered.to_date == date ? jittered : base
 
     # 基準時刻に「日毎・kind毎に固定した揺らぎ秒」を足す（退勤: 基準は下限なので後ろへずらす）。
     def apply_jitter(base_time, date, kind) = base_time + jitter_seconds(date, kind)

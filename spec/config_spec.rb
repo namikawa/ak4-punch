@@ -184,6 +184,18 @@ RSpec.describe Ak4Punch::Config do
         .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days は 0〜31 の整数で.*nil/)
     end
 
+    it "小数はエラー（Integer() の切り捨てで黙って通さない）" do
+      expect { cfg_with_threshold(7.9) }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days は 0〜31 の整数で.*7\.9/)
+      expect { cfg_with_threshold(31.9) }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days.*31\.9/)
+    end
+
+    it "16進表記の文字列はエラー（基数10で解釈する）" do
+      expect { cfg_with_threshold("0x1f") }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days.*0x1f/)
+    end
+
     it "整数化できない文字列はエラー" do
       expect { cfg_with_threshold("ななにち") }
         .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days.*ななにち/)

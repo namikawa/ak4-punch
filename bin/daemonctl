@@ -52,6 +52,10 @@ wait_until_unloaded() {
     is_loaded || return 0
     sleep 1
   done
+  # 最後の sleep 中に登録解除が完了している場合があるため、ループを抜けた後にもう一度確認する
+  # （この再判定がないと、40秒目に完了したケースで stop が誤ってタイムアウトを報告し、
+  #  install は bootstrap せずに終了してデーモンが停止したまま残る）。
+  is_loaded || return 0
   return 1
 }
 

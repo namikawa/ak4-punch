@@ -26,6 +26,15 @@ module Ak4Punch
     # 応答本文をそのまま全部載せるとログ・Slack が読めなくなるため。
     MAX_DETAIL_LENGTH = 200
 
+    # 「nil か文字列」であることを検証するイベントのフィールド。下流が String 前提で扱うものだけを挙げる。
+    #   title             … LeaveSchedule のキーワード判定（include?）と display_title（empty?）
+    #   starts_at/ends_at … parse_time が Time.iso8601 に渡す（rescue は ArgumentError のみなので
+    #                       数値だと TypeError が素通しし、定期再取得が毎 tick 例外になる）
+    # id と location は意図的に検証しない: id は数値で返る可能性があり、location は保持するだけで
+    # 型に依存した処理をしていない（実在の応答を弾かない側に倒す）。
+    # キー自体が無い場合は nil 扱いで正常（実際に starts_at を持たない応答がある）。
+    STRING_FIELDS = %w[title starts_at ends_at].freeze
+
     # 1件のイベント。時刻は JST に正規化済みの Time または nil。
     Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true) do
       # ログ・CLI 表示用のタイトル。nil と空文字はプレースホルダに置き換える。
@@ -56,8 +65,10 @@ module Ak4Punch
     # 応答の形を検証して events の配列を取り出す。
     # HTTP 200 でも形が違うことはあり、`Array(json["events"])` で黙って [] に潰すと
     # 「予定なし」の成功として扱われる（休暇情報が空で上書きされ、休暇日の防御が静かに外れる）。
-    # 要素が Hash でない場合は build_event が NoMethodError/TypeError を投げ、定期再取得の経路では
-    # tick が毎回 fire_due_punches に到達しなくなって打刻が無通知のまま止まる。
+    # 要素が Hash でない場合、あるいは要素内部のフィールドの型が違う場合は、build_event や
+    # 下流（parse_time の Time.iso8601 / LeaveSchedule のキーワード判定）が TypeError・NoMethodError を
+    # 投げる。これらは Daemon#fetch_events の `rescue CalendarClient::ApiError` を通らないため、
+    # 定期再取得の経路では tick が毎回 fire_due_punches に到達せず、打刻が無通知のまま止まる。
     # どちらも一過性の通信障害ではなく恒久的な不整合なので、リトライしない ApiError にして
     # Daemon の既存の取得失敗経路（連続失敗カウント・所定時刻フォールバック・通知）に載せる。
     # 空配列は「予定なし」として正常。
@@ -68,11 +79,29 @@ module Ak4Punch
       events = json["events"]
       invalid_response!("events が配列ではありません: #{summarize(events)}") unless events.is_a?(Array)
 
-      # nil 要素も検出したいので find ではなく index で探す。
-      bad = events.index { |e| !e.is_a?(Hash) }
-      invalid_response!("events[#{bad}] がオブジェクトではありません: #{summarize(events[bad])}") unless bad.nil?
+      events.each_with_index do |raw, i|
+        invalid_response!("events[#{i}] がオブジェクトではありません: #{summarize(raw)}") unless raw.is_a?(Hash)
 
+        validate_event_fields!(raw, i)
+      end
       events
+    end
+
+    # 1件のイベントのフィールドの型を検証する（下流が型に依存して扱うものだけ・詳細は STRING_FIELDS）。
+    def validate_event_fields!(raw, index)
+      STRING_FIELDS.each do |field|
+        value = raw[field]
+        next if value.nil? || value.is_a?(String)
+
+        invalid_response!("events[#{index}].#{field} が文字列ではありません: #{summarize(value)}")
+      end
+
+      all_day = raw["all_day"]
+      return if all_day.nil? || all_day == true || all_day == false
+
+      # build_event は `== true` で潰すため例外にはならないが、"true" のような値を黙って
+      # all_day=false として扱うと終日イベントを通常の予定として打刻判定に使ってしまう。
+      invalid_response!("events[#{index}].all_day が真偽値ではありません: #{summarize(all_day)}")
     end
 
     def invalid_response!(detail)

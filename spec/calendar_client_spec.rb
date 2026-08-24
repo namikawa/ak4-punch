@@ -152,6 +152,57 @@ RSpec.describe Ak4Punch::CalendarClient do
       stub_body({ date: "2026-07-10", events: [] }.to_json)
       expect(client.events(date: date)).to eq []
     end
+
+    describe "イベント内部のフィールドの型" do
+      # 要素が Hash でも、下流が String / 真偽値 前提で扱うフィールドに別の型が来ると
+      # Time.iso8601 の TypeError や include?/empty? の NoMethodError になり、
+      # ApiError を通らないため定期再取得の経路が毎 tick 壊れる（打刻の無通知の飢餓）。
+      it "starts_at が文字列でなければ ApiError（Time.iso8601 の TypeError にしない）" do
+        stub_body({ events: [{ id: "x", starts_at: 1 }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                          /events\[0\]\.starts_at が文字列ではありません/)
+      end
+
+      it "ends_at が文字列でなければ ApiError（位置が分かる）" do
+        stub_body({ events: [{ id: "a", ends_at: "2026-07-10T18:00:00+09:00" }, { id: "b", ends_at: 2 }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[1\]\.ends_at が文字列ではありません/)
+      end
+
+      it "title が文字列でなければ ApiError（休暇キーワード判定の NoMethodError にしない）" do
+        stub_body({ events: [{ id: "x", title: 42 }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.title が文字列ではありません/)
+      end
+
+      it "all_day が真偽値でなければ ApiError（終日を黙って通常イベント扱いにしない）" do
+        stub_body({ events: [{ id: "x", all_day: "true" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.all_day が真偽値ではありません/)
+      end
+
+      it "title / starts_at / ends_at が nil、キー自体が無い場合は正常（実在の応答形）" do
+        stub_body({ events: [
+          { id: "def", title: nil, starts_at: nil, ends_at: nil, location: nil, all_day: true },
+          { id: "z", location: "3F" }, # 時刻・タイトル・all_day のキーがない
+        ] }.to_json)
+        events = client.events(date: date)
+        expect(events.size).to eq 2
+        expect(events[0].all_day).to be true
+        expect(events[1].starts_at).to be_nil
+        expect(events[1].all_day).to be false
+      end
+
+      it "id と location の型は検証しない（id は数値で返る可能性があり location は保持のみ）" do
+        stub_body({ events: [{ id: 12_345, title: "会議", location: 3,
+                               ends_at: "2026-07-10T18:00:00+09:00", all_day: false }] }.to_json)
+        ev = client.events(date: date).first
+        expect(ev.id).to eq 12_345
+        expect(ev.location).to eq 3
+        expect(ev.ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00")
+      end
+    end
   end
 
   it "APIキー未設定なら通信せず ApiError" do

@@ -198,8 +198,15 @@ module Ak4Punch
     # 既定値へ黙ってフォールバックさせないのは、設定ミスに気づけないまま
     # 「打刻の直前に毎 tick 失敗して grace 超過で未打刻」という壊れ方をするため
     # （YAML に値なしで書くと nil が入り、TokenStore#needs_refresh? の乗算で NoMethodError になる）。
+    # 小数は明示的に拒否する（Integer(7.9) は 7 を返すため、7.9 と書くと黙って 7 として通ってしまう。
+    # 動作自体は 7 として正しくなるが「整数で指定してください」というメッセージと矛盾する）。
+    # 文字列は基数10を明示して変換する（"0x1f" のような表記を弾くため）。
     def threshold_days!(value)
-      days = Integer(value, exception: false)
+      days =
+        case value
+        when Integer then value
+        when String then Integer(value, 10, exception: false)
+        end
       return days if days && days.between?(0, MAX_TOKEN_REFRESH_THRESHOLD_DAYS)
 
       raise Error, "token.refresh_threshold_days は 0〜#{MAX_TOKEN_REFRESH_THRESHOLD_DAYS} の整数で" \

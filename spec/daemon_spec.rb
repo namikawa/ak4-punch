@@ -400,21 +400,25 @@ RSpec.describe Ak4Punch::Daemon do
   end
 
   describe "sukesan 応答のスキーマ不正（打刻の飢餓を防ぐ）" do
-    it "形式不正の応答でも tick が例外を漏らさず、所定時刻フォールバックで打刻する" do
-      # HTTP 200 で events の要素が Hash でない応答。CalendarClient が ApiError にせず素通しすると
-      # build_event が NoMethodError を投げ、定期再取得（fire_due_punches より前）で毎 tick 例外に
-      # なって打刻に到達しない（give_up 通知すら出ない無通知の飢餓）。ApiError にして既存の
-      # 取得失敗経路（所定時刻フォールバック）へ載せることで、この日でも打刻される。
-      stub_request(:get, %r{/api/v1/calendars/google/events})
-        .to_return(status: 200, body: { date: "2026-07-10", events: [nil] }.to_json)
+    # CalendarClient が形式不正を ApiError にせず素通しすると、build_event の NoMethodError や
+    # parse_time の TypeError（rescue は ArgumentError のみ）が Daemon#fetch_events の
+    # `rescue CalendarClient::ApiError` を通らず、定期再取得（fire_due_punches より前）で毎 tick
+    # 例外になって打刻に到達しない（give_up 通知すら出ない無通知の飢餓）。ApiError にして既存の
+    # 取得失敗経路（所定時刻フォールバック）へ載せることで、この日でも打刻される。
+    # 実 CalendarClient + WebMock で経路全体を固定する。
+    def daemon_against(body)
+      stub_request(:get, %r{/api/v1/calendars/google/events}).to_return(status: 200, body: body)
       real_client = Ak4Punch::CalendarClient.new(
         base_url: "http://127.0.0.1:3000", api_key: "k" * 64, sleeper: ->(_s) {},
       )
-      d = described_class.new(
+      described_class.new(
         config: config, stamper: stamper, calendar: calendar, calendar_client: real_client,
         token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
         notifier: notifier, clock: clock, sleeper: ->(_s) {},
       )
+    end
+
+    def expect_fallback_punch(d)
       allow(stamper).to receive(:punch)
 
       clock_time[:now] = t("08:00")
@@ -427,6 +431,17 @@ RSpec.describe Ak4Punch::Daemon do
       expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
       expect(notifier).to have_received(:notify)
         .with(/sukesan からのイベント取得に失敗し、出勤・退勤とも所定時刻にフォールバック.*応答の形式が不正です/).once
+    end
+
+    it "要素が Hash でない応答（events: [null]）でも tick が例外を漏らさず打刻する" do
+      expect_fallback_punch(daemon_against({ date: "2026-07-10", events: [nil] }.to_json))
+    end
+
+    it "starts_at が数値の応答でも tick が例外を漏らさず打刻する" do
+      body = { date: "2026-07-10",
+               events: [{ id: "x", title: "会議", starts_at: 1,
+                          ends_at: "2026-07-10T18:30:00+09:00", all_day: false }] }.to_json
+      expect_fallback_punch(daemon_against(body))
     end
   end
 
@@ -1291,6 +1306,107 @@ RSpec.describe Ak4Punch::Daemon do
       day = daemon.build_day_plan(date: date)
       expect(day[:in_target]).to eq t("09:30") - jitter(:in)
       expect(day[:out_target]).to eq t("18:00") + jitter(:out)
+    end
+  end
+
+  # 退勤目標は「基準 + 揺らぎ」なので、基準が当日内でも目標が翌日に跨ることがある。
+  # 翌日に出た目標は日付変化で計画が破棄され（start_new_day）必ず未打刻になるため、
+  # そういう日は揺らぎを落として基準そのものを目標にする（23:59:59 で頭を押さえるのでは、
+  # tick（既定30秒）が日付変更までに入る余裕がなく、位相次第で結局打刻されない）。
+  describe "退勤目標が翌日に出る日は揺らぎを落とす" do
+    let(:config) do
+      Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
+          "calendar" => { "enabled" => true },
+          "daemon" => { "manage_wake" => false, "late_grace_minutes" => 10, "morning_wake_at" => "07:45" },
+        },
+        root: Dir.pwd,
+      )
+    end
+
+    # 退勤側の揺らぎ秒（Daemon と同じ導出。2026-07-10 は 183秒）
+    def jitter_out(day: 10)
+      seed = Date.new(2026, 7, day).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
+      Random.new(seed).rand(0..300)
+    end
+
+    it "23:59 終了のイベントの日は基準（23:59:00）が目標になる" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59"))])
+
+      # 前提の確認: 揺らぎを足すと目標は翌日 00:02:03 になる
+      expect(t("23:59") + jitter_out).to eq t("00:02", 3, day: 11)
+
+      day = daemon.build_day_plan(date: date)
+      expect(day[:out_base]).to eq t("23:59")
+      expect(day[:out_target]).to eq t("23:59")      # 23:59:59 ではなく基準そのもの
+      expect(day[:out_target].to_date).to eq date
+      # 日付変更まで60秒あり、tick(30秒)がどの位相でも1回は入る
+      expect(t("00:00", 0, day: 11) - day[:out_target]).to be >= config.daemon_tick_seconds
+    end
+
+    it "落とした結果も基準を下回らない（退勤基準より前には打刻しない）" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59"))])
+
+      day = daemon.build_day_plan(date: date)
+      expect(day[:out_target]).to be >= day[:out_base]
+    end
+
+    it "当日内に収まる目標はそのまま（従来どおり基準+揺らぎ）" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+
+      day = daemon.build_day_plan(date: date)
+      expect(day[:out_target]).to eq t("18:30") + jitter_out
+      expect(day[:out_plan].source).to eq :calendar
+    end
+
+    it "目標は再取得で動かず、日付変更前の tick で退勤が打刻される" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59"))])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 退勤目標 23:59:00（揺らぎ後が翌日になるため基準へ）
+      expect(logger).to have_received(:info)
+        .with(%r{退勤目標を設定: 2026-07-10 23:59:00.*揺らぎ後 07/11 00:02 が翌日になるため基準時刻に戻す})
+
+      clock_time[:now] = t("08:16")
+      daemon.tick # 定期再取得でも目標は動かない（揺らぎも分岐も決定論的）
+      expect(logger).not_to have_received(:info).with(/退勤目標を更新/)
+
+      # 目標到達後の最初の tick（23:59:20）で打刻される＝日付変更前に発火機会がある。
+      # 23:59:59 に押さえる方式だと、この位相では now < target で打刻されないまま日付が変わる。
+      expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+      clock_time[:now] = t("23:59", 20)
+      daemon.tick
+    end
+
+    it "tick の位相がどこでも日付変更前に退勤が打刻される（30通り総当たり）" do
+      # 目標 23:59:00・tick 30秒。位相を1秒ずつずらした30通りで、23:59:00〜23:59:59 の間に
+      # 必ず tick が入り打刻されることを確認する（23:59:59 に押さえる方式では1通りしか通らない）。
+      fired = (0...30).count do |phase|
+        allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59"))])
+        punched = []
+        stamper_double = instance_double(Ak4Punch::Stamper, punch_recorded?: false)
+        allow(stamper_double).to receive(:punch) { |kind:, **| punched << kind }
+        d = described_class.new(
+          config: config, stamper: stamper_double, calendar: calendar, calendar_client: calendar_client,
+          token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+          notifier: notifier, clock: clock, sleeper: ->(_s) {},
+        )
+        clock_time[:now] = t("23:00", phase)
+        d.tick # 計画作成（この位相を起点に30秒刻みで tick が回る）
+        # 23:00 台から日付変更（翌 00:00:00）までを 30 秒刻みで進める
+        (1..).each do |i|
+          now = t("23:00", phase) + (i * 30)
+          break if now >= t("00:00", 0, day: 11)
+
+          clock_time[:now] = now
+          d.tick
+        end
+        punched.include?(:out)
+      end
+      expect(fired).to eq 30
     end
   end
 
