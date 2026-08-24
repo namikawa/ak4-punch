@@ -139,10 +139,12 @@ module Ak4Punch
         sudo -k -n -l
         #   → 「may run the following commands」の一覧に次の行があることを確認してください:
         #        (root) NOPASSWD: #{pmset} schedule wake *
-        #   → 「a password is required」で終了した場合は、NOPASSWD の行が1つも無い状態です。
-        #   ※ `-k` は直前の visudo で残った認証キャッシュを無視するために付けます。キャッシュが
-        #     生きていると、NOPASSWD が無くても許可されているように見えてしまいます
-        #     （デーモンは launchd 起動でキャッシュを使えないため、NOPASSWD が無いと必ず失敗します）。
+        #   → 標準設定（sudoers の listpw=any）で「a password is required」で終了した場合は、
+        #     NOPASSWD の行が1つも無い状態です。listpw を all/always に変えている環境では
+        #     NOPASSWD が正しくあってもこう出るため、`sudo -k -l`（-n なし）で認証して一覧を見てください。
+        #   ※ `-k` は直前の visudo で残った認証キャッシュを無視し、一覧を取得できるかどうかが
+        #     キャッシュに左右されないようにするために付けます（デーモンは launchd 起動で
+        #     キャッシュを使えないため、NOPASSWD が無いと必ず失敗します）。
         #   ※ `sudo -l <コマンド>` 形式は「そのコマンドが policy 上許可されているか」しか判定せず、
         #     NOPASSWD が付いているかを確認できないため使いません。
 
