@@ -443,6 +443,44 @@ RSpec.describe Ak4Punch::Daemon do
                           ends_at: "2026-07-10T18:30:00+09:00", all_day: false }] }.to_json
       expect_fallback_punch(daemon_against(body))
     end
+
+    it "日中の再取得で ends_at が壊れても退勤目標を所定へ巻き戻さず維持する" do
+      # 型は String でも日時として読めない値。検証がないと parse_time が nil を返して
+      # このイベントが退勤の判定から落ち、基準が所定 18:00 へ巻き戻る（grace 内なら早期退勤）。
+      # 取得失敗（ApiError）にすることで「定期再取得の失敗では目標を巻き戻さない」経路に乗る。
+      body_with = lambda do |ends_at|
+        { date: "2026-07-10",
+          events: [{ id: "e1", title: "実装", starts_at: "2026-07-10T10:00:00+09:00",
+                     ends_at: ends_at, all_day: false }] }.to_json
+      end
+      stub_request(:get, %r{/api/v1/calendars/google/events}).to_return(
+        { status: 200, body: body_with.call("2026-07-10T20:00:00+09:00") }, # 初回は正常（退勤目標 20:00）
+        { status: 200, body: body_with.call("oops") },                      # 以降は壊れた応答
+      )
+      real_client = Ak4Punch::CalendarClient.new(
+        base_url: "http://127.0.0.1:3000", api_key: "k" * 64, sleeper: ->(_s) {},
+      )
+      d = described_class.new(
+        config: config, stamper: stamper, calendar: calendar, calendar_client: real_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      )
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      d.tick # 退勤目標 20:00（カレンダー由来）
+      clock_time[:now] = t("08:16")
+      d.tick # 定期再取得が形式不正 → 目標は維持
+      expect(logger).to have_received(:warn).with(/定期再取得に失敗.*退勤 20:00.*維持.*日時として解析できません/)
+
+      clock_time[:now] = t("18:00", 5) # 所定に巻き戻っていたらここで打刻されてしまう
+      d.tick
+      expect(stamper).not_to have_received(:punch).with(hash_including(kind: :out))
+
+      clock_time[:now] = t("20:00", 5)
+      d.tick
+      expect(stamper).to have_received(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
+    end
   end
 
   describe "非対象日は何もしない" do
@@ -1407,6 +1445,142 @@ RSpec.describe Ak4Punch::Daemon do
         punched.include?(:out)
       end
       expect(fired).to eq 30
+    end
+  end
+
+  # 打刻の直前（POST の直前）に日付が変わるケース。execute_punch は壁時計の日付を Stamper に渡すため、
+  # 跨いだ後に打刻すると翌日を対象日として冪等スキップされ（翌日には出勤の記録がないので退勤が
+  # 「未出勤」扱いになる）、:skipped と成功を区別しないため通知もないまま打刻が失われていた。
+  describe "打刻直前の日付変更ガード" do
+    let(:config) do
+      Ak4Punch::Config.new(
+        data: {
+          "company_id" => "x",
+          "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
+          "calendar" => { "enabled" => true },
+          "daemon" => { "manage_wake" => false, "late_grace_minutes" => 10, "morning_wake_at" => "07:45" },
+        },
+        root: Dir.pwd,
+      )
+    end
+
+    # 退勤側の揺らぎ秒（Daemon と同じ導出。2026-07-10 は 183秒）
+    def jitter_out
+      seed = Date.new(2026, 7, 10).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
+      Random.new(seed).rand(0..300)
+    end
+
+    # tick の途中で時計が進むクロック（配列を順に返し、最後の値は以降ずっと返す）。
+    # 位相総当たりテストのように tick 内で時刻を固定する形では、この退行（tick 冒頭は当日／
+    # 打刻直前は翌日）を再現できないため、@clock の呼ばれ方に合わせて1呼び出しずつ与える。
+    # 呼ばれ方: tick 冒頭で1回、fire_due_punches で打刻直前の取り直しが kind 毎に1回
+    #（窓超過で断念する kind は取り直さない）。
+    def daemon_with_clock(times)
+      queue = times.dup
+      described_class.new(
+        config: config, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: -> { queue.length > 1 ? queue.shift : queue.first }, sleeper: ->(_s) {},
+      )
+    end
+
+    it "退勤直前チェック中に日付が変わったら打刻せず、翌日の tick で未打刻として通知する" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59", 30))])
+      allow(stamper).to receive(:punch)
+      # ①計画 ②due の tick 冒頭（23:59:40）③打刻直前の取り直し（sukesan 再取得で約26秒経過して翌日）
+      # ④翌日の tick
+      d = daemon_with_clock([t("08:00"), t("23:59", 40), t("00:00", 6, day: 11), t("00:00", 40, day: 11)])
+
+      d.tick # 計画作成（退勤目標 23:59:30／揺らぎは翌日に出るため落とされる）
+      d.tick # due → 打刻直前に日付が変わっている → 打刻しない
+
+      expect(stamper).not_to have_received(:punch).with(hash_including(kind: :out))
+      expect(logger).to have_received(:warn)
+        .with(/日付が変わったため退勤打刻を見送ります.*計画日 2026-07-10.*目標 2026-07-10 23:59:30/)
+      expect(logger).to have_received(:warn).with(/日付が変わったため退勤打刻.*現在 2026-07-11 00:00:06/)
+      # done を立てないのが要点（立てると翌日の未打刻通知が出ず、黙って失われる）
+      expect(d.instance_variable_get(:@punch_plans)[:out].done?).to be false
+
+      d.tick # 翌日の最初の tick → start_new_day が前日の未打刻を通知
+      expect(notifier).to have_received(:notify)
+        .with(/昨日（2026-07-10）の退勤は打刻されませんでした（未打刻のまま日付が変わりました）/).once
+    end
+
+    it "通常日は日付ガードが発火せず、POST 期限は 目標+grace のまま" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:00"))])
+      out_target = t("18:00") + jitter_out # 18:03:03（当日内なので揺らぎはそのまま）
+      d = daemon_with_clock([t("08:00"), out_target + 5, out_target + 8])
+
+      d.tick
+      # 計画日の終端(23:59:59)より「目標+grace」の方が早いので min の結果は変わらない
+      expect(stamper).to receive(:punch)
+        .with(kind: :out, date: date, window_minutes: 0, deadline: out_target + (10 * 60))
+      d.tick
+
+      expect(logger).not_to have_received(:warn).with(/打刻の直前に日付が変わった/)
+    end
+
+    it "近深夜の目標では POST 期限を計画日の終端(23:59:59)で丸める" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59", 30))])
+      d = daemon_with_clock([t("08:00"), t("23:59", 40), t("23:59", 45)])
+
+      d.tick
+      # 目標 23:59:30 + grace 10分 = 翌 00:09:30 ではなく、計画日の終端で丸めた期限を渡す
+      expect(stamper).to receive(:punch)
+        .with(kind: :out, date: date, window_minutes: 0, deadline: t("23:59", 59))
+      d.tick
+    end
+
+    it "期限内に始めた打刻が通信の途中で日付を跨いだら中止され、計画は未完了のまま残る" do
+      # Stamper#ensure_within_deadline! / Client の送信直前判定が DeadlineExceeded を投げるケース
+      # （冪等チェックの GET 中にスリープして復帰が翌日になった状況）。
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59", 30))])
+      allow(stamper).to receive(:punch) do |kind:, **|
+        raise Ak4Punch::DeadlineExceeded, "打刻期限を超過したため打刻を中止しました（期限 23:59:59／現在 00:00:12）" if kind == :out
+      end
+      d = daemon_with_clock([t("08:00"), t("23:59", 40), t("23:59", 45), t("00:00", 40, day: 11)])
+
+      d.tick
+      d.tick # 期限内に打刻を試みるが Stamper が中止 → done にせずリトライ扱いで残る
+      out_plan = d.instance_variable_get(:@punch_plans)[:out]
+      expect(out_plan.done?).to be false
+      expect(out_plan.attempted).to be true
+
+      d.tick # 翌日 → 未打刻として通知（黙って失われない）
+      expect(notifier).to have_received(:notify)
+        .with(/昨日（2026-07-10）の退勤は打刻されませんでした/).once
+    end
+
+    it "断念時の打刻済み確認は計画日で行う（翌日の履歴で通知を抑止しない）" do
+      # 目標 23:59:30／grace 10分 → 期限は翌 00:09:30。tick 冒頭は期限内だが、退勤の直前チェックに
+      # 手間取って打刻直前が翌 00:10:00（期限超過・日付も翌日）になったケース。
+      # ここは日付ガードより手前の give_up 経路なので、now.to_date で確認すると翌日の履歴を見てしまい、
+      # 0時台の手動打刻などがあると通知が抑止され plan.done が立って前日の未打刻が黙って消える。
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59", 30))])
+      allow(stamper).to receive(:punch_recorded?).with(:out, date).and_return(false)          # 計画日は未打刻
+      allow(stamper).to receive(:punch_recorded?).with(:out, Date.new(2026, 7, 11)).and_return(true) # 翌日には記録あり
+      d = daemon_with_clock([t("08:00"), t("23:59", 40), t("00:10", 0, day: 11)])
+
+      d.tick
+      d.tick # 直前チェック後に期限超過＋日付跨ぎ → 断念
+
+      expect(stamper).to have_received(:punch_recorded?).with(:out, date)
+      expect(stamper).not_to have_received(:punch_recorded?).with(:out, Date.new(2026, 7, 11))
+      expect(notifier).to have_received(:notify).with(/退勤打刻をスキップしました.*目標 23:59/).once
+    end
+
+    it "日付を跨がない断念では、打刻済みなら従来どおり通知を抑止して done にする" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:00"))])
+      allow(stamper).to receive(:punch_recorded?).and_return(true) # 手動打刻済み
+      d = daemon_with_clock([t("08:00"), t("18:14")]) # 目標 18:03:03 + grace 10分 = 18:13:03 を超過
+
+      d.tick
+      d.tick
+
+      expect(stamper).to have_received(:punch_recorded?).with(:out, date)
+      expect(logger).to have_received(:info).with(/退勤は既にAKASHIで打刻済みのため、スキップ通知は出しません/)
+      expect(notifier).not_to have_received(:notify)
+      expect(d.instance_variable_get(:@punch_plans)[:out].done?).to be true
     end
   end
 

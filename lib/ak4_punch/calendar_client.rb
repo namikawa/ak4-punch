@@ -35,6 +35,17 @@ module Ak4Punch
     # キー自体が無い場合は nil 扱いで正常（実際に starts_at を持たない応答がある）。
     STRING_FIELDS = %w[title starts_at ends_at].freeze
 
+    # 「ISO8601 の日時として解析できる文字列」であることまで検証するフィールド（STRING_FIELDS の部分集合）。
+    # 型が String でも中身が壊れていると parse_time が ArgumentError を rescue して nil を返すため、
+    # そのイベントが ClockOutPlanner の対象から静かに落ち、退勤基準が所定時刻へ巻き戻る
+    # （日中の再取得でこれが起きると、20:00 だった目標が 18:0x になり grace 内なら早期退勤する）。
+    # 取得失敗（ApiError）にすれば refresh_if_due が既存目標を維持するので、
+    # 「定期再取得の失敗では打刻目標を所定時刻へ巻き戻さない」（過去バグ 5843f72）と挙動が揃う。
+    # nil・空文字・空白のみは parse_time が意図的に nil として扱うので正常のまま（判定は blank_time? で共有）。
+    # sukesan は Time#iso8601 の出力か null しか返さない（終日イベントも Time.parse 経由で
+    # 00:00:00+09:00 になる）ため、この検証で実在の応答が弾かれることはない。
+    TIME_FIELDS = %w[starts_at ends_at].freeze
+
     # 1件のイベント。時刻は JST に正規化済みの Time または nil。
     Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true) do
       # ログ・CLI 表示用のタイトル。nil と空文字はプレースホルダに置き換える。
@@ -96,12 +107,32 @@ module Ak4Punch
         invalid_response!("events[#{index}].#{field} が文字列ではありません: #{summarize(value)}")
       end
 
+      # 型が String でも中身が日時として読めない値は取得失敗にする（詳細は TIME_FIELDS）。
+      TIME_FIELDS.each do |field|
+        value = raw[field]
+        next if blank_time?(value) || parsable_time?(value)
+
+        invalid_response!("events[#{index}].#{field} が日時として解析できません: #{summarize(value)}")
+      end
+
       all_day = raw["all_day"]
       return if all_day.nil? || all_day == true || all_day == false
 
       # build_event は `== true` で潰すため例外にはならないが、"true" のような値を黙って
       # all_day=false として扱うと終日イベントを通常の予定として打刻判定に使ってしまう。
       invalid_response!("events[#{index}].all_day が真偽値ではありません: #{summarize(all_day)}")
+    end
+
+    # parse_time が nil として扱う値（nil・空文字・空白のみ）。判定を parse_time と揃えること
+    # （食い違うと「検証は通るのに parse_time が nil にする」あるいはその逆が起きる）。
+    def blank_time?(value) = value.nil? || value.to_s.strip.empty?
+
+    # parse_time と同じ Time.iso8601 で解析できるか（STRING_FIELDS の検証を先に通すので String 前提）。
+    def parsable_time?(value)
+      Time.iso8601(value)
+      true
+    rescue ArgumentError
+      false
     end
 
     def invalid_response!(detail)

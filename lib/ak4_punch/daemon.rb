@@ -347,11 +347,34 @@ module Ak4Punch
 
     # 打刻期限（目標時刻の窓の終端 ＝ 目標 + grace）。grace の解釈をここ1箇所に閉じ込める。
     # 参照元は2つある: ① unreachable_target?（give_up の発火判定と、既存計画の更新ガード）
-    # ② execute_punch から Stamper / Client に渡し、POST 直前に再判定させる deadline。
+    # ② post_deadline_at 経由で execute_punch → Stamper / Client に渡し、POST 直前に
+    #    再判定させる deadline。
     # この2つは必ず同じ端でなければならない。片方だけ動かすと、デーモンは窓が開いていると
     # 判断するのに Stamper が DeadlineExceeded で拒み続け、tick 毎のリトライを重ねた末に
     # 「リトライ上限に達した」という実態と違う内容で通知されることになる。
+    # ②だけは計画日の終端でも丸める（post_deadline_at）が、丸めが効くのは日付が変わった後だけで、
+    # そこは日付ガードと start_new_day が先に止めるため上の空回りは起きない（詳細は post_deadline_at）。
     def punch_deadline_at(target) = target + (@config.daemon_late_grace_minutes * 60)
+
+    # POST の期限 ＝ min(目標+grace, 計画日の終端)。execute_punch に渡す値。
+    # 日付ガード（postpone_punch_after_date_change?）を通った後でも、トークン再発行や
+    # 冪等チェックの GET（open10秒/read20秒）の途中で Mac がスリープし、復帰が翌日になることは
+    # ありうる。その場合の誤った日付での打刻成立を Stamper#ensure_within_deadline! と
+    # Client の送信直前判定で止める（DeadlineExceeded は既存の打刻失敗と同じ扱いで、
+    # 計画は未完了のまま残り、日付変化時に「未打刻のまま日付が変わりました」で通知される）。
+    #
+    # 通常日は「目標+grace」の方が早いので min の結果は変わらない（影響は近深夜の目標だけ）。
+    # unreachable_target? と端が食い違うのは日付が変わった後だけで、その状態では
+    # ① 同じ tick では日付ガードが execute_punch を呼ばせない
+    # ② 次の tick では ensure_day_plan → start_new_day が当日の計画を破棄する
+    # ため、「窓は開いているのに Stamper が拒み続ける」空回りにはならない。
+    def post_deadline_at(plan) = [punch_deadline_at(plan.target_at), end_of_plan_day].min
+
+    # 計画日（@current_date）の終端。日付が変わると当日の計画は破棄されるため、
+    # POST はこの時刻までに完了していなければならない。
+    def end_of_plan_day
+      Time.new(@current_date.year, @current_date.month, @current_date.day, 23, 59, 59, Ak4Punch::JST)
+    end
 
     # 打刻期限（punch_deadline_at）を過ぎていて、もう打刻できないか。
     # fire_due_punches の give_up 発火条件そのものであり、set_in_plan / set_out_plan の
@@ -483,13 +506,16 @@ module Ak4Punch
           next
         end
 
+        # 日付ガード（休暇ゲートより前）。打刻直前に日付が変わっていたらこの tick では打刻しない。
+        next if postpone_punch_after_date_change?(plan, punch_now)
+
         # 休暇ゲート（POST 直前の単一判定）。出勤・退勤とも、初回もリトライも必ず通す。
         # 休暇による中止の判定はここ1箇所だけに置く。直前チェック（退勤のみ・初回のみ）の中に
         # 置くと、そこを通らない経路（出勤全般・recheck 後の計画作り直し・打刻失敗のリトライ）が
         # 素通しになる。
         next if abort_punch_in_leave?(plan, punch_now)
 
-        ok, error = execute_punch(kind, punch_now, deadline: punch_deadline_at(plan.target_at))
+        ok, error = execute_punch(kind, punch_now, deadline: post_deadline_at(plan))
         if ok
           plan.done = true
         else
@@ -511,8 +537,20 @@ module Ak4Punch
     # キーを kind だけにしないのは、「断念 → カレンダー修正＋recheck で復活 → 新目標も逃して再断念」
     # という2度目の正当な通知まで潰れ、直ったと誤認させる黙殺になるため（新目標の断念は必ず鳴らす）。
     # ログ（warn）は間引かず毎回出す（事後の障害調査で全履歴が必要なため）。
+    #
+    # 打刻済み確認は now ではなく計画日（@current_date）について行う。これは「計画日の打刻を
+    # 諦める」判断なので、打刻済みかどうかも計画日について見るのが正しい。
+    # fire_due_punches からの2つ目の呼び出しは punch_now（退勤の直前チェック後の時刻）を渡し、
+    # 日付ガード（postpone_punch_after_date_change?）より手前にあるため、日付を跨いだ時刻で
+    # 呼ばれうる。そこで now.to_date を見ると翌日の打刻履歴を確認してしまい、翌日に何らかの
+    # 打刻（0時台の手動打刻など）があると通知を抑止して plan.done = true にする。done が立つと
+    # notify_unpunched_from_previous_day も拾えないため、前日の未打刻が黙って消える。
+    # 通常時は now.to_date == @current_date なので挙動は変わらない（影響は跨いだ場合だけ）。
+    # なお休暇ゲート（abort_punch_in_leave?）の打刻済み確認が now.to_date のままでよいのは、
+    # 日付ガードが休暇ゲートより手前にあり、到達時点で punch_now.to_date == @current_date が
+    # 保証されているため（ガードの順序を動かすならあちらも計画日に変えること）。
     def give_up_punch(plan, now)
-      if already_stamped?(plan.kind, now.to_date)
+      if already_stamped?(plan.kind, @current_date)
         @logger.info("#{label(plan.kind)}は既にAKASHIで打刻済みのため、スキップ通知は出しません" \
                      "（目標 #{fmt(plan.target_at)}）。")
         plan.done = true
@@ -594,6 +632,43 @@ module Ak4Punch
 
       # 休暇による中止はここでは判定しない（POST 直前の休暇ゲートに一本化している）。
       false
+    end
+
+    # 打刻の直前（POST の直前）に日付が変わっていたら、この tick では打刻しない。
+    # 戻り値: true = 打刻しない（計画は未完了のまま残す）。
+    #
+    # execute_punch は @stamper.punch に「壁時計の日付」を渡す。日付が変わった後に呼ぶと
+    # Stamper は翌日を対象日として判定するため、非対象日なら :skipped、対象日でも
+    # 翌日には出勤の記録がないので退勤は「未出勤」で :skipped になる。execute_punch は
+    # :skipped と成功を区別しないため plan.done が立ち、通知もないまま打刻が失われる。
+    # 打刻日だけ計画日に差し替えて冪等チェックを通す案は採れない: AKASHI は受信時刻で記録する
+    # ので、0時を跨いだ後に POST すれば記録は翌日になり、記録日は直せない。
+    # よって「跨いだら打刻しない」が正解。
+    #
+    # 発生経路: 目標 23:59:3x で due になった tick で、退勤直前チェックの sukesan 再取得が
+    # 遅延（最大 3試行 ×(open5秒+read5秒) + バックオフ 2+4秒 ≒ 36秒）して punch_now が翌日になる。
+    #
+    # done にせず next で未完了のまま残すのが要点。次の tick で ensure_day_plan が日付変化を
+    # 検知して start_new_day → notify_unpunched_from_previous_day が「未打刻のまま日付が
+    # 変わりました」を通知する（サイレントな喪失が、通知される未打刻に変わる）。同じ tick 内で
+    # 計画がまだ残っているのは、ensure_day_plan が tick 冒頭の now（＝まだ前日）で走るため。
+    #
+    # 休暇ゲートより前に置くこと: 跨いだ後の @leave_snapshot は前日の情報なので、それを根拠に
+    # 「休暇中のため中止」と通知するのは適切でない（中止は done を立ててしまう）。
+    #
+    # 計画日は @current_date（その計画が属する日＝カレンダーを取得した日・@leave_snapshot と
+    # @notified_keys が有効な日・翌 tick の未打刻通知が報告する日）を使う。plan.target_at.to_date は
+    # そこから派生した値で、休暇の押し出し等で計画日と食い違えば「計画日でない日の打刻」を
+    # 通してしまう。@punch_plans が空でない限り @current_date は必ず当日で埋まっている
+    # （ensure_day_plan が start_new_day → build_and_apply_day_plan の順で進むため）。
+    def postpone_punch_after_date_change?(plan, punch_now)
+      return false if punch_now.to_date == @current_date
+
+      @logger.warn("打刻の直前に日付が変わったため#{label(plan.kind)}打刻を見送ります" \
+                   "（計画日 #{@current_date}／目標 #{fmt(plan.target_at)}／現在 #{fmt(punch_now)}）。" \
+                   "AKASHI は受信時刻で記録するため、日付が変わった後に打刻すると記録日が翌日になります。" \
+                   "未打刻のまま日付が変わったものとして通知します")
+      true
     end
 
     # 当日最後に取得できた休暇情報（@leave_snapshot）を保存する。

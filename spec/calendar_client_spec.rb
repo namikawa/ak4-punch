@@ -176,6 +176,28 @@ RSpec.describe Ak4Punch::CalendarClient do
           .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.title が文字列ではありません/)
       end
 
+      it "文字列でも日時として解析できなければ ApiError（黙って時刻なしのイベントにしない）" do
+        # 従来は parse_time が ArgumentError を rescue して nil を返すため、このイベントが
+        # 退勤の判定から落ちて基準が所定時刻へ巻き戻っていた（定期再取得で目標が前倒しされる）。
+        stub_body({ events: [{ id: "x", title: "会議", ends_at: "oops" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                          /events\[0\]\.ends_at が日時として解析できません/)
+      end
+
+      it "日付のみ・オフセットなしなど Time.iso8601 で読めない形式も ApiError" do
+        stub_body({ events: [{ id: "x", starts_at: "2026-07-10" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.starts_at が日時として解析できません/)
+      end
+
+      it "空文字・空白のみは「時刻なし」として正常（parse_time と同じ扱い）" do
+        stub_body({ events: [{ id: "x", title: "会議", starts_at: "", ends_at: "  " }] }.to_json)
+        ev = client.events(date: date).first
+        expect(ev.starts_at).to be_nil
+        expect(ev.ends_at).to be_nil
+      end
+
       it "all_day が真偽値でなければ ApiError（終日を黙って通常イベント扱いにしない）" do
         stub_body({ events: [{ id: "x", all_day: "true" }] }.to_json)
         expect { client.events(date: date) }
