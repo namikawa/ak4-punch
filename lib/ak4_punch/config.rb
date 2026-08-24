@@ -89,7 +89,7 @@ module Ak4Punch
       # 通知に付けるメンション（例: <@U04XXXXXX>）。任意・未設定なら付けない。
       @slack_mention = ENV["SLACK_MENTION"]
 
-      # カレンダー連動（退勤時刻の動的決定）の振る舞い。
+      # カレンダー連動（出勤・退勤時刻の動的決定）の振る舞い。
       cal = data["calendar"] || {}
       @calendar_enabled = cal.fetch("enabled", false)
       kw = cal["exclude_keywords"]
