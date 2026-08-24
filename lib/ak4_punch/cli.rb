@@ -119,20 +119,35 @@ module Ak4Punch
       pmset = WakeScheduler::PMSET
       puts <<~GUIDE
         # ===== sudoers 設定（pmset の自動起床予約を無パスワードで許可）=====
-        # デーモンが `sudo -n pmset schedule ...` を実行できるようにします。
+        # デーモンが実行するのは起床予約の追加（`sudo -n pmset schedule wake <日時>`）だけです。
+        # 予約状態の読み取り（`pmset -g sched`）は sudo なしで実行するため、許可は要りません。
         # 下記1行を /etc/sudoers.d/ak4-punch に設置してください（visudo で構文検証されます）:
 
-        #{user} ALL=(root) NOPASSWD: #{pmset} schedule *
+        #{user} ALL=(root) NOPASSWD: #{pmset} schedule wake *
+
+        #   ※ 末尾の `*` は日時の引数に一致します（sudoers は引数を1つに連結した文字列として
+        #     照合します）。`wake` の後の空白まで含むパターンなので、引数のない
+        #     `#{pmset} schedule wake` には一致しませんが、デーモンは必ず日時を渡すため問題ありません。
 
         # 設置手順:
         sudo visudo -f /etc/sudoers.d/ak4-punch
         #   → 上記の1行を貼り付けて保存
+        #   → 以前の `#{pmset} schedule *` を設置済みの場合は、上記の行に置き換えてください
+        #     （置き換えなくても許可範囲が広いだけなので、そのままでも動作は継続します）
 
-        # 確認（パスワードを聞かれずに実行できればOK）:
-        sudo -n #{pmset} -g sched
+        # 確認（許可内容を一覧表示するだけ。起床予約は作りません）:
+        sudo -k -n -l
+        #   → 「may run the following commands」の一覧に次の行があることを確認してください:
+        #        (root) NOPASSWD: #{pmset} schedule wake *
+        #   → 標準設定（sudoers の listpw=any）で「a password is required」で終了した場合は、
+        #     NOPASSWD の行が1つも無い状態です。listpw を all/always に変えている環境では
+        #     NOPASSWD が正しくあってもこう出るため、`sudo -k -l`（-n なし）で認証して一覧を見てください。
+        #   ※ `-k` は直前の visudo で残った認証キャッシュを無視し、一覧を取得できるかどうかが
+        #     キャッシュに左右されないようにするために付けます（デーモンは launchd 起動で
+        #     キャッシュを使えないため、NOPASSWD が無いと必ず失敗します）。
+        #   ※ `sudo -l <コマンド>` 形式は「そのコマンドが policy 上許可されているか」しか判定せず、
+        #     NOPASSWD が付いているかを確認できないため使いません。
 
-        # ※ pmset の実パスは環境により異なる場合があります。上は #{pmset} を前提にしています。
-        #   異なる場合は `which pmset` の結果に置き換えてください。
         # ※ 設定しない場合は config.yml の daemon.manage_wake を false にし、
         #   常時電源接続＋スリープ無効（システム設定 > ロック画面/バッテリー）で運用してください。
       GUIDE

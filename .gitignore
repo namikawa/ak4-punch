@@ -1,7 +1,12 @@
 # 機密・ローカル設定（コミット厳禁）
 .env
+# .env.local などの派生ファイル（例示用の .env.example だけは除外から戻す）
+.env.*
+!.env.example
 config/config.yml
 config/token.json
+# トークンの atomic write 用一時ファイル（fsync 後・rename 前の異常終了で残ることがある）
+config/token.json.tmp.*
 *.log
 
 # Claude Code 用の作業指示（コミットしない）

@@ -35,7 +35,11 @@ idempotency:
   check_existing: true           # 打刻前に GET で当日の在席状態(最終打刻)を確認し、既に済んでいればスキップ
 
 token:
-  path: "config/token.json"      # 再発行トークンの保存先（.gitignore 済み）
+  # 再発行トークンの保存先（この既定パスは .gitignore 済み）。
+  # 既定以外に変更する場合は、保存先と `<保存先>.tmp.*`（atomic write の一時ファイル。異常終了時に
+  # 残ることがある）の両方を .gitignore に追加してください。このリポジトリは public のため、
+  # リポジトリ外の場所を指定するのが確実です。
+  path: "config/token.json"
   refresh_threshold_days: 7      # 有効期限がこの日数以内になったら自動再発行
 
 # ===== カレンダー連動デーモン（推奨）=====
@@ -66,7 +70,7 @@ calendar:
   refresh_interval_minutes: 15   # デーモンがカレンダーを再取得する間隔（分）
 
   # 定期再取得が連続で何回失敗したら Slack に通知するか。
-  # 再取得の失敗は退勤目標を直近の値のまま維持するだけで実害がないため、
+  # 再取得の失敗は出勤・退勤の目標を直近の値のまま維持するだけで実害がないため、
   # DarkWake（スリープ中の一時起床）で Wi-Fi 未接続のまま1回失敗しただけでは鳴らさない。
   # 通知までの時間は「この回数 × refresh_interval_minutes」が目安（既定 3回×15分＝約30〜45分）。
   refresh_failure_notify_threshold: 3

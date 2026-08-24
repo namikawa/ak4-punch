@@ -7,9 +7,15 @@ RSpec.describe Ak4Punch::Client do
     described_class.new(base_url: "https://atnd.ak4.jp/api/cooperation", company_id: "soldout", token: "tok")
   end
 
-  it "post_stamp は正しいURL/bodyで叩き、記録時刻を返す" do
+  # body の検証はキーの完全一致で行う（hash_including を使わない）。
+  # AKASHI の打刻APIは stampedAt を無視してサーバ受信時刻で記録するため（実機検証済み・遡り登録は不可）、
+  # post_stamp は stampedAt を意図的に送らない。これが本ツール全体の前提（打刻したい時刻にAPIを呼ぶ設計）。
+  # hash_including だと将来 body にキーが増えてもテストが通ってしまい、この前提が崩れても気づけない。
+  # WebMock は Hash を渡すと JSON をパースしてキー集合まで完全一致で比較するので、
+  # stampedAt を送るようになった時点でこのテストが落ちる。
+  it "post_stamp は正しいURL/bodyで叩き、記録時刻を返す（stampedAt は送らない）" do
     stub = stub_request(:post, "https://atnd.ak4.jp/api/cooperation/soldout/stamps")
-           .with(body: hash_including("token" => "tok", "type" => 11))
+           .with(body: { "token" => "tok", "type" => 11, "timezone" => "+09:00" })
            .to_return(status: 200, body: {
              success: true,
              response: { login_company_code: "soldout", staff_id: 1, type: 11, stampedAt: "2026/07/08 09:30:01" },
