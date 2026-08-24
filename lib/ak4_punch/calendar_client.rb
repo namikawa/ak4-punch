@@ -22,6 +22,10 @@ module Ak4Punch
 
     EVENTS_PATH = "/api/v1/calendars/google/events"
 
+    # 形式不正のエラーメッセージに載せる値の最大長（超過分は切り詰める）。
+    # 応答本文をそのまま全部載せるとログ・Slack が読めなくなるため。
+    MAX_DETAIL_LENGTH = 200
+
     # 1件のイベント。時刻は JST に正規化済みの Time または nil。
     Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true) do
       # ログ・CLI 表示用のタイトル。nil と空文字はプレースホルダに置き換える。
@@ -44,11 +48,42 @@ module Ak4Punch
     def events(date: nil)
       path = EVENTS_PATH
       path += "?#{URI.encode_www_form(date: date.strftime('%Y-%m-%d'))}" if date
-      json = request(path)
-      Array(json["events"]).map { |e| build_event(e) }
+      extract_events(request(path)).map { |e| build_event(e) }
     end
 
     private
+
+    # 応答の形を検証して events の配列を取り出す。
+    # HTTP 200 でも形が違うことはあり、`Array(json["events"])` で黙って [] に潰すと
+    # 「予定なし」の成功として扱われる（休暇情報が空で上書きされ、休暇日の防御が静かに外れる）。
+    # 要素が Hash でない場合は build_event が NoMethodError/TypeError を投げ、定期再取得の経路では
+    # tick が毎回 fire_due_punches に到達しなくなって打刻が無通知のまま止まる。
+    # どちらも一過性の通信障害ではなく恒久的な不整合なので、リトライしない ApiError にして
+    # Daemon の既存の取得失敗経路（連続失敗カウント・所定時刻フォールバック・通知）に載せる。
+    # 空配列は「予定なし」として正常。
+    def extract_events(json)
+      invalid_response!("オブジェクトではありません: #{summarize(json)}") unless json.is_a?(Hash)
+      invalid_response!("events がありません: #{summarize(json)}") unless json.key?("events")
+
+      events = json["events"]
+      invalid_response!("events が配列ではありません: #{summarize(events)}") unless events.is_a?(Array)
+
+      # nil 要素も検出したいので find ではなく index で探す。
+      bad = events.index { |e| !e.is_a?(Hash) }
+      invalid_response!("events[#{bad}] がオブジェクトではありません: #{summarize(events[bad])}") unless bad.nil?
+
+      events
+    end
+
+    def invalid_response!(detail)
+      raise ApiError, "sukesan 応答の形式が不正です（#{detail}）"
+    end
+
+    # エラーメッセージに載せる値の要約（長すぎる応答を切り詰める）。
+    def summarize(value)
+      text = value.inspect
+      text.length > MAX_DETAIL_LENGTH ? "#{text[0, MAX_DETAIL_LENGTH]}…" : text
+    end
 
     def build_event(raw)
       Event.new(

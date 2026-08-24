@@ -93,6 +93,67 @@ RSpec.describe Ak4Punch::CalendarClient do
     expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /JSONパース/)
   end
 
+  describe "レスポンスのスキーマ検証" do
+    # HTTP 200 でも形が違う応答はある。黙って [] に潰すと「予定なし」の成功として扱われ、
+    # 休暇情報が空で上書きされて休暇日の防御が外れる。要素が Hash でない場合は例外が
+    # 定期再取得の経路を毎 tick 壊し、打刻が無通知のまま止まる。どちらも一過性ではないので
+    # リトライしない ApiError にして、Daemon の既存の取得失敗経路に載せる。
+    def stub_body(body)
+      stub_request(:get, %r{/events}).to_return(status: 200, body: body)
+    end
+
+    it "events が null なら ApiError（「予定なし」として成功扱いにしない）" do
+      stub_body({ date: "2026-07-10", events: nil }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*events が配列ではありません/)
+    end
+
+    it "events キーが無ければ ApiError" do
+      stub_body({ date: "2026-07-10" }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*events がありません/)
+    end
+
+    it "events が配列でなければ ApiError（Hash が来た場合も TypeError にしない）" do
+      stub_body({ events: { "id" => "x" } }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*events が配列ではありません/)
+    end
+
+    it "events の要素が Hash でなければ ApiError（NoMethodError にしない・位置が分かる）" do
+      stub_body({ events: [{ id: "x" }, nil] }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                        /応答の形式が不正です.*events\[1\] がオブジェクトではありません/)
+    end
+
+    it "トップレベルが Hash でなければ ApiError" do
+      stub_body([{ id: "x" }].to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*オブジェクトではありません/)
+    end
+
+    it "スキーマ不正はリトライしない（1回で ApiError・待機なし）" do
+      stub = stub_body({ events: nil }.to_json)
+      expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError)
+      expect(stub).to have_been_requested.times(1)
+      expect(slept).to be_empty
+    end
+
+    it "巨大な応答でもエラーメッセージは切り詰める" do
+      stub_body({ events: "x" * 5000 }.to_json)
+      expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError) { |e|
+        expect(e.message.length).to be < 400
+        expect(e.message).to end_with "…）"
+      }
+    end
+
+    it "events が空配列なら「予定なし」として正常" do
+      stub_body({ date: "2026-07-10", events: [] }.to_json)
+      expect(client.events(date: date)).to eq []
+    end
+  end
+
   it "APIキー未設定なら通信せず ApiError" do
     no_key = described_class.new(base_url: "http://127.0.0.1:3000", api_key: nil)
     expect { no_key.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /APIキー/)

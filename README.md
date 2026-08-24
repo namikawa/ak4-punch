@@ -59,6 +59,7 @@ bin/daemonctl restart           # デーモンを再起動（start/stop/log も�
 ```
 
 - 設定変更の反映: `.env` / `config/config.yml` を変更したら `bin/daemonctl restart`。デーモンは起動時に一度だけ設定を読むため、`punch recheck` は当日計画を作り直すだけで設定は再読込しません。
+- plist 変更の反映: Ruby を更新して実行パスが変わったときやリポジトリを移動したときは `bin/daemonctl install`。`restart`（`launchctl kickstart -k`）はプロセスの再起動だけで plist を読み直さないため、install で job 定義を登録し直します。
 - 休暇の入れ方: カレンダーに「休暇」「休み」を含むイベントを、実際に休む時間帯で入れるだけ（午前休・午後休は時間指定、全休は終日）。`schedule.exclude_dates` は補助として使えます。
 - 休暇として拾われたイベントは `punch plan` の先頭に一覧表示されます。キーワードは部分一致なので「休み明けMTG」のようなタイトルも休暇になります。意図しない扱いがないか plan で確認できます。
 - 誤って休暇イベントを入れて打刻が止まったら: カレンダーを修正 → `punch recheck`。打刻済みの分は AKASHI 側で手動削除してください。

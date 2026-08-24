@@ -109,6 +109,94 @@ RSpec.describe Ak4Punch::Config do
     end
   end
 
+  describe "所定時刻とウィンドウの組み合わせの検証" do
+    def cfg_with(work)
+      described_class.new(data: { "company_id" => "x", "work" => work }, root: Dir.pwd)
+    end
+
+    it "出勤の打刻締切が退勤時刻以降になる設定はエラー" do
+      # 実測: clock_in 17:50 / clock_out 18:00 / window 30 で出勤目標 18:14・退勤目標 18:10 になり、
+      # 先に来た退勤が未出勤で冪等スキップされ、出勤だけが記録された。
+      expect { cfg_with("clock_in" => "17:50", "clock_out" => "18:00", "random_window_minutes" => 30) }
+        .to raise_error(Ak4Punch::Config::Error, /出勤の打刻締切.*18:20.*work\.clock_out\(18:00\) 以降/)
+    end
+
+    it "締切がちょうど退勤時刻と同じでもエラー（退勤が先に来る余地を残さない）" do
+      expect { cfg_with("clock_in" => "17:30", "clock_out" => "18:00", "clock_in_window" => 30) }
+        .to raise_error(Ak4Punch::Config::Error, /出勤の打刻締切.*18:00.*以降/)
+    end
+
+    it "締切が退勤時刻の1分前（境界）なら受理する" do
+      cfg = cfg_with("clock_in" => "17:29", "clock_out" => "18:00", "clock_in_window" => 30)
+      expect(cfg.clock_in_window).to eq 30
+      expect(cfg.clock_out_time).to eq "18:00"
+    end
+
+    it "退勤の打刻目標が翌日になる設定はエラー（日付が変わると計画が破棄され未打刻になる）" do
+      expect { cfg_with("clock_out" => "23:59", "clock_out_window" => 5) }
+        .to raise_error(Ak4Punch::Config::Error, /退勤の打刻目標が翌日になります.*23:59.*翌日 00:04/)
+    end
+
+    it "出勤の打刻締切が翌日になる設定もエラー" do
+      expect { cfg_with("clock_in" => "23:50", "clock_out" => "23:59", "clock_in_window" => 20) }
+        .to raise_error(Ak4Punch::Config::Error, /出勤の打刻締切が翌日になります.*23:50.*翌日 00:10/)
+    end
+
+    it "退勤の打刻目標がちょうど 23:59（境界）なら受理する" do
+      cfg = cfg_with("clock_out" => "23:58", "clock_out_window" => 1)
+      expect(cfg.clock_out_window).to eq 1
+    end
+
+    it "既定値（09:30/18:00・ウィンドウ0）は受理する" do
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.clock_in_time).to eq "09:30"
+      expect(cfg.clock_out_time).to eq "18:00"
+    end
+  end
+
+  describe "token.refresh_threshold_days の検証" do
+    def cfg_with_threshold(value)
+      described_class.new(
+        data: { "company_id" => "x", "token" => { "refresh_threshold_days" => value } },
+        root: Dir.pwd,
+      )
+    end
+
+    it "既定は 7 日" do
+      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
+      expect(cfg.token_refresh_threshold_days).to eq 7
+    end
+
+    it "整数・数値文字列を受理する" do
+      expect(cfg_with_threshold(3).token_refresh_threshold_days).to eq 3
+      expect(cfg_with_threshold("3").token_refresh_threshold_days).to eq 3
+    end
+
+    it "境界値 0 と 31 を受理する（0 = 期限切れまで再発行しない）" do
+      expect(cfg_with_threshold(0).token_refresh_threshold_days).to eq 0
+      expect(cfg_with_threshold(31).token_refresh_threshold_days).to eq 31
+    end
+
+    it "値なし（YAML で キー: のみ → nil）はエラー（既定値へ黙って落とさない）" do
+      # nil のままだと TokenStore#needs_refresh? の乗算で NoMethodError になり、
+      # 打刻の直前に毎 tick 失敗して grace 超過で未打刻になる。
+      expect { cfg_with_threshold(nil) }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days は 0〜31 の整数で.*nil/)
+    end
+
+    it "整数化できない文字列はエラー" do
+      expect { cfg_with_threshold("ななにち") }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days.*ななにち/)
+    end
+
+    it "範囲外（負値・32以上）はエラー" do
+      expect { cfg_with_threshold(-1) }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days.*-1/)
+      expect { cfg_with_threshold(32) }
+        .to raise_error(Ak4Punch::Config::Error, /token\.refresh_threshold_days.*32/)
+    end
+  end
+
   describe "カレンダー連動・デーモン設定" do
     it "既定値を持つ（未設定時）" do
       cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)

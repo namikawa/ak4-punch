@@ -15,6 +15,15 @@ module Ak4Punch
     # 所定時刻（work.clock_in / work.clock_out）の書式。時 0〜23 / 分 00〜59 の "HH:MM"。
     TIME_FORMAT = /\A([01]?\d|2[0-3]):[0-5]\d\z/
 
+    # 1日の分数（打刻目標が翌日にはみ出す設定を弾く判定に使う）。
+    MINUTES_PER_DAY = 24 * 60
+
+    # トークン再発行の閾値（日）の既定値と上限。
+    # 上限が31日なのはトークンの有効期限が「1ヶ月と1日」で、これを超える閾値は
+    # 「常に再発行し続ける」と同義で意味を持たないため。
+    DEFAULT_TOKEN_REFRESH_THRESHOLD_DAYS = 7
+    MAX_TOKEN_REFRESH_THRESHOLD_DAYS = 31
+
     # カレンダー連動デーモンの既定値。
     DEFAULT_EXCLUDE_KEYWORDS = %w[会食 懇親会 飲み会 打ち上げ 歓迎会 送別会 忘年会 新年会].freeze
     # 出勤側（朝の先頭イベントのスキップ）の除外キーワード。退勤側とは目的が違うため独立させる。
@@ -78,7 +87,8 @@ module Ak4Punch
 
       tok = data["token"] || {}
       @token_path = File.expand_path(tok["path"] || "config/token.json", root)
-      @token_refresh_threshold_days = tok.fetch("refresh_threshold_days", 7)
+      @token_refresh_threshold_days =
+        threshold_days!(tok.fetch("refresh_threshold_days", DEFAULT_TOKEN_REFRESH_THRESHOLD_DAYS))
 
       # sukesan 接続情報（機密）は .env から。BASE_URL は既定でループバック。
       @sukesan_base_url = env_or(data, "SUKESAN_BASE_URL", "sukesan_base_url") || DEFAULT_SUKESAN_BASE_URL
@@ -145,6 +155,67 @@ module Ak4Punch
       validate_time!("work.clock_out", @clock_out_time)
       # 任意項目。設定されている場合だけ書式を検証する（未設定＝従来動作）。
       validate_time!("daemon.morning_wake_at", @daemon_morning_wake_at) unless @daemon_morning_wake_at.nil?
+      validate_punch_windows!
+    end
+
+    # 所定時刻とウィンドウの組み合わせが打刻できる範囲に収まっているかを検証する
+    # （書式検証を通した後に呼ぶこと。ここでは "HH:MM" として解釈できることを前提にする）。
+    #
+    # ① 翌日にはみ出す設定を拒否する: デーモンは日付が変わると前日の計画を破棄するため
+    #    （Daemon#start_new_day）、翌日に出た目標は必ず未打刻になる。
+    #    例: clock_out 23:59 + clock_out_window 5 → 翌日 00:04。
+    #    カレンダー由来の目標は当日終了のイベントだけを対象にする（ClockOutPlanner）ので
+    #    ここでは設定由来だけを見る。
+    # ② 出勤の打刻締切（clock_in + clock_in_window）が退勤時刻以降になる設定を拒否する。
+    #    実測では clock_in 17:50 / clock_out 18:00 / window 30 で出勤目標 18:14・退勤目標 18:10
+    #    となり、先に来た退勤が「未出勤」で冪等スキップされ、出勤だけが記録される状態になった。
+    #    なお休暇による全休判定（Daemon#full_leave?）が休暇イベントの有無を条件にしているのは、
+    #    この種の設定ミスを「全休」として黙って打刻停止しないため。こちらは起動時に弾く役割を持つ。
+    def validate_punch_windows!
+      in_deadline = minutes_of_day(@clock_in_time) + @clock_in_window
+      out_target = minutes_of_day(@clock_out_time) + @clock_out_window
+      clock_out = minutes_of_day(@clock_out_time)
+
+      if in_deadline >= MINUTES_PER_DAY
+        raise Error, "出勤の打刻締切が翌日になります（work.clock_in #{@clock_in_time} + " \
+                     "clock_in_window #{@clock_in_window}分 = #{format_minutes(in_deadline)}）。" \
+                     "日付が変わると当日の計画は破棄されるため、当日に収まる値にしてください。"
+      end
+      if out_target >= MINUTES_PER_DAY
+        raise Error, "退勤の打刻目標が翌日になります（work.clock_out #{@clock_out_time} + " \
+                     "clock_out_window #{@clock_out_window}分 = #{format_minutes(out_target)}）。" \
+                     "日付が変わると当日の計画は破棄されるため、当日に収まる値にしてください。"
+      end
+      return if in_deadline < clock_out
+
+      raise Error, "出勤の打刻締切（work.clock_in #{@clock_in_time} + clock_in_window " \
+                   "#{@clock_in_window}分 = #{format_minutes(in_deadline)}）が " \
+                   "work.clock_out(#{@clock_out_time}) 以降になっています。" \
+                   "退勤が出勤より先に来ると出勤だけが記録されるため、締切が退勤時刻より前になるようにしてください。"
+    end
+
+    # トークン再発行の閾値（日）を整数化して範囲を検証する。
+    # 既定値へ黙ってフォールバックさせないのは、設定ミスに気づけないまま
+    # 「打刻の直前に毎 tick 失敗して grace 超過で未打刻」という壊れ方をするため
+    # （YAML に値なしで書くと nil が入り、TokenStore#needs_refresh? の乗算で NoMethodError になる）。
+    def threshold_days!(value)
+      days = Integer(value, exception: false)
+      return days if days && days.between?(0, MAX_TOKEN_REFRESH_THRESHOLD_DAYS)
+
+      raise Error, "token.refresh_threshold_days は 0〜#{MAX_TOKEN_REFRESH_THRESHOLD_DAYS} の整数で" \
+                   "指定してください（0 は期限切れまで再発行しない）: #{value.inspect}"
+    end
+
+    # 書式検証済みの "HH:MM" を「その日の 0:00 からの分」に変換する。
+    def minutes_of_day(hhmm)
+      h, m = hhmm.to_s.split(":").map(&:to_i)
+      (h * 60) + m
+    end
+
+    # 分（0:00 起点）を "HH:MM" に戻す。翌日にはみ出す値には「翌日」を付ける。
+    def format_minutes(total)
+      prefix = total >= MINUTES_PER_DAY ? "翌日 " : ""
+      format("%s%02d:%02d", prefix, (total % MINUTES_PER_DAY) / 60, total % 60)
     end
 
     # 所定時刻は文字列のまま保持し、目標時刻の算出時に "HH:MM" として解釈する。

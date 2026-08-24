@@ -399,6 +399,37 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
+  describe "sukesan 応答のスキーマ不正（打刻の飢餓を防ぐ）" do
+    it "形式不正の応答でも tick が例外を漏らさず、所定時刻フォールバックで打刻する" do
+      # HTTP 200 で events の要素が Hash でない応答。CalendarClient が ApiError にせず素通しすると
+      # build_event が NoMethodError を投げ、定期再取得（fire_due_punches より前）で毎 tick 例外に
+      # なって打刻に到達しない（give_up 通知すら出ない無通知の飢餓）。ApiError にして既存の
+      # 取得失敗経路（所定時刻フォールバック）へ載せることで、この日でも打刻される。
+      stub_request(:get, %r{/api/v1/calendars/google/events})
+        .to_return(status: 200, body: { date: "2026-07-10", events: [nil] }.to_json)
+      real_client = Ak4Punch::CalendarClient.new(
+        base_url: "http://127.0.0.1:3000", api_key: "k" * 64, sleeper: ->(_s) {},
+      )
+      d = described_class.new(
+        config: config, stamper: stamper, calendar: calendar, calendar_client: real_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      )
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      expect { d.tick }.not_to raise_error # 計画作成（所定 09:30 / 18:00 へフォールバック）
+      clock_time[:now] = t("08:16")
+      expect { d.tick }.not_to raise_error # 定期再取得も失敗するが例外を漏らさない
+
+      clock_time[:now] = t("09:30", 5)
+      expect { d.tick }.not_to raise_error
+      expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      expect(notifier).to have_received(:notify)
+        .with(/sukesan からのイベント取得に失敗し、出勤・退勤とも所定時刻にフォールバック.*応答の形式が不正です/).once
+    end
+  end
+
   describe "非対象日は何もしない" do
     it "対象日でなければ計画せず打刻しない" do
       allow(calendar).to receive(:reason).and_return("祝日")
@@ -1327,6 +1358,69 @@ RSpec.describe Ak4Punch::Daemon do
       expect(stamper).to receive(:punch).with(kind: :out, date: date, window_minutes: 0, deadline: anything)
       clock_time[:now] = t("15:00", 5)
       daemon.tick
+    end
+
+    it "日中に全休へ切り替わったら Slack にも通知する（手動削除が必要なため・同日1回）" do
+      evs = { list: [event(title: "実装", ends_at: t("18:30"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      evs[:list] = [leave_event] # 出勤後に終日の休暇イベントが入った
+      clock_time[:now] = t("10:00")
+      daemon.tick # 再取得で全休判定 → 以降の打刻を中止
+
+      expect(notifier).to have_received(:notify)
+        .with(/休暇イベント『夏季休暇』\(終日\) により本日の勤務時間がなくなったため、以降の打刻を中止しました。/)
+        .once
+      expect(notifier).to have_received(:notify).with(/既に打刻済みの分は AKASHI で手動削除が必要です/).once
+    end
+
+    it "計画時点で全休の日は通知しない（休暇を取った日に毎回鳴らさない）" do
+      allow(calendar_client).to receive(:events).and_return([leave_event])
+      expect(stamper).not_to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画時に全休判定（ログのみ）
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+      clock_time[:now] = t("18:00", 5)
+      daemon.tick
+
+      expect(notifier).not_to have_received(:notify)
+    end
+
+    it "同日に2回全休へ切り替わっても通知は1回だけ" do
+      evs = { list: [event(title: "実装", ends_at: t("18:30"))] }
+      allow(calendar_client).to receive(:events) { evs[:list] }
+      allow(stamper).to receive(:punch)
+      # 出勤は 09:30 に打刻済み（recheck 後の再計画で断念しても通知されないようにする）
+      allow(stamper).to receive(:punch_recorded?).with(:in, date).and_return(true)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick # 出勤打刻
+
+      evs[:list] = [leave_event]
+      clock_time[:now] = t("10:00")
+      daemon.tick # 1回目の切り替え（通知される）
+
+      evs[:list] = [event(title: "実装", ends_at: t("18:30"))] # カレンダーを修正して recheck
+      daemon.request_recheck!
+      clock_time[:now] = t("10:05")
+      daemon.tick # 通常計画へ復帰（退勤18:30 が生き返る）
+
+      evs[:list] = [leave_event] # また休暇イベントが入った
+      clock_time[:now] = t("10:21")
+      daemon.tick # 2回目の切り替え（通知は重複しない）
+
+      expect(logger).to have_received(:warn).with(/本日の勤務時間がなくなったため/).twice
+      expect(notifier).to have_received(:notify).with(/本日の勤務時間がなくなったため/).once
     end
 
     it "recheck 要求で再計画し、休暇イベントが消えていれば通常計画に復帰する" do
