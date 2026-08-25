@@ -1308,7 +1308,7 @@ RSpec.describe Ak4Punch::Daemon do
 
     # 日毎・kind毎に固定の揺らぎ秒（Daemon と同じ導出）
     def jitter(kind, window: 5, day: 10)
-      seed = Date.new(2026, 7, day).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
+      seed = Time.new(2026, 7, day, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
       Random.new(seed).rand(0..(window * 60))
     end
 
@@ -1366,7 +1366,7 @@ RSpec.describe Ak4Punch::Daemon do
 
     # 退勤側の揺らぎ秒（Daemon と同じ導出。2026-07-10 は 183秒）
     def jitter_out(day: 10)
-      seed = Date.new(2026, 7, day).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
+      seed = Time.new(2026, 7, day, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
       Random.new(seed).rand(0..300)
     end
 
@@ -1466,7 +1466,7 @@ RSpec.describe Ak4Punch::Daemon do
 
     # 退勤側の揺らぎ秒（Daemon と同じ導出。2026-07-10 は 183秒）
     def jitter_out
-      seed = Date.new(2026, 7, 10).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
+      seed = Time.new(2026, 7, 10, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
       Random.new(seed).rand(0..300)
     end
 
@@ -2283,7 +2283,7 @@ RSpec.describe Ak4Punch::Daemon do
 
     # 日毎・kind毎に固定の揺らぎ秒（Daemon と同じ導出）。目標＝締切−この秒数。
     def jitter(kind, window: 5, day: 10)
-      seed = Date.new(2026, 7, day).to_time.to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
+      seed = Time.new(2026, 7, day, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
       Random.new(seed).rand(0..(window * 60))
     end
 

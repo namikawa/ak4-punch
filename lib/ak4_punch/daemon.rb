@@ -1041,12 +1041,17 @@ module Ak4Punch
     def apply_jitter_before(deadline, date, kind) = deadline - jitter_seconds(date, kind)
 
     # 日毎・kind毎に固定した揺らぎ秒。定期再取得のたびに目標がブレないよう、
-    # 日付とkindから決定論的に決める（このシードの導出は変えないこと）。
+    # 日付とkindから決定論的に決める（このシードの導出は変えないこと＝目標時刻を動かさないこと）。
+    # 起点は「その日の JST 午前0時」。Date#to_time はローカルタイムゾーン依存なので使わない
+    # （TZ が JST 以外の環境では同じ日でも別の揺らぎになり、「日付・時刻ロジックはすべて JST 基準」
+    #  という不変条件から外れる。旅行先で Mac の TZ を変えると当日の目標が動く／CI が落ちる）。
+    # JST 環境では Date#to_time と同値なので、既存の目標時刻は変わらない（366日分で実測確認済み）。
     def jitter_seconds(date, kind)
       window = kind == :in ? @config.clock_in_window : @config.clock_out_window
       return 0 unless window.positive?
 
-      seed = date.to_time.to_i ^ KIND_SALT.fetch(kind)
+      day_start = Time.new(date.year, date.month, date.day, 0, 0, 0, Ak4Punch::JST)
+      seed = day_start.to_i ^ KIND_SALT.fetch(kind)
       Random.new(seed).rand(0..(window * 60))
     end
 
