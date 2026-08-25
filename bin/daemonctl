@@ -13,10 +13,11 @@ usage() {
   cat <<USAGE
 使い方: bin/daemonctl <サブコマンド>
 
-  install   plist を設置して launchd に登録・起動する（冪等・既存 plist は上書き）
+  install   plist を設置し、launchd に job を登録し直す（plist の変更を反映する）
+            ※ Ruby の更新やリポジトリの移動で plist の内容が変わったときはこちら
   start     デーモンを起動する（plist 未設置なら install を自動実行）
   stop      デーモンを停止する（plist は残す）
-  restart   デーモンを再起動する（未起動なら起動）
+  restart   デーモンのプロセスを再起動する（.env / config.yml の変更を反映する。未起動なら起動）
   status    稼働状態・ログ末尾・起床予約を表示する
   log       ログを追尾表示する（tail -f）
 USAGE
@@ -29,8 +30,11 @@ is_loaded() {
 }
 
 # 稼働中の PID（未稼働・未ロードなら空）
+# 末尾の `|| true` が必要: launchctl list が非0で終了すると set -euo pipefail 配下では
+# 呼び出し側の `pid="$(get_pid)"` が失敗し、スクリプトが何も表示せず終了してしまう。
+# PID が取れないことは status/start が扱える正常な状態なので、空文字を返して継続する。
 get_pid() {
-  launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l && $1 != "-" { print $1 }'
+  launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l && $1 != "-" { print $1 }' || true
 }
 
 write_plist() {
@@ -39,14 +43,39 @@ write_plist() {
   echo "plist を設置しました: $PLIST"
 }
 
+# bootout（非同期）の完了＝登録解除を待つ。デーモンは tick の sleep 中だと
+# 終了まで最大 tick_seconds かかるため、最大40秒待つ。
+# 戻り値: 0 = 登録解除を確認 / 1 = タイムアウト（まだロード済み）
+wait_until_unloaded() {
+  local i
+  for i in $(seq 1 40); do
+    is_loaded || return 0
+    sleep 1
+  done
+  # 最後の sleep 中に登録解除が完了している場合があるため、ループを抜けた後にもう一度確認する
+  # （この再判定がないと、40秒目に完了したケースで stop が誤ってタイムアウトを報告し、
+  #  install は bootstrap せずに終了してデーモンが停止したまま残る）。
+  is_loaded || return 0
+  return 1
+}
+
+# job 定義（plist）の再登録。plist を書いてから bootout → bootstrap する。
+# restart（kickstart -k）はプロセスを再起動するだけで plist を読み直さないため、
+# ProgramArguments / WorkingDirectory / PATH は登録済みの古い定義のまま残る。
+# Ruby の更新で bindir が変わった場合やリポジトリを移動した場合に、古い定義のまま
+# 動き続けてしまうので、install では必ず登録し直す。
 cmd_install() {
   write_plist
   if is_loaded; then
-    echo "既にロード済みです（再読込は restart を使ってください）"
-  else
-    launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
-    echo "launchd に登録して起動しました"
+    echo "ロード済みのため登録し直します（job 定義を plist の内容に更新します）"
+    launchctl bootout "$GUI_DOMAIN/$LABEL"
+    if ! wait_until_unloaded; then
+      echo "登録解除の完了確認がタイムアウトしました。時間をおいて install を再実行してください（status で確認できます）"
+      exit 1
+    fi
   fi
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+  echo "launchd に登録して起動しました"
 }
 
 cmd_start() {
@@ -68,27 +97,23 @@ cmd_start() {
 cmd_stop() {
   if is_loaded; then
     launchctl bootout "$GUI_DOMAIN/$LABEL"
-    # bootout は非同期のため、登録解除（＝プロセス終了）の完了を待つ。
-    # デーモンは tick の sleep 中だと終了まで最大 tick_seconds かかる。
-    local i
-    for i in $(seq 1 40); do
-      is_loaded || break
-      sleep 1
-    done
-    if is_loaded; then
-      echo "停止要求を送りましたが完了確認がタイムアウトしました（status で確認してください）"
-    else
+    if wait_until_unloaded; then
       echo "停止しました（plist は残っています。再開は start）"
+    else
+      echo "停止要求を送りましたが完了確認がタイムアウトしました（status で確認してください）"
     fi
   else
     echo "起動していません"
   fi
 }
 
+# 設定再読込のためのプロセス再起動（.env / config.yml の変更を反映する）。
+# kickstart -k は登録済み job のプロセスを入れ替えるだけで plist は読み直さないため、
+# plist の内容が変わった場合（Ruby の更新・リポジトリの移動）は install を使う。
 cmd_restart() {
   if is_loaded; then
     launchctl kickstart -k "$GUI_DOMAIN/$LABEL"
-    echo "再起動しました"
+    echo "再起動しました（.env / config.yml を再読込。plist の変更を反映するには install）"
   else
     echo "起動していないため start します"
     cmd_start

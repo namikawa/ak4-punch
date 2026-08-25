@@ -93,6 +93,161 @@ RSpec.describe Ak4Punch::CalendarClient do
     expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /JSONパース/)
   end
 
+  describe "レスポンスのスキーマ検証" do
+    # HTTP 200 でも形が違う応答はある。黙って [] に潰すと「予定なし」の成功として扱われ、
+    # 休暇情報が空で上書きされて休暇日の防御が外れる。要素が Hash でない場合は例外が
+    # 定期再取得の経路を毎 tick 壊し、打刻が無通知のまま止まる。どちらも一過性ではないので
+    # リトライしない ApiError にして、Daemon の既存の取得失敗経路に載せる。
+    def stub_body(body)
+      stub_request(:get, %r{/events}).to_return(status: 200, body: body)
+    end
+
+    it "events が null なら ApiError（「予定なし」として成功扱いにしない）" do
+      stub_body({ date: "2026-07-10", events: nil }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*events が配列ではありません/)
+    end
+
+    it "events キーが無ければ ApiError" do
+      stub_body({ date: "2026-07-10" }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*events がありません/)
+    end
+
+    it "events が配列でなければ ApiError（Hash が来た場合も TypeError にしない）" do
+      stub_body({ events: { "id" => "x" } }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*events が配列ではありません/)
+    end
+
+    it "events の要素が Hash でなければ ApiError（NoMethodError にしない・位置が分かる）" do
+      stub_body({ events: [{ id: "x" }, nil] }.to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                        /応答の形式が不正です.*events\[1\] がオブジェクトではありません/)
+    end
+
+    it "トップレベルが Hash でなければ ApiError" do
+      stub_body([{ id: "x" }].to_json)
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, /応答の形式が不正です.*オブジェクトではありません/)
+    end
+
+    it "スキーマ不正はリトライしない（1回で ApiError・待機なし）" do
+      stub = stub_body({ events: nil }.to_json)
+      expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError)
+      expect(stub).to have_been_requested.times(1)
+      expect(slept).to be_empty
+    end
+
+    it "巨大な応答でもエラーメッセージは切り詰める" do
+      stub_body({ events: "x" * 5000 }.to_json)
+      expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError) { |e|
+        expect(e.message.length).to be < 400
+        expect(e.message).to end_with "…）"
+      }
+    end
+
+    it "events が空配列なら「予定なし」として正常" do
+      stub_body({ date: "2026-07-10", events: [] }.to_json)
+      expect(client.events(date: date)).to eq []
+    end
+
+    describe "イベント内部のフィールドの型" do
+      # 要素が Hash でも、下流が String / 真偽値 前提で扱うフィールドに別の型が来ると
+      # Time.iso8601 の TypeError や include?/empty? の NoMethodError になり、
+      # ApiError を通らないため定期再取得の経路が毎 tick 壊れる（打刻の無通知の飢餓）。
+      it "starts_at が文字列でなければ ApiError（Time.iso8601 の TypeError にしない）" do
+        stub_body({ events: [{ id: "x", starts_at: 1 }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                          /events\[0\]\.starts_at が文字列ではありません/)
+      end
+
+      it "ends_at が文字列でなければ ApiError（位置が分かる）" do
+        stub_body({ events: [{ id: "a", ends_at: "2026-07-10T18:00:00+09:00" }, { id: "b", ends_at: 2 }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[1\]\.ends_at が文字列ではありません/)
+      end
+
+      it "title が文字列でなければ ApiError（休暇キーワード判定の NoMethodError にしない）" do
+        stub_body({ events: [{ id: "x", title: 42 }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.title が文字列ではありません/)
+      end
+
+      it "文字列でも日時として解析できなければ ApiError（黙って時刻なしのイベントにしない）" do
+        # 従来は parse_time が ArgumentError を rescue して nil を返すため、このイベントが
+        # 退勤の判定から落ちて基準が所定時刻へ巻き戻っていた（定期再取得で目標が前倒しされる）。
+        stub_body({ events: [{ id: "x", title: "会議", ends_at: "oops" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                          /events\[0\]\.ends_at が日時として解析できません/)
+      end
+
+      it "日付のみ（時刻なし）も ApiError（日時として解析できない）" do
+        stub_body({ events: [{ id: "x", starts_at: "2026-07-10" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.starts_at が日時として解析できません/)
+      end
+
+      it "オフセットのない日時は ApiError（ホストのタイムゾーンで解釈させない）" do
+        # Time.iso8601 はこの形式を受理してホストの TZ で解釈するため、解析可否では弾けない。
+        # JST 基準の不変条件を守るには、境界でオフセットの存在まで要求する必要がある。
+        stub_body({ events: [{ id: "x", title: "会議", ends_at: "2026-07-10T18:00:00" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                          /events\[0\]\.ends_at にタイムゾーンオフセットがありません/)
+      end
+
+      it "Z・+0900・小数秒付きのオフセット表記は受理する" do
+        stub_body({ events: [
+          { id: "a", title: "UTC", ends_at: "2026-07-10T09:00:00Z", all_day: false },
+          { id: "b", title: "コロンなし", ends_at: "2026-07-10T18:00:00+0900", all_day: false },
+          { id: "c", title: "小数秒", ends_at: "2026-07-10T18:30:00.500+09:00", all_day: false },
+        ] }.to_json)
+        events = client.events(date: date)
+        expect(events.map(&:id)).to eq %w[a b c]
+        expect(events[0].ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00") # JST 正規化
+        expect(events[1].ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00")
+      end
+
+      it "空文字・空白のみは「時刻なし」として正常（parse_time と同じ扱い）" do
+        stub_body({ events: [{ id: "x", title: "会議", starts_at: "", ends_at: "  " }] }.to_json)
+        ev = client.events(date: date).first
+        expect(ev.starts_at).to be_nil
+        expect(ev.ends_at).to be_nil
+      end
+
+      it "all_day が真偽値でなければ ApiError（終日を黙って通常イベント扱いにしない）" do
+        stub_body({ events: [{ id: "x", all_day: "true" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.all_day が真偽値ではありません/)
+      end
+
+      it "title / starts_at / ends_at が nil、キー自体が無い場合は正常（実在の応答形）" do
+        stub_body({ events: [
+          { id: "def", title: nil, starts_at: nil, ends_at: nil, location: nil, all_day: true },
+          { id: "z", location: "3F" }, # 時刻・タイトル・all_day のキーがない
+        ] }.to_json)
+        events = client.events(date: date)
+        expect(events.size).to eq 2
+        expect(events[0].all_day).to be true
+        expect(events[1].starts_at).to be_nil
+        expect(events[1].all_day).to be false
+      end
+
+      it "id と location の型は検証しない（id は数値で返る可能性があり location は保持のみ）" do
+        stub_body({ events: [{ id: 12_345, title: "会議", location: 3,
+                               ends_at: "2026-07-10T18:00:00+09:00", all_day: false }] }.to_json)
+        ev = client.events(date: date).first
+        expect(ev.id).to eq 12_345
+        expect(ev.location).to eq 3
+        expect(ev.ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00")
+      end
+    end
+  end
+
   it "APIキー未設定なら通信せず ApiError" do
     no_key = described_class.new(base_url: "http://127.0.0.1:3000", api_key: nil)
     expect { no_key.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /APIキー/)
