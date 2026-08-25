@@ -5,6 +5,7 @@ require "openssl"
 require "uri"
 require "json"
 require "time"
+require "date" # Date._iso8601（オフセットの有無の判定）で使う
 
 module Ak4Punch
   # ローカル常駐システム sukesan のカレンダーAPIクライアント。
@@ -35,15 +36,24 @@ module Ak4Punch
     # キー自体が無い場合は nil 扱いで正常（実際に starts_at を持たない応答がある）。
     STRING_FIELDS = %w[title starts_at ends_at].freeze
 
-    # 「ISO8601 の日時として解析できる文字列」であることまで検証するフィールド（STRING_FIELDS の部分集合）。
+    # 「オフセット付き ISO8601 の日時として解析できる文字列」であることまで検証するフィールド
+    # （STRING_FIELDS の部分集合）。
     # 型が String でも中身が壊れていると parse_time が ArgumentError を rescue して nil を返すため、
     # そのイベントが ClockOutPlanner の対象から静かに落ち、退勤基準が所定時刻へ巻き戻る
     # （日中の再取得でこれが起きると、20:00 だった目標が 18:0x になり grace 内なら早期退勤する）。
     # 取得失敗（ApiError）にすれば refresh_if_due が既存目標を維持するので、
     # 「定期再取得の失敗では打刻目標を所定時刻へ巻き戻さない」（過去バグ 5843f72）と挙動が揃う。
     # nil・空文字・空白のみは parse_time が意図的に nil として扱うので正常のまま（判定は blank_time? で共有）。
-    # sukesan は Time#iso8601 の出力か null しか返さない（終日イベントも Time.parse 経由で
-    # 00:00:00+09:00 になる）ため、この検証で実在の応答が弾かれることはない。
+    #
+    # オフセットの有無も検証する。parse_time は「ISO8601（オフセット付き）を JST に正規化する」ことを
+    # 前提に書かれている（海外タイムゾーンの招待は +09:00 以外のオフセットで届く）が、
+    # Time.iso8601 はオフセットなしの日時（"2026-07-10T10:00:00"）も受理してホストのタイムゾーンで
+    # 解釈してしまう。TZ が JST でない環境では時刻がずれるため、「日付・時刻ロジックはすべて JST 基準」
+    # という不変条件を境界で強制する。検証を parse_time より厳しくするのは意図的で、
+    # parse_time は寛容なまま残し、契約の強制はこの入口だけに置く。
+    #
+    # sukesan は Time#iso8601 の出力（常にオフセット付き）か null しか返さない
+    # （終日イベントも Time.parse 経由で 00:00:00+09:00 になる）ため、この検証で実在の応答は弾かれない。
     TIME_FIELDS = %w[starts_at ends_at].freeze
 
     # 1件のイベント。時刻は JST に正規化済みの Time または nil。
@@ -107,12 +117,13 @@ module Ak4Punch
         invalid_response!("events[#{index}].#{field} が文字列ではありません: #{summarize(value)}")
       end
 
-      # 型が String でも中身が日時として読めない値は取得失敗にする（詳細は TIME_FIELDS）。
+      # 型が String でも、日時として読めない値・オフセットのない値は取得失敗にする（詳細は TIME_FIELDS）。
       TIME_FIELDS.each do |field|
         value = raw[field]
-        next if blank_time?(value) || parsable_time?(value)
+        next if blank_time?(value)
 
-        invalid_response!("events[#{index}].#{field} が日時として解析できません: #{summarize(value)}")
+        reason = time_field_error(value)
+        invalid_response!("events[#{index}].#{field} #{reason}: #{summarize(value)}") if reason
       end
 
       all_day = raw["all_day"]
@@ -127,12 +138,30 @@ module Ak4Punch
     # （食い違うと「検証は通るのに parse_time が nil にする」あるいはその逆が起きる）。
     def blank_time?(value) = value.nil? || value.to_s.strip.empty?
 
+    # 時刻フィールドが不正な理由（正常なら nil）。メッセージに埋めて位置と併せて示す。
+    def time_field_error(value)
+      return "が日時として解析できません" unless parsable_time?(value)
+      return "にタイムゾーンオフセットがありません" unless offset_specified?(value)
+
+      nil
+    end
+
     # parse_time と同じ Time.iso8601 で解析できるか（STRING_FIELDS の検証を先に通すので String 前提）。
     def parsable_time?(value)
       Time.iso8601(value)
       true
     rescue ArgumentError
       false
+    end
+
+    # ISO8601 にタイムゾーンオフセットが含まれているか。
+    # Time.iso8601 はオフセットなしでも成功してホストのタイムゾーンで解釈するため、
+    # 解析結果ではなく元の文字列の構成要素で判定する。Date._iso8601 は解析できた要素をキーに持つ
+    # Hash（解析できない入力では空 Hash、実装によっては nil）を返し、オフセット付きなら :offset を含む
+    # （"Z"・"+0900"・"+09:00"・小数秒付き いずれも :offset が入ることを実測で確認済み）。
+    def offset_specified?(value)
+      parts = Date._iso8601(value)
+      parts.is_a?(Hash) && parts.key?(:offset)
     end
 
     def invalid_response!(detail)

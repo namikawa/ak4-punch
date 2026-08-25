@@ -1520,15 +1520,34 @@ RSpec.describe Ak4Punch::Daemon do
       expect(logger).not_to have_received(:warn).with(/打刻の直前に日付が変わった/)
     end
 
-    it "近深夜の目標では POST 期限を計画日の終端(23:59:59)で丸める" do
+    it "近深夜の目標では POST 期限を計画日の終端（翌日00:00の直前）で丸める" do
       allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59", 30))])
       d = daemon_with_clock([t("08:00"), t("23:59", 40), t("23:59", 45)])
 
       d.tick
-      # 目標 23:59:30 + grace 10分 = 翌 00:09:30 ではなく、計画日の終端で丸めた期限を渡す
+      # 目標 23:59:30 + grace 10分 = 翌 00:09:30 ではなく、計画日の終端で丸めた期限を渡す。
+      # 端は 23:59:59 ではなく「翌日 00:00 の直前」（期限判定が now <= deadline のため、
+      # 23:59:59 にすると当日の最終1秒が期限外になる）。
       expect(stamper).to receive(:punch)
-        .with(kind: :out, date: date, window_minutes: 0, deadline: t("23:59", 59))
+        .with(kind: :out, date: date, window_minutes: 0,
+              deadline: t("00:00", 0, day: 11) - Rational(1, 1_000_000_000))
       d.tick
+    end
+
+    it "当日の最終1秒（23:59:59.5）でも期限内と判定され打刻が成立する" do
+      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59", 30))])
+      captured = {}
+      allow(stamper).to receive(:punch) { |kind:, deadline:, **| captured[kind] = deadline }
+      d = daemon_with_clock([t("08:00"), t("23:59", 50), t("23:59", 59.5)])
+
+      d.tick
+      d.tick # 打刻直前の時刻は 23:59:59.5（まだ当日なので日付ガードは通る）
+
+      # Stamper#ensure_within_deadline! / Client は now <= deadline で判定するので、
+      # この now が期限内であること（端が 23:59:59 だと DeadlineExceeded になっていた）。
+      expect(captured[:out]).not_to be_nil
+      expect(captured[:out]).to be >= t("23:59", 59.5)
+      expect(captured[:out]).to be < t("00:00", 0, day: 11) # 日付は跨がない
     end
 
     it "期限内に始めた打刻が通信の途中で日付を跨いだら中止され、計画は未完了のまま残る" do

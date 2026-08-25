@@ -185,10 +185,31 @@ RSpec.describe Ak4Punch::CalendarClient do
                           /events\[0\]\.ends_at が日時として解析できません/)
       end
 
-      it "日付のみ・オフセットなしなど Time.iso8601 で読めない形式も ApiError" do
+      it "日付のみ（時刻なし）も ApiError（日時として解析できない）" do
         stub_body({ events: [{ id: "x", starts_at: "2026-07-10" }] }.to_json)
         expect { client.events(date: date) }
           .to raise_error(Ak4Punch::CalendarClient::ApiError, /events\[0\]\.starts_at が日時として解析できません/)
+      end
+
+      it "オフセットのない日時は ApiError（ホストのタイムゾーンで解釈させない）" do
+        # Time.iso8601 はこの形式を受理してホストの TZ で解釈するため、解析可否では弾けない。
+        # JST 基準の不変条件を守るには、境界でオフセットの存在まで要求する必要がある。
+        stub_body({ events: [{ id: "x", title: "会議", ends_at: "2026-07-10T18:00:00" }] }.to_json)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError,
+                          /events\[0\]\.ends_at にタイムゾーンオフセットがありません/)
+      end
+
+      it "Z・+0900・小数秒付きのオフセット表記は受理する" do
+        stub_body({ events: [
+          { id: "a", title: "UTC", ends_at: "2026-07-10T09:00:00Z", all_day: false },
+          { id: "b", title: "コロンなし", ends_at: "2026-07-10T18:00:00+0900", all_day: false },
+          { id: "c", title: "小数秒", ends_at: "2026-07-10T18:30:00.500+09:00", all_day: false },
+        ] }.to_json)
+        events = client.events(date: date)
+        expect(events.map(&:id)).to eq %w[a b c]
+        expect(events[0].ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00") # JST 正規化
+        expect(events[1].ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00")
       end
 
       it "空文字・空白のみは「時刻なし」として正常（parse_time と同じ扱い）" do

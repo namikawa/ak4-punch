@@ -34,6 +34,10 @@ module Ak4Punch
     KINDS = %i[in out].freeze
     # 揺らぎ乱数のシードを in/out で分けるための salt。
     KIND_SALT = { in: 0x1111, out: 0x2222 }.freeze
+    # 「翌日 00:00 の直前」を表すために引く最小の差（end_of_plan_day）。
+    # Time.now の分解能（clock_gettime）はナノ秒なので、これで
+    # 「now <= 端 ⟺ now は日付が変わる前」が実用上厳密に成り立つ。
+    ONE_NANOSECOND = Rational(1, 1_000_000_000)
 
     # 1日分の打刻計画（1 kind 分）。
     #   attempted:     窓内で打刻を試行したか（寝過ごしスキップとリトライ枯渇の区別用）
@@ -352,8 +356,9 @@ module Ak4Punch
     # この2つは必ず同じ端でなければならない。片方だけ動かすと、デーモンは窓が開いていると
     # 判断するのに Stamper が DeadlineExceeded で拒み続け、tick 毎のリトライを重ねた末に
     # 「リトライ上限に達した」という実態と違う内容で通知されることになる。
-    # ②だけは計画日の終端でも丸める（post_deadline_at）が、丸めが効くのは日付が変わった後だけで、
-    # そこは日付ガードと start_new_day が先に止めるため上の空回りは起きない（詳細は post_deadline_at）。
+    # ②だけは計画日の終端（＝翌日 00:00 の直前）でも丸める（post_deadline_at）。2つの判定が
+    # 食い違うのは現在時刻が日付を跨いだ後だけで、そこは日付ガードと start_new_day が先に止めるため
+    # 上の空回りは起きない。この「跨いだ後だけ」は端の取り方に依存する（詳細は post_deadline_at）。
     def punch_deadline_at(target) = target + (@config.daemon_late_grace_minutes * 60)
 
     # POST の期限 ＝ min(目標+grace, 計画日の終端)。execute_punch に渡す値。
@@ -364,16 +369,24 @@ module Ak4Punch
     # 計画は未完了のまま残り、日付変化時に「未打刻のまま日付が変わりました」で通知される）。
     #
     # 通常日は「目標+grace」の方が早いので min の結果は変わらない（影響は近深夜の目標だけ）。
-    # unreachable_target? と端が食い違うのは日付が変わった後だけで、その状態では
+    # unreachable_target? と判定が食い違うのは現在時刻が日付を跨いだ後だけで、その状態では
     # ① 同じ tick では日付ガードが execute_punch を呼ばせない
     # ② 次の tick では ensure_day_plan → start_new_day が当日の計画を破棄する
     # ため、「窓は開いているのに Stamper が拒み続ける」空回りにはならない。
+    # ただしこれは end_of_plan_day を「翌日 00:00 の直前」に取って初めて成り立つ。23:59:59
+    # （その秒の開始点）にすると当日の最終1秒（23:59:59.000000001〜.999999999）が
+    # 「日付ガードは通るのに期限外」になり、この不変条件が1秒だけ破れる。
     def post_deadline_at(plan) = [punch_deadline_at(plan.target_at), end_of_plan_day].min
 
-    # 計画日（@current_date）の終端。日付が変わると当日の計画は破棄されるため、
-    # POST はこの時刻までに完了していなければならない。
+    # 計画日（@current_date）の終端 ＝ 翌日 00:00 の直前。日付が変わると当日の計画は破棄されるため、
+    # POST は「日付が変わる前」に完了していなければならない。
+    # 期限の判定は Stamper#ensure_within_deadline! / Client#post_stamp が `now <= deadline` で
+    # 行うため、この条件を表す端は「翌日 00:00 のちょうど直前」でなければならない
+    # （23:59:59 だと当日の最終1秒が期限外になる。上の post_deadline_at のコメント参照）。
+    # 減算は Rational で行う（Time は秒を有理数で保持するので Float だと丸め誤差が出る）。
     def end_of_plan_day
-      Time.new(@current_date.year, @current_date.month, @current_date.day, 23, 59, 59, Ak4Punch::JST)
+      next_day = @current_date + 1
+      Time.new(next_day.year, next_day.month, next_day.day, 0, 0, 0, Ak4Punch::JST) - ONE_NANOSECOND
     end
 
     # 打刻期限（punch_deadline_at）を過ぎていて、もう打刻できないか。
