@@ -1,8 +1,5 @@
 # 変更履歴
 
-このファイルは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に沿って記録し、
-バージョンは [セマンティック バージョニング](https://semver.org/lang/ja/) に従います。
-
 ## [1.0.1] - 2026-08-26
 
 ### 追加
