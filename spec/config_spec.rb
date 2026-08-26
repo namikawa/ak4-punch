@@ -359,6 +359,97 @@ RSpec.describe Ak4Punch::Config do
     end
   end
 
+  describe "接続先 URL のスキーム検証" do
+    def cfg_with(data) = described_class.new(data: { "company_id" => "x" }.merge(data), root: Dir.pwd)
+
+    it "既定値（https の AKASHI / ループバックの sukesan / Slack 未設定）を受理する" do
+      cfg = cfg_with({})
+      expect(cfg.base_url).to eq "https://atnd.ak4.jp/api/cooperation"
+      expect(cfg.sukesan_base_url).to eq "http://127.0.0.1:3000"
+    end
+
+    it "AKASHI の URL が http ならエラー（トークンが平文で送られる）" do
+      expect { cfg_with("base_url" => "http://atnd.ak4.jp/api/cooperation") }
+        .to raise_error(Ak4Punch::Config::Error, %r{AK4_BASE_URL.*https の URL.*http://atnd\.ak4\.jp})
+    end
+
+    it "AKASHI の URL のスキームが http/https 以外ならエラー" do
+      expect { cfg_with("base_url" => "ftp://atnd.ak4.jp/api") }
+        .to raise_error(Ak4Punch::Config::Error, %r{AK4_BASE_URL.*スキームが不正.*ftp://atnd\.ak4\.jp})
+    end
+
+    it "スキームやホストがない値はエラー（値そのものはメッセージに出さない）" do
+      expect { cfg_with("base_url" => "atnd.ak4.jp/api/cooperation") }
+        .to raise_error(Ak4Punch::Config::Error, /AK4_BASE_URL.*URL として解釈できません/)
+      expect { cfg_with("base_url" => "https:///api/cooperation") }
+        .to raise_error(Ak4Punch::Config::Error, /AK4_BASE_URL.*URL として解釈できません/)
+      expect { cfg_with("base_url" => "https://atnd .ak4.jp") }
+        .to raise_error(Ak4Punch::Config::Error, /AK4_BASE_URL.*URL として解釈できません/)
+    end
+
+    it "エラーメッセージに URL のパス（機密になりうる部分）を出さない" do
+      expect { cfg_with("base_url" => "http://atnd.ak4.jp/api/cooperation") }
+        .to raise_error(Ak4Punch::Config::Error) { |e| expect(e.message).not_to include "cooperation" }
+    end
+
+    describe "sukesan の URL" do
+      it "ループバック宛の http を受理する（127.0.0.0/8 全体・localhost・::1）" do
+        expect(cfg_with("sukesan_base_url" => "http://127.0.0.1:3000").sukesan_base_url)
+          .to eq "http://127.0.0.1:3000"
+        expect(cfg_with("sukesan_base_url" => "http://127.0.0.53:3000").sukesan_base_url)
+          .to eq "http://127.0.0.53:3000"
+        expect(cfg_with("sukesan_base_url" => "http://localhost:3000").sukesan_base_url)
+          .to eq "http://localhost:3000"
+        expect(cfg_with("sukesan_base_url" => "http://LocalHost:3000").sukesan_base_url)
+          .to eq "http://LocalHost:3000"
+        expect(cfg_with("sukesan_base_url" => "http://[::1]:3000").sukesan_base_url)
+          .to eq "http://[::1]:3000"
+      end
+
+      it "他ホスト宛でも https なら受理する" do
+        expect(cfg_with("sukesan_base_url" => "https://sukesan.example.com").sukesan_base_url)
+          .to eq "https://sukesan.example.com"
+      end
+
+      it "ループバック以外への http はエラー（APIキーが平文で飛ぶ）" do
+        expect { cfg_with("sukesan_base_url" => "http://192.168.1.10:3000") }
+          .to raise_error(Ak4Punch::Config::Error, %r{SUKESAN_BASE_URL.*ループバック.*http://192\.168\.1\.10})
+      end
+
+      it "ホスト名の前方一致で通さない（127.0.0.1.example.com は外部ホスト）" do
+        expect { cfg_with("sukesan_base_url" => "http://127.0.0.1.example.com") }
+          .to raise_error(Ak4Punch::Config::Error, /SUKESAN_BASE_URL.*ループバック/)
+      end
+    end
+
+    describe "Slack Webhook URL" do
+      it "未設定・空文字は検証しない（通知が無効になるだけ）" do
+        ENV["SLACK_WEBHOOK_URL"] = ""
+        expect(cfg_with({}).slack_webhook_url).to eq ""
+      ensure
+        ENV.delete("SLACK_WEBHOOK_URL")
+      end
+
+      it "https なら受理する" do
+        ENV["SLACK_WEBHOOK_URL"] = "https://hooks.slack.com/services/T000/B000/XXXX"
+        expect(cfg_with({}).slack_webhook_url).to eq "https://hooks.slack.com/services/T000/B000/XXXX"
+      ensure
+        ENV.delete("SLACK_WEBHOOK_URL")
+      end
+
+      it "http はエラー。メッセージに Webhook のパス（それ自体が秘密）を出さない" do
+        ENV["SLACK_WEBHOOK_URL"] = "http://hooks.slack.com/services/T000/B000/SECRET"
+        expect { cfg_with({}) }.to raise_error(Ak4Punch::Config::Error) { |e|
+          expect(e.message).to match(%r{SLACK_WEBHOOK_URL.*https の URL.*http://hooks\.slack\.com})
+          expect(e.message).not_to include "SECRET"
+          expect(e.message).not_to include "services"
+        }
+      ensure
+        ENV.delete("SLACK_WEBHOOK_URL")
+      end
+    end
+  end
+
   describe "Slack 通知設定" do
     it "slack_webhook_url は環境変数(SLACK_WEBHOOK_URL)から読む" do
       ENV["SLACK_WEBHOOK_URL"] = "https://hooks.slack.com/services/T000/B000/XXXX"

@@ -253,6 +253,28 @@ RSpec.describe Ak4Punch::CalendarClient do
     expect { no_key.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /APIキー/)
   end
 
+  # Net::HTTP に渡すホストは URI#hostname（角括弧なし）でなければならない。
+  # WebMock は Net::HTTP#request をフックするので、URL ベースのスタブだけでは
+  # URI#host（"[::1]"）を渡していても素通りしてしまい、この回帰を検出できない
+  # （実機では Net::HTTP.new("[::1]", 3000) が getaddrinfo に失敗して Socket::ResolutionError になる）。
+  # そのため Net::HTTP.new の第1引数を直接検証する。
+  describe "Net::HTTP に渡すホスト" do
+    it "IPv6 は角括弧を外した形を渡す（URI#host の \"[::1]\" では名前解決に失敗する）" do
+      stub_request(:get, %r{/events}).to_return(status: 200, body: { events: [] }.to_json)
+      ipv6 = described_class.new(base_url: "http://[::1]:3000", api_key: "k" * 64)
+
+      expect(Net::HTTP).to receive(:new).with("::1", 3000).and_call_original
+      expect(ipv6.events(date: date)).to eq []
+    end
+
+    it "通常のホスト（IPv4・ホスト名）では渡す値が変わらない" do
+      stub_request(:get, %r{/events}).to_return(status: 200, body: { events: [] }.to_json)
+
+      expect(Net::HTTP).to receive(:new).with("127.0.0.1", 3000).and_call_original
+      expect(client.events(date: date)).to eq []
+    end
+  end
+
   describe "一過性エラーのリトライ" do
     it "5xx はリトライし、回復すれば成功する" do
       stub = stub_request(:get, %r{/events}).to_return(

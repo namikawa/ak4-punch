@@ -1,5 +1,34 @@
 # 変更履歴
 
+## [未リリース]
+
+### 追加
+
+- 接続先 URL のスキームを起動時に検証するようにした。不正なら起動時にエラーで停止する。
+  HTTP クライアントは `use_ssl = (scheme == "https")` としているだけなので、`.env` の URL を
+  `http://` と書き間違えても誰も気づけないまま、アクセストークン・APIキー・Webhook URL が
+  平文で送信されていた。
+  - `AK4_BASE_URL` は https 必須。
+  - `SLACK_WEBHOOK_URL` は設定されている場合のみ https 必須（未設定・空文字は通知が無効になるだけ）。
+  - `SUKESAN_BASE_URL` は https を常に許可し、http はループバック（`localhost` / 127.0.0.0/8 / `::1`）
+    宛のときだけ許可する。ホストの照合は完全一致で行う（`http://127.0.0.1.example.com` のような
+    外部ホストを通さない）。
+  - URL として解釈できない値・http/https 以外のスキーム・ホストのない値もエラーにする。
+    エラーメッセージに出すのは「スキーム://ホスト」までで、URL 全体は出さない
+    （`SLACK_WEBHOOK_URL` はパスそのものが秘密で、メッセージは `punch.log` に残るため）。
+
+### 修正
+
+- HTTP クライアント（AKASHI・sukesan・Slack）が `Net::HTTP` に渡すホストを `URI#host` から
+  `URI#hostname` に修正した。`URI#host` は IPv6 を角括弧付き（`[::1]`）で返すため、
+  `Net::HTTP.new("[::1]", 3000)` は getaddrinfo が失敗して `Socket::ResolutionError` になる
+  （`hostname` なら `::1` が渡り接続まで到達することを実測で確認）。`SUKESAN_BASE_URL` の http は
+  ループバック（`localhost` / 127.0.0.0/8 / `::1`）宛なら許可すると明記したのに、`::1` を
+  指定すると sukesan に一切接続できない（毎回の取得失敗＝所定時刻フォールバックで休暇も
+  検知できない）状態だった。通常のホスト名・IPv4 では `host` と `hostname` が同値なので挙動は
+  変わらない。WebMock は `Net::HTTP#request` をフックするため URL ベースのスタブでは
+  この不具合を検出できず、spec は `Net::HTTP.new` に渡る値を直接検証している。
+
 ## [1.0.1] - 2026-08-26
 
 ### 追加

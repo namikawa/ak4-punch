@@ -65,7 +65,9 @@ module Ak4Punch
     # warn_on_failure: true のときだけ失敗を warn ログに出す。
     def deliver(message, warn_on_failure:)
       uri = URI(@webhook_url)
-      http = Net::HTTP.new(uri.host, uri.port)
+      # ホストは URI#hostname（IPv6 の角括弧を外した形）を渡す。URI#host は "[::1]" を返し、
+      # Net::HTTP がそのまま getaddrinfo に渡して名前解決に失敗する（CalendarClient#send_request 参照）。
+      http = Net::HTTP.new(uri.hostname, uri.port)
       http.use_ssl = uri.scheme == "https"
       http.open_timeout = @open_timeout
       http.read_timeout = @read_timeout

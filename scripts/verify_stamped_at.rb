@@ -103,7 +103,9 @@ punches << ["退勤", 12, STAMPED_OUT] unless options[:only_in]
 # --- HTTP ヘルパ ------------------------------------------------------------
 def request_json(method, url, body: nil)
   uri = URI(url)
-  http = Net::HTTP.new(uri.host, uri.port)
+  # ホストは URI#hostname（IPv6 の角括弧を外した形）を渡す（lib 側と揃える。
+  # URI#host は "[::1]" を返し、Net::HTTP がそのまま getaddrinfo に渡して失敗する）。
+  http = Net::HTTP.new(uri.hostname, uri.port)
   http.use_ssl = uri.scheme == "https"
   http.open_timeout = 10
   http.read_timeout = 20
