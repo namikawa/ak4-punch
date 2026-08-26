@@ -64,7 +64,9 @@ module Ak4Punch
 
     def request(method, path, body: nil, deadline: nil)
       uri = URI("#{@base_url.chomp('/')}#{path}")
-      http = Net::HTTP.new(uri.host, uri.port)
+      # ホストは URI#hostname（IPv6 の角括弧を外した形）を渡す。URI#host は "[::1]" を返し、
+      # Net::HTTP がそのまま getaddrinfo に渡して名前解決に失敗する（CalendarClient#send_request 参照）。
+      http = Net::HTTP.new(uri.hostname, uri.port)
       http.use_ssl = uri.scheme == "https"
       http.open_timeout = 10
       http.read_timeout = 20

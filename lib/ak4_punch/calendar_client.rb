@@ -216,9 +216,15 @@ module Ak4Punch
     end
 
     # 1回分の HTTP 取得。通信エラーは一過性(TransientError)としてラップする。
+    #
+    # Net::HTTP に渡すホストは URI#host ではなく URI#hostname（IPv6 の角括弧を外した形）にすること。
+    # URI#host は IPv6 を "[::1]" と角括弧付きで返し、Net::HTTP.new("[::1]", 3000) は
+    # getaddrinfo が失敗して Socket::ResolutionError になる（hostname なら "::1" が渡り接続できる）。
+    # sukesan はループバック運用で SUKESAN_BASE_URL に http://[::1]:3000 を設定できるため、
+    # ここが実害の当事者になる。通常のホスト名では host == hostname で挙動は変わらない。
     def send_request(path)
       uri = URI("#{@base_url.chomp('/')}#{path}")
-      http = Net::HTTP.new(uri.host, uri.port)
+      http = Net::HTTP.new(uri.hostname, uri.port)
       http.use_ssl = uri.scheme == "https"
       http.open_timeout = @open_timeout
       http.read_timeout = @read_timeout

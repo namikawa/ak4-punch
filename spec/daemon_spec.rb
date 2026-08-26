@@ -172,6 +172,49 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
+  describe "Stamper に渡す対象日" do
+    # tick 経由の確認。日付ガード（postpone_punch_after_date_change?）が
+    # punch_now.to_date == @current_date を保証するため、この経路では計画日と壁時計の日付が
+    # 必ず同じ値になる。したがってここは「経路として当日の日付で打刻される」ことの確認であり、
+    # 「渡すのは計画日」という内部契約は下の例（execute_punch を直接呼ぶ）で固定する。
+    it "通常の打刻（tick 経由）では計画日で打刻される" do
+      allow(calendar_client).to receive(:events).with(date: date).and_return([])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成（出勤09:30）
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+
+      expect(daemon.instance_variable_get(:@current_date)).to eq date
+      expect(stamper).to have_received(:punch)
+        .with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+    end
+
+    # 内部契約の固定: execute_punch は対象日（＝対象日判定と冪等チェックに使う日付）に
+    # 計画日を渡し、壁時計の日付には依存しない。tick 経由では日付ガードが両者を一致させて
+    # しまい、壁時計依存に戻しても差が出ないため、ここは execute_punch を直接呼んで検証する
+    # （壁時計が翌日を指していても計画日が渡ることを確認する。実運用でこの状態に到達する前に
+    #  日付ガードが打刻自体を見送るので、これは多重防御の単体検証）。
+    it "壁時計が翌日を指していても対象日は計画日を渡す（多重防御の内部契約）" do
+      allow(calendar_client).to receive(:events).with(date: date).and_return([])
+      allow(stamper).to receive(:punch)
+
+      clock_time[:now] = t("08:00")
+      daemon.tick # 計画作成（@current_date = 2026-07-10）
+      expect(daemon.instance_variable_get(:@current_date)).to eq date
+
+      # 壁時計は翌日（2026-07-11 00:00:06）。日付ガードを通らずに直接呼ぶ。
+      next_day_now = t("00:00", 6, day: 11)
+      expect(next_day_now.to_date).to eq date + 1
+      daemon.send(:execute_punch, :in, next_day_now, deadline: next_day_now + 60)
+
+      expect(stamper).to have_received(:punch)
+        .with(kind: :in, date: date, window_minutes: 0, deadline: anything)
+      expect(stamper).not_to have_received(:punch).with(hash_including(date: date + 1))
+    end
+  end
+
   describe "refresh で目標変更に追随" do
     it "再取得でイベントが伸びたら退勤目標を更新して再スケジュールする" do
       allow(calendar_client).to receive(:events).and_return(
@@ -1448,9 +1491,11 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
-  # 打刻の直前（POST の直前）に日付が変わるケース。execute_punch は壁時計の日付を Stamper に渡すため、
-  # 跨いだ後に打刻すると翌日を対象日として冪等スキップされ（翌日には出勤の記録がないので退勤が
-  # 「未出勤」扱いになる）、:skipped と成功を区別しないため通知もないまま打刻が失われていた。
+  # 打刻の直前（POST の直前）に日付が変わるケース。AKASHI は受信時刻で記録するため、跨いだ後に
+  # POST すると記録日が翌日になり、Stamper に渡す日付を差し替えても直せない（＝打刻しないのが正解）。
+  # execute_punch が壁時計の日付を Stamper に渡していた頃は、跨いだ後の打刻が翌日を対象日として
+  # 冪等スキップされ（翌日には出勤の記録がないので退勤が「未出勤」扱いになる）、:skipped と成功を
+  # 区別しないため通知もないまま打刻が失われていた。
   describe "打刻直前の日付変更ガード" do
     let(:config) do
       Ak4Punch::Config.new(

@@ -47,6 +47,7 @@ bin/daemonctl install
 
 > `.env` / `config/config.yml` / `config/token.json` は `.gitignore` 済みです。
 > `.env` にはアクセストークン・APIキー・Webhook URL が入るため、他ユーザーが読めない権限（600）で作成してください（`config/token.json` は本ツールが 600 で作成します）。
+> ログ（`punch.log`）にはカレンダーの予定タイトルが出るため、デーモンが作るファイルも本人だけが読める権限になります（plist の `Umask`）。既に別の権限で作られている場合は `chmod 600 punch.log` で揃えてください。
 
 ## 日常運用
 

@@ -2,6 +2,8 @@
 
 require "yaml"
 require "date"
+require "uri"
+require "ipaddr"
 
 module Ak4Punch
   # 動作設定。接続情報（企業ID/トークン/エンドポイント）は .env、
@@ -36,6 +38,9 @@ module Ak4Punch
     DEFAULT_WAKE_LEAD_MINUTES = 1
     DEFAULT_LATE_GRACE_MINUTES = 10
     DEFAULT_SUKESAN_BASE_URL = "http://127.0.0.1:3000"
+
+    # URL として受理するスキーム（平文 http は sukesan のループバックだけ許可する）。
+    ALLOWED_URL_SCHEMES = %w[http https].freeze
 
     # 休暇イベントのキーワードの既定値（AKASHI は休暇申請日でも打刻を受理するため、
     # カレンダー上の休暇イベントで打刻時刻を決めるのが誤打刻を防ぐ主手段）。
@@ -151,11 +156,79 @@ module Ak4Punch
     def validate!
       raise Error, "企業ID(AK4_COMPANY_ID)が未設定です。.env に設定してください。" if blank?(@company_id)
       raise Error, "エンドポイント(base_url)が未設定です。" if blank?(@base_url)
+      validate_urls!
       validate_time!("work.clock_in", @clock_in_time)
       validate_time!("work.clock_out", @clock_out_time)
       # 任意項目。設定されている場合だけ書式を検証する（未設定＝従来動作）。
       validate_time!("daemon.morning_wake_at", @daemon_morning_wake_at) unless @daemon_morning_wake_at.nil?
       validate_punch_windows!
+    end
+
+    # 接続先 URL のスキームを検証する。
+    #
+    # なぜ起動時に弾くのか: HTTP クライアント（Client / CalendarClient / SlackNotifier）は
+    # いずれも `use_ssl = (scheme == "https")` としているだけなので、.env の URL を
+    # `http://` と書き間違えても誰も気づけないまま、アクセストークン・APIキー・
+    # Webhook URL が平文で社外ホストへ飛ぶ。検証はこの1箇所に集約する。
+    #
+    # メッセージには URL 全体を出さない（SLACK_WEBHOOK_URL はパスそのものが秘密で、
+    # このメッセージは punch.log に残る）。表示は「スキーム://ホスト」までに丸め、
+    # スキーム・ホストが取れない場合は値を一切出さない。
+    def validate_urls!
+      validate_https_url!("AK4_BASE_URL(base_url)", @base_url)
+      # Slack は未設定・空文字が正常（通知機能が無効になるだけ）なので、設定時のみ検証する。
+      validate_https_url!("SLACK_WEBHOOK_URL", @slack_webhook_url) unless blank?(@slack_webhook_url)
+      validate_sukesan_url!
+    end
+
+    def validate_https_url!(key, value)
+      scheme, host = url_parts!(key, value)
+      return if scheme == "https"
+
+      raise Error, "#{key} は https の URL を指定してください（#{scheme}://#{host} は" \
+                   "暗号化されず、アクセストークンや Webhook URL が平文で送信されます）。"
+    end
+
+    # sukesan はローカルの API なので平文 http を許すが、許すのはループバック宛だけにする
+    # （既定は http://127.0.0.1:3000）。ループバック以外へ平文で投げると APIキーが露出する。
+    def validate_sukesan_url!
+      scheme, host = url_parts!("SUKESAN_BASE_URL", @sukesan_base_url)
+      return if scheme == "https" || loopback_host?(host)
+
+      raise Error, "SUKESAN_BASE_URL に http を指定できるのはループバック" \
+                   "（localhost / 127.0.0.0/8 / ::1）宛のときだけです（#{scheme}://#{host}）。" \
+                   "他ホストの sukesan を参照する場合は https を指定してください。"
+    end
+
+    # http/https の URL から [スキーム, ホスト] を取り出す。解釈できない値・ホストのない値・
+    # http/https 以外のスキームはエラーにする。ホストは URI#hostname（IPv6 の角括弧を外した形）。
+    def url_parts!(key, value)
+      uri = URI.parse(value.to_s)
+      scheme = uri.scheme&.downcase
+      host = uri.hostname
+      # 「http://」を書き忘れた値（例: atnd.ak4.jp/api）はここに来る。値は出さない
+      # （どの環境変数が不正かは key で分かる）。
+      if scheme.nil? || host.nil? || host.empty?
+        raise Error, "#{key} を URL として解釈できません。https://ホスト名/… の形式で指定してください。"
+      end
+
+      return [scheme, host] if ALLOWED_URL_SCHEMES.include?(scheme)
+
+      raise Error, "#{key} のスキームが不正です（#{scheme}://#{host}）。http または https を指定してください。"
+    rescue URI::InvalidURIError
+      raise Error, "#{key} を URL として解釈できません。https://ホスト名/… の形式で指定してください。"
+    end
+
+    # 平文 http を許すループバックのホストか（完全一致で判定する。
+    # 部分一致にすると http://127.0.0.1.example.com のような外部ホストを通してしまう）。
+    # IP は IPAddr で判定するため 127.0.0.0/8 全体（127.0.0.53 など）と
+    # ::1 の展開表記（0:0:0:0:0:0:0:1）も正しく通る。
+    def loopback_host?(host)
+      return true if host.casecmp?("localhost")
+
+      IPAddr.new(host).loopback?
+    rescue IPAddr::Error
+      false # ホスト名（DNS 名）は IP として解釈できない＝ループバックではない
     end
 
     # 所定時刻とウィンドウの組み合わせが打刻できる範囲に収まっているかを検証する

@@ -8,6 +8,16 @@ require "etc"
 
 module Ak4Punch
   class CLI < Thor
+    # LaunchAgent の Umask に指定する値。63 は 8 進の 077（＝本人以外に権限を与えない）。
+    # plist の <integer> は10進しか表現できない（launchd.plist(5): "property lists do not
+    # support encoding integers in octal"）ため、`077` と書くと 8 進 077 にはならず
+    # 10 進 77（＝8進115）になり、group/other に読み取りが残ってしまう。必ず10進で書くこと。
+    # デーモンが作るファイル（punch.log）にはカレンダーの予定タイトルが載るため、
+    # 既定の 0644 ではなく本人だけが読める権限で作らせる（launchd.plist(5) の StandardOutPath:
+    # ファイルが無い場合は Umask を反映した権限で作成される）。
+    # 既存の punch.log の権限は umask では変わらないので、必要なら手で chmod する。
+    UMASK_OWNER_ONLY = 0o077
+
     def self.exit_on_failure? = true
 
     class_option :config, type: :string, desc: "config.yml のパス（既定: <root>/config/config.yml）"
@@ -239,9 +249,14 @@ module Ak4Punch
     end
 
     # LaunchAgent plist（デーモン常駐用）。ruby の PATH はビルド時に解決する。
+    #
+    # plist に埋め込むパスは XML エスケープする。`&` や `<` を含むディレクトリに置いた場合、
+    # そのまま補間すると plist が XML として壊れ、daemonctl install が壊れた plist を
+    # 設置してしまう（launchd が読めないだけで、原因はログにも出ず分かりにくい）。
     def build_launchd_plist(root)
-      ruby_bindir = File.dirname(RbConfig.ruby)
-      exec_path = File.join(root, "bin", "punch")
+      ruby_bindir = xml_escape(File.dirname(RbConfig.ruby))
+      exec_path = xml_escape(File.join(root, "bin", "punch"))
+      root_path = xml_escape(root)
       <<~PLIST
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -255,7 +270,7 @@ module Ak4Punch
             <string>daemon</string>
           </array>
           <key>WorkingDirectory</key>
-          <string>#{root}</string>
+          <string>#{root_path}</string>
           <key>EnvironmentVariables</key>
           <dict>
             <key>PATH</key>
@@ -267,13 +282,26 @@ module Ak4Punch
           <true/>
           <key>KeepAlive</key>
           <true/>
+          <key>Umask</key>
+          <integer>#{UMASK_OWNER_ONLY}</integer>
           <key>StandardOutPath</key>
-          <string>#{root}/punch.log</string>
+          <string>#{root_path}/punch.log</string>
           <key>StandardErrorPath</key>
-          <string>#{root}/punch.log</string>
+          <string>#{root_path}/punch.log</string>
         </dict>
         </plist>
       PLIST
+    end
+
+    # plist の <string> に入れる値をエスケープする。
+    # `&` を最初に置換すること（後に回すと、他の置換で入れた `&amp;` の `&` を
+    # さらに `&amp;amp;` にしてしまう）。
+    def xml_escape(value)
+      value.to_s
+           .gsub("&", "&amp;")
+           .gsub("<", "&lt;")
+           .gsub(">", "&gt;")
+           .gsub('"', "&quot;")
     end
 
     # `punch plan` の計画を人間可読で出力する。

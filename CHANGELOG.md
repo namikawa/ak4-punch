@@ -1,5 +1,61 @@
 # 変更履歴
 
+## [未リリース]
+
+### 追加
+
+- CI に macOS のスモークジョブを追加した（`bash -n bin/daemonctl` / `punch help` / `punch sudoers` /
+  `punch launchd --plist-only` の出力を `plutil -lint` で検証）。`bin/daemonctl` と plist の生成には
+  spec がなく、macOS 既定の bash 3.2（全角括弧の混入で構文エラーになった）や launchd 前提の
+  挙動でこのサイクルに実際の不具合を出していた。いずれも `.env` / `config/config.yml` /
+  ネットワークを必要としないコマンドだけを使う。
+- 接続先 URL のスキームを起動時に検証するようにした。不正なら起動時にエラーで停止する。
+  HTTP クライアントは `use_ssl = (scheme == "https")` としているだけなので、`.env` の URL を
+  `http://` と書き間違えても誰も気づけないまま、アクセストークン・APIキー・Webhook URL が
+  平文で送信されていた。
+  - `AK4_BASE_URL` は https 必須。
+  - `SLACK_WEBHOOK_URL` は設定されている場合のみ https 必須（未設定・空文字は通知が無効になるだけ）。
+  - `SUKESAN_BASE_URL` は https を常に許可し、http はループバック（`localhost` / 127.0.0.0/8 / `::1`）
+    宛のときだけ許可する。ホストの照合は完全一致で行う（`http://127.0.0.1.example.com` のような
+    外部ホストを通さない）。
+  - URL として解釈できない値・http/https 以外のスキーム・ホストのない値もエラーにする。
+    エラーメッセージに出すのは「スキーム://ホスト」までで、URL 全体は出さない
+    （`SLACK_WEBHOOK_URL` はパスそのものが秘密で、メッセージは `punch.log` に残るため）。
+
+### 変更
+
+- LaunchAgent plist に `Umask`（8進 077 = 10進 63）を追加した。デーモンが作る `punch.log` は
+  0644 で作られていたが、ログにはカレンダーの予定タイトルが載るため本人だけが読める権限にする。
+  plist の `<integer>` は10進しか表現できないので `077` と書くと 8進 077 にならない
+  （10進 77 = 8進 115 になり group/other に読み取りが残る）。既存の `punch.log` の権限は
+  umask では変わらないため、必要なら手で `chmod 600` する。
+- plist に埋め込むパス（実行パス・リポジトリのパス・ruby の bindir）を XML エスケープするようにした。
+  `&` や `<` を含むディレクトリに置いた場合、`bin/daemonctl install` が XML として壊れた plist を
+  設置してしまい、launchd が読めないだけで原因はログにも出ない状態になっていた。
+- 打刻時に `Stamper` へ渡す対象日を、壁時計の日付から計画日に変えた（挙動は変わらない）。
+  打刻直前の日付ガードで両者は一致しているため多重防御だが、対象日判定と冪等チェックに使う
+  日付が壁時計に依存しなくなる。AKASHI は受信時刻で記録するため、渡す日付を差し替えても
+  記録日は直せない（日付が変わったら打刻しないという判断は日付ガードのまま）。
+
+### 修正
+
+- HTTP クライアント（AKASHI・sukesan・Slack）が `Net::HTTP` に渡すホストを `URI#host` から
+  `URI#hostname` に修正した。`URI#host` は IPv6 を角括弧付き（`[::1]`）で返すため、
+  `Net::HTTP.new("[::1]", 3000)` は getaddrinfo が失敗して `Socket::ResolutionError` になる
+  （`hostname` なら `::1` が渡り接続まで到達することを実測で確認）。`SUKESAN_BASE_URL` の http は
+  ループバック（`localhost` / 127.0.0.0/8 / `::1`）宛なら許可すると明記したのに、`::1` を
+  指定すると sukesan に一切接続できない（毎回の取得失敗＝所定時刻フォールバックで休暇も
+  検知できない）状態だった。通常のホスト名・IPv4 では `host` と `hostname` が同値なので挙動は
+  変わらない。WebMock は `Net::HTTP#request` をフックするため URL ベースのスタブでは
+  この不具合を検出できず、spec は `Net::HTTP.new` に渡る値を直接検証している。
+- `bin/daemonctl install` の plist 生成を一時ファイル経由にし、生成の成否・出力が空でないこと・
+  `plutil -lint` を確認してから設置するようにした。従来は `punch launchd --plist-only > "$PLIST"` と
+  直接リダイレクトしていたため、シェルがコマンド実行前に出力先を 0 バイトへ切り詰め、生成が
+  失敗すると（bundler の破損・Ruby の入れ替え・編集途中の構文エラーなど）空の plist が残っていた。
+  稼働中のデーモンは launchd に登録済みの定義で動き続けるのでその場は無害だが、次の
+  `start` / `install` で `launchctl bootstrap` が空の plist を読んで失敗し、デーモンが戻ってこない。
+  検証に失敗した場合は既存の plist を一切変更せず、どの段階で失敗したかを表示して非0で終了する。
+
 ## [1.0.1] - 2026-08-26
 
 ### 追加

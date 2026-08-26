@@ -15,3 +15,28 @@ jobs:
           ruby-version: .ruby-version
           bundler-cache: true
       - run: bundle exec rspec
+
+  # macOS でしか確認できない箇所のスモーク。bin/daemonctl（bash スクリプト）と plist の生成には
+  # spec がなく、どちらも実際にバグを出しているため最小限の実行確認を置く。
+  # いずれも .env / config/config.yml / ネットワークを必要としないコマンドだけを使う。
+  macos-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+      # macOS 既定の bash は 3.2。全角括弧の混入で構文エラーになったことがある。
+      - name: bin/daemonctl の構文チェック
+        run: bash -n bin/daemonctl
+      # 設定ファイルを読まないコマンド（Config を触らない）が単体で動くこと。
+      - name: 設定なしで動くコマンド
+        run: |
+          bundle exec bin/punch help
+          bundle exec bin/punch sudoers
+      # 生成した plist が plist として妥当であること（daemonctl install はこの出力を設置する）。
+      - name: plist の生成と検証
+        run: |
+          bundle exec bin/punch launchd --plist-only > "$RUNNER_TEMP/com.ak4punch.daemon.plist"
+          plutil -lint "$RUNNER_TEMP/com.ak4punch.daemon.plist"

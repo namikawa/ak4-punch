@@ -37,9 +37,42 @@ get_pid() {
   launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l && $1 != "-" { print $1 }' || true
 }
 
+# plist を生成して設置する。生成は一時ファイルに対して行い、内容を検証してから mv で置き換える。
+# `punch launchd --plist-only > "$PLIST"` と直接リダイレクトしてはいけない: シェルはコマンドの
+# 実行前にリダイレクト先を 0 バイトへ切り詰めるため、生成が失敗すると（bundler の破損・Ruby の
+# 入れ替え・編集途中の構文エラーなど）空の plist が残る。稼働中のデーモンは launchd に登録済みの
+# 定義で動き続けるのでその場は無害だが、次の start / install で launchctl bootstrap が空の plist を
+# 読んで失敗し、デーモンが戻ってこない。
+# 一時ファイルは $PLIST と同じディレクトリに作る（同一ファイルシステムなので mv が rename 1回で
+# 済み、置き換えの途中で壊れた plist が見える状態を作らない）。末尾が .plist でない名前なので、
+# 万一残ってもログイン時の LaunchAgents 読み込みには拾われない。
 write_plist() {
   mkdir -p "$(dirname "$PLIST")"
-  "$ROOT/bin/punch" launchd --plist-only > "$PLIST"
+
+  # trap から参照するためグローバルに置く（local にすると EXIT の実行時に参照できず、
+  # set -u で「unbound variable」になる）。
+  TMP_PLIST="$(mktemp "$(dirname "$PLIST")/com.ak4punch.daemon.plist.XXXXXX")"
+  trap 'rm -f "$TMP_PLIST"' EXIT
+
+  if ! "$ROOT/bin/punch" launchd --plist-only > "$TMP_PLIST"; then
+    echo "plist の生成に失敗しました（bin/punch launchd --plist-only が異常終了）。$PLIST は変更していません" >&2
+    exit 1
+  fi
+  if [ ! -s "$TMP_PLIST" ]; then
+    echo "plist の生成結果が空でした。$PLIST は変更していません" >&2
+    exit 1
+  fi
+  local lint
+  if ! lint="$(plutil -lint "$TMP_PLIST" 2>&1)"; then
+    echo "生成した plist が plist として不正です（plutil -lint: ${lint}）。$PLIST は変更していません" >&2
+    exit 1
+  fi
+
+  # mktemp は 0600 で作るため、リダイレクトで生成していた従来と同じ 0644 に明示的に揃える
+  # （plist の中身はパスだけで機密ではない。launchd の読み取り権限で想定外の差を作らない）。
+  chmod 644 "$TMP_PLIST"
+  mv "$TMP_PLIST" "$PLIST"
+  trap - EXIT
   echo "plist を設置しました: $PLIST"
 }
 
