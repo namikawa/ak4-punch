@@ -4,6 +4,11 @@
 
 ### 追加
 
+- CI に macOS のスモークジョブを追加した（`bash -n bin/daemonctl` / `punch help` / `punch sudoers` /
+  `punch launchd --plist-only` の出力を `plutil -lint` で検証）。`bin/daemonctl` と plist の生成には
+  spec がなく、macOS 既定の bash 3.2（全角括弧の混入で構文エラーになった）や launchd 前提の
+  挙動でこのサイクルに実際の不具合を出していた。いずれも `.env` / `config/config.yml` /
+  ネットワークを必要としないコマンドだけを使う。
 - 接続先 URL のスキームを起動時に検証するようにした。不正なら起動時にエラーで停止する。
   HTTP クライアントは `use_ssl = (scheme == "https")` としているだけなので、`.env` の URL を
   `http://` と書き間違えても誰も気づけないまま、アクセストークン・APIキー・Webhook URL が
