@@ -11,6 +11,9 @@ gem "logger", "~> 1.6"     # Ruby 4.0 で標準gemから外れるため明示
 gem "thor", "~> 1.3"       # CLI サブコマンド
 
 group :development, :test do
+  # plist の XML 検証に使う。Ruby 3.4 では bundled gem（＝Gemfile に無いと bundle exec 下で
+  # require できない）ので、webmock → crack の推移依存に頼らず明示する。
+  gem "rexml", "~> 3.4"
   gem "rspec", "~> 3.13"
   gem "webmock", "~> 3.20"
 end

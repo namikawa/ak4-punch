@@ -17,6 +17,17 @@
     エラーメッセージに出すのは「スキーム://ホスト」までで、URL 全体は出さない
     （`SLACK_WEBHOOK_URL` はパスそのものが秘密で、メッセージは `punch.log` に残るため）。
 
+### 変更
+
+- LaunchAgent plist に `Umask`（8進 077 = 10進 63）を追加した。デーモンが作る `punch.log` は
+  0644 で作られていたが、ログにはカレンダーの予定タイトルが載るため本人だけが読める権限にする。
+  plist の `<integer>` は10進しか表現できないので `077` と書くと 8進 077 にならない
+  （10進 77 = 8進 115 になり group/other に読み取りが残る）。既存の `punch.log` の権限は
+  umask では変わらないため、必要なら手で `chmod 600` する。
+- plist に埋め込むパス（実行パス・リポジトリのパス・ruby の bindir）を XML エスケープするようにした。
+  `&` や `<` を含むディレクトリに置いた場合、`bin/daemonctl install` が XML として壊れた plist を
+  設置してしまい、launchd が読めないだけで原因はログにも出ない状態になっていた。
+
 ### 修正
 
 - HTTP クライアント（AKASHI・sukesan・Slack）が `Net::HTTP` に渡すホストを `URI#host` から
@@ -28,6 +39,13 @@
   検知できない）状態だった。通常のホスト名・IPv4 では `host` と `hostname` が同値なので挙動は
   変わらない。WebMock は `Net::HTTP#request` をフックするため URL ベースのスタブでは
   この不具合を検出できず、spec は `Net::HTTP.new` に渡る値を直接検証している。
+- `bin/daemonctl install` の plist 生成を一時ファイル経由にし、生成の成否・出力が空でないこと・
+  `plutil -lint` を確認してから設置するようにした。従来は `punch launchd --plist-only > "$PLIST"` と
+  直接リダイレクトしていたため、シェルがコマンド実行前に出力先を 0 バイトへ切り詰め、生成が
+  失敗すると（bundler の破損・Ruby の入れ替え・編集途中の構文エラーなど）空の plist が残っていた。
+  稼働中のデーモンは launchd に登録済みの定義で動き続けるのでその場は無害だが、次の
+  `start` / `install` で `launchctl bootstrap` が空の plist を読んで失敗し、デーモンが戻ってこない。
+  検証に失敗した場合は既存の plist を一切変更せず、どの段階で失敗したかを表示して非0で終了する。
 
 ## [1.0.1] - 2026-08-26
 
