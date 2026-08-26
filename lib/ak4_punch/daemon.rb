@@ -650,13 +650,15 @@ module Ak4Punch
     # 打刻の直前（POST の直前）に日付が変わっていたら、この tick では打刻しない。
     # 戻り値: true = 打刻しない（計画は未完了のまま残す）。
     #
-    # execute_punch は @stamper.punch に「壁時計の日付」を渡す。日付が変わった後に呼ぶと
-    # Stamper は翌日を対象日として判定するため、非対象日なら :skipped、対象日でも
-    # 翌日には出勤の記録がないので退勤は「未出勤」で :skipped になる。execute_punch は
-    # :skipped と成功を区別しないため plan.done が立ち、通知もないまま打刻が失われる。
-    # 打刻日だけ計画日に差し替えて冪等チェックを通す案は採れない: AKASHI は受信時刻で記録する
-    # ので、0時を跨いだ後に POST すれば記録は翌日になり、記録日は直せない。
-    # よって「跨いだら打刻しない」が正解。
+    # AKASHI は受信時刻で記録するため、0時を跨いだ後に POST すれば記録は翌日になり、
+    # 渡す日付を差し替えても記録日は直せない。よって「跨いだら打刻しない」が正解であり、
+    # この判定を無くすと execute_punch は「前日の計画で翌日に記録される打刻」を通してしまう。
+    # （execute_punch が @stamper.punch に「壁時計の日付」を渡していた頃は、跨いだ後に呼ぶと
+    #  Stamper が翌日を対象日として判定し、非対象日なら :skipped、対象日でも翌日には出勤の
+    #  記録がないので退勤は「未出勤」で :skipped になった。execute_punch は :skipped と成功を
+    #  区別しないため plan.done が立ち、通知もないまま打刻が失われていた。現在は対象日に
+    #  計画日を渡すので :skipped にはならないが、記録日が翌日になる問題は残るため
+    #  このガードが本来の防御である。）
     #
     # 発生経路: 目標 23:59:3x で due になった tick で、退勤直前チェックの sukesan 再取得が
     # 遅延（最大 3試行 ×(open5秒+read5秒) + バックオフ 2+4秒 ≒ 36秒）して punch_now が翌日になる。
@@ -819,7 +821,13 @@ module Ak4Punch
         end
       end
 
-      @stamper.punch(kind: kind, date: now.to_date, window_minutes: 0, deadline: deadline)
+      # 対象日には計画日（@current_date）を渡す。呼び出し元の日付ガード
+      # （postpone_punch_after_date_change?）で punch_now.to_date == @current_date は
+      # 保証されているので挙動は変わらないが、対象日判定と冪等チェックに使う日付を
+      # 壁時計に依存させないための多重防御（変わるとしたら日付ガードが壊れている）。
+      # なお AKASHI は受信時刻で記録するため、ここで渡す日付を前日にしても記録日は直せない
+      # （＝これは記録時刻の修正ではなく、判定に使う日付の固定である）。
+      @stamper.punch(kind: kind, date: @current_date, window_minutes: 0, deadline: deadline)
       [true, nil]
     rescue StandardError => e
       message = "#{e.class}: #{e.message}"
