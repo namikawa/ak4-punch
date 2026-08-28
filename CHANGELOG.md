@@ -1,5 +1,43 @@
 # 変更履歴
 
+## [未リリース]
+
+### 変更
+
+内部構造の整理のみで、打刻の挙動・ログ・Slack 通知・`punch plan` の出力は変えていない。
+
+- 打刻計画の計算（出勤締切・退勤基準・揺らぎ・休暇の押し出し・朝の起床時刻）を `Daemon` から
+  `DayPlanner` へ切り出した。`config` と `logger` しか持たず可変状態がないため、同じ入力からは
+  常に同じ計画を返す。`Daemon` の責務は「いつ計算するか・結果をどう状態へ反映するか・いつ打刻するか」
+  に絞られ、`daemon.rb` は 1069行から 829行になった。`Daemon` に4箇所あった
+  「取得 → 休暇の仕分け → 出勤計画 → 退勤計画」の並びも `DayPlanner#call` の1行に集約している。
+- `punch plan` が `Daemon.new` に `stamper` / `token_store` / `client` / `wake_scheduler` の4つを
+  nil で渡して組み立てていたのをやめ、`DayPlanner` を直接使うようにした。sukesan の取得・警告ログ・
+  見出し・対象日判定の順序は従来どおり。`Daemon#build_day_plan` は削除した。
+- 複数箇所に同じ規則が書かれていて「片方だけ直すと壊れる」状態になっていたものを、単一の定義に
+  集約した。
+  - `Net::HTTP` の組み立て（`URI#hostname` / `use_ssl` / タイムアウト）を `Ak4Punch::Http.build` へ。
+    `Client` / `CalendarClient` / `SlackNotifier` の3箇所に同じ組み立てと同じ解説コメントがあった。
+    `URI#host` に戻すと IPv6 のループバック（`http://[::1]:3000`）で名前解決に失敗するが、通常の
+    ホスト名では差が出ないため気づけない。`spec/http_spec.rb` で回帰を検出する。
+  - イベントタイトルのキーワード部分一致を `Ak4Punch::TitleKeywords` へ。同一の判定が
+    `ClockInPlanner` / `ClockOutPlanner` / `LeaveSchedule` に3つあり、キーワードの正規化も
+    同じ3箇所に重複していた。
+  - 未設定判定（nil・空文字・空白のみ）を `Ak4Punch.blank?` へ。`CalendarClient` の `blank_time?` と
+    `parse_time` が同じ述語を共有するようになり、「判定を揃えること」とコメントで警告していた
+    手作業の同期が不要になった。空白のみを通常の文字列として扱う箇所（タイトルの判定など）は
+    意図的に据え置いている。
+  - `Daemon#set_in_plan` と `set_out_plan` を `set_plan(kind, ...)` に統合した。差は `final_checked`
+    だけで、これは退勤にしか立たないため出勤の計画では恒等的に false になる。
+  - 揺らぎの期待値を計算する式が spec 内に4箇所コピーされていたのを `spec/spec_helper.rb` の
+    1箇所にまとめた。目標時刻を動かす変更が入ったときに片方だけ直して
+    「spec は通るのに目標がずれている」状態を作れないようにするため。
+- `punch plan` のイベント一覧の描画（採用 / 除外 / 早すぎ / 対象外のマーク付け）を出勤・退勤で
+  共通化した。
+- `CalendarClient::Event` から `location` を削除した。代入されるだけで一度も参照されていなかった。
+- `WakeScheduler` で `Set` を明示的に require し（Ruby の暗黙 autoload に依存しない）、
+  `reschedule` の無効化判定に公開メソッドの `disabled?` を使うようにした。
+
 ## [1.0.2] - 2026-08-28
 
 ### 追加
