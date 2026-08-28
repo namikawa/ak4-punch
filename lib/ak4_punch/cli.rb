@@ -75,14 +75,20 @@ module Ak4Punch
     def plan
       cfg = load_config
       logger = build_logger
-      calendar = build_calendar(cfg)
-      calendar_client = build_calendar_client(cfg)
-      daemon = Daemon.new(
-        config: cfg, stamper: nil, calendar: calendar, calendar_client: calendar_client,
-        token_store: nil, client: nil, wake_scheduler: nil, logger: logger,
-      )
       date = options[:date] ? Date.parse(options[:date]) : Ak4Punch.today
-      print_plan(daemon.build_day_plan(date: date), cfg)
+      # 計画の組み立て（sukesan の取得を含む）を先に済ませる。取得失敗の警告ログは
+      # DayPlanner が出すため、見出しより前に出るのが従来の並び。
+      events, error = fetch_plan_events(cfg, date)
+      day = DayPlanner.new(config: cfg, logger: logger).call(date: date, events: events, error: error)
+
+      puts "==== #{date} の打刻計画 ===="
+      reason = build_calendar(cfg).reason(date)
+      if reason
+        puts "対象日ではありません（#{reason}）。打刻しません。"
+        return
+      end
+
+      print_plan(day, cfg)
     rescue StandardError => e
       abort "エラー: #{e.message}"
     end
@@ -248,6 +254,18 @@ module Ak4Punch
       CalendarClient.new(base_url: cfg.sukesan_base_url, api_key: cfg.sukesan_api_key)
     end
 
+    # `punch plan` 用の sukesan 取得。戻り値: [イベント配列(or nil), エラーメッセージ(or nil)]。
+    # 連動OFF なら取得しない（nil ＝ 未取得。DayPlanner が所定時刻の計画を作る）。
+    # 取得失敗も所定時刻フォールバックの計画になるのでここで握る。デーモンと違い
+    # 連続失敗の集計・通知は不要なので、メッセージを返すだけにする。
+    def fetch_plan_events(cfg, date)
+      return [nil, nil] unless cfg.calendar_enabled
+
+      [build_calendar_client(cfg).events(date: date), nil]
+    rescue CalendarClient::ApiError => e
+      [nil, e.message]
+    end
+
     # LaunchAgent plist（デーモン常駐用）。ruby の PATH はビルド時に解決する。
     #
     # plist に埋め込むパスは XML エスケープする。`&` や `<` を含むディレクトリに置いた場合、
@@ -304,17 +322,12 @@ module Ak4Punch
            .gsub('"', "&quot;")
     end
 
-    # `punch plan` の計画を人間可読で出力する。
+    # `punch plan` の計画（DayPlanner::DayPlan）を人間可読で出力する。
+    # 見出しと対象日判定は plan コマンド側にある（WorkCalendar が要るため）。
     def print_plan(day, cfg)
-      puts "==== #{day[:date]} の打刻計画 ===="
-      unless day[:target?]
-        puts "対象日ではありません（#{day[:reason]}）。打刻しません。"
-        return
-      end
-
       print_leave_periods(day)
 
-      if day[:full_leave]
+      if day.full_leave?
         puts "全休: 休暇イベントで当日の勤務時間がなくなるため、この日は打刻しません"
         return
       end
@@ -328,7 +341,7 @@ module Ak4Punch
     # 「休み明けMTG」のようなタイトルも休暇になる。取りこぼし・拾いすぎに気づけるよう、
     # 半休の日（通常の計画を表示する日）でも必ず併記する。
     def print_leave_periods(day)
-      periods = day[:leave_periods]
+      periods = day.leaves.periods
       return if periods.nil? || periods.empty?
 
       puts "[休暇として扱ったイベント]"
@@ -340,25 +353,14 @@ module Ak4Punch
     # `punch plan` の退勤側（カレンダー連動の判断根拠＋基準時刻と目標）を出力する。
     def print_out_plan(day, cfg)
       puts "[退勤]"
-      plan = day[:out_plan]
-      if day[:out_error]
-        puts "カレンダー取得: 失敗（#{day[:out_error]}）→ 所定退勤時刻へフォールバック"
+      plan = day.clock_out.plan
+      if day.clock_out.error
+        puts "カレンダー取得: 失敗（#{day.clock_out.error}）→ 所定退勤時刻へフォールバック"
       elsif !cfg.calendar_enabled
         puts "カレンダー連動: OFF（config の calendar.enabled=false）→ 所定退勤時刻"
       elsif plan
-        puts "取得イベント（当日・終了時刻ありのみ・終了昇順／休暇イベントは除外済み）:"
-        if plan.considered_events.empty?
-          puts "  (対象イベントなし)"
-        else
-          plan.considered_events.each do |ev|
-            mark =
-              if ev.equal?(plan.adopted_event) then "採用 ←"
-              elsif same_event?(plan.excluded_events, ev) then "除外"
-              else "対象外"
-              end
-            puts "  #{ev.starts_at&.strftime('%H:%M')}-#{ev.ends_at.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
-          end
-        end
+        print_events("取得イベント（当日・終了時刻ありのみ・終了昇順／休暇イベントは除外済み）:",
+                     plan.considered_events, plan)
         puts
         if plan.source == :calendar
           puts "採用イベント: #{plan.adopted_event.display_title}（終了 #{plan.adopted_event.ends_at.strftime('%H:%M')}）"
@@ -369,23 +371,26 @@ module Ak4Punch
       end
 
       puts
-      puts "退勤基準: #{day[:out_base].strftime('%H:%M:%S')}"
-      print_leave_shifts(day[:out_leave_shifts])
+      puts "退勤基準: #{day.clock_out.base.strftime('%H:%M:%S')}"
+      print_leave_shifts(day.clock_out.leave_shifts)
       out_window = cfg.clock_out_window.positive? ? "+0〜#{cfg.clock_out_window}分揺らぎ" : ""
-      puts "退勤目標: #{day[:out_target].strftime('%H:%M:%S')}#{out_window.empty? ? '' : "（#{out_window}）"}"
+      puts "退勤目標: #{day.clock_out.target.strftime('%H:%M:%S')}#{out_window.empty? ? '' : "（#{out_window}）"}"
     end
 
     # `punch plan` の出勤側（カレンダー連動の判断根拠＋打刻締切と目標）を出力する。
     # 出勤は「締切 −0〜N分揺らぎ」で決まるため、退勤側と違い締切も表示する。
     def print_in_plan(day, cfg)
       puts "[出勤]"
-      plan = day[:in_plan]
-      if day[:in_error]
-        puts "カレンダー取得: 失敗（#{day[:in_error]}）→ 所定出勤時刻へフォールバック"
+      plan = day.clock_in.plan
+      if day.clock_in.error
+        puts "カレンダー取得: 失敗（#{day.clock_in.error}）→ 所定出勤時刻へフォールバック"
       elsif !cfg.calendar_enabled
         puts "カレンダー連動: OFF（config の calendar.enabled=false）→ 所定出勤時刻"
       elsif plan
-        print_in_events(plan)
+        # 一覧は「下限より前で対象外にした分」も含めて開始昇順に並べ直す（採否はマークで示す）。
+        print_events("取得イベント（当日・開始時刻ありのみ・開始昇順／休暇イベントは除外済み）:",
+                     (plan.too_early_events + plan.considered_events).sort_by(&:starts_at),
+                     plan, too_early: plan.too_early_events)
         puts
         if plan.source == :calendar
           puts "採用イベント: #{plan.adopted_event.display_title}（開始 #{plan.adopted_event.starts_at.strftime('%H:%M')}）"
@@ -396,9 +401,9 @@ module Ak4Punch
       end
 
       puts
-      deadline = day[:in_deadline]
+      deadline = day.clock_in.deadline
       adopted = plan&.adopted_event
-      shifts = day[:in_leave_shifts]
+      shifts = day.clock_in.leave_shifts
       note =
         if shifts && !shifts.empty?
           "休暇の時間帯の外へ後ろ倒し"
@@ -410,7 +415,7 @@ module Ak4Punch
       puts "打刻締切: #{deadline.strftime('%H:%M:%S')}（#{note}）"
       print_leave_shifts(shifts)
       in_window = cfg.clock_in_window.positive? ? "締切 −0〜#{cfg.clock_in_window}分揺らぎ" : "揺らぎなし"
-      puts "出勤目標: #{day[:in_target].strftime('%H:%M:%S')}（#{in_window}）"
+      puts "出勤目標: #{day.clock_in.target.strftime('%H:%M:%S')}（#{in_window}）"
     end
 
     # 休暇による押し出しの根拠（どのイベントで、どこからどこへ動かしたか）。
@@ -418,23 +423,27 @@ module Ak4Punch
       Array(shifts).each { |s| puts "  #{s.label}" }
     end
 
-    # 出勤判定に使ったイベント一覧（当日・開始時刻ありのみ・開始昇順）を採否のマーク付きで出力する。
-    def print_in_events(plan)
-      puts "取得イベント（当日・開始時刻ありのみ・開始昇順／休暇イベントは除外済み）:"
-      listed = (plan.too_early_events + plan.considered_events).sort_by(&:starts_at)
-      if listed.empty?
+    # 判定に使ったイベント一覧を採否のマーク付きで出力する（出勤・退勤で共通）。
+    # マークの判定順は「採用 → 除外 → 早すぎ → 対象外」。退勤側は「早すぎ」の概念がなく
+    # too_early が空になるので、従来どおり「採用 → 除外 → 対象外」の結果になる。
+    # 開始・終了はどちらも &. で参照する。出勤側の一覧は終了時刻なしのイベントを、
+    # 退勤側の一覧は開始時刻なしのイベントを含みうるため（各 Planner が必須にしているのは
+    # 自分が使う側の時刻だけ）。
+    def print_events(heading, events, plan, too_early: [])
+      puts heading
+      if events.empty?
         puts "  (対象イベントなし)"
         return
       end
 
-      listed.each do |ev|
+      events.each do |ev|
         mark =
           if ev.equal?(plan.adopted_event) then "採用 ←"
           elsif same_event?(plan.excluded_events, ev) then "除外"
-          elsif same_event?(plan.too_early_events, ev) then "早すぎ"
+          elsif same_event?(too_early, ev) then "早すぎ"
           else "対象外"
           end
-        puts "  #{ev.starts_at.strftime('%H:%M')}-#{ev.ends_at&.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
+        puts "  #{ev.starts_at&.strftime('%H:%M')}-#{ev.ends_at&.strftime('%H:%M')} #{ev.display_title}  [#{mark}]"
       end
     end
 

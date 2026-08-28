@@ -1240,160 +1240,12 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
-  # 「休暇」イベントは『その時間帯は勤務しない』の意味。打刻の基準時刻がその時間帯に
-  # 入っていたら休暇の外へ押し出す（出勤＝終了へ後ろ倒し／退勤＝開始へ前倒し）。
-  # 所定は 出勤締切 09:30（clock_in 09:30 + window 0）/ 退勤基準 18:00。
-  describe "休暇イベントの時間帯を打刻計画に反映する" do
-    # [出勤締切, 退勤基準, 全休か] を返す
-    def plan_for(events)
-      allow(calendar_client).to receive(:events).with(date: date).and_return(events)
-      day = daemon.build_day_plan(date: date)
-      [day[:in_deadline], day[:out_base], day[:full_leave]]
-    end
-
-    def span(title, from, to)
-      event(title: title, starts_at: t(from), ends_at: t(to))
-    end
-
-    it "休暇なし → 所定どおり" do
-      expect(plan_for([])).to eq [t("09:30"), t("18:00"), false]
-    end
-
-    it "休暇 12:00-19:00（午後休）→ 退勤は休暇の開始へ前倒し" do
-      expect(plan_for([span("休暇", "12:00", "19:00")])).to eq [t("09:30"), t("12:00"), false]
-    end
-
-    it "休暇 15:00-18:00 → 退勤基準（所定18:00）は休暇の終端に一致するので前倒しする" do
-      expect(plan_for([span("休暇", "15:00", "18:00")])).to eq [t("09:30"), t("15:00"), false]
-    end
-
-    it "休暇 15:00-18:30 → 退勤は休暇の開始へ前倒し" do
-      expect(plan_for([span("休暇", "15:00", "18:30")])).to eq [t("09:30"), t("15:00"), false]
-    end
-
-    it "休暇 15:00-19:00 ＋ 会議 19:00-20:00 → 退勤は会議の終了（中抜け扱い・押し出しなし）" do
-      events = [span("休暇", "15:00", "19:00"), span("会議", "19:00", "20:00")]
-      expect(plan_for(events)).to eq [t("09:30"), t("20:00"), false]
-    end
-
-    it "休暇 15:00-17:00（中抜け）→ 所定退勤のまま" do
-      expect(plan_for([span("休暇", "15:00", "17:00")])).to eq [t("09:30"), t("18:00"), false]
-    end
-
-    it "休暇 09:00-13:00（午前休）→ 出勤締切は休暇の終了へ後ろ倒し" do
-      expect(plan_for([span("休暇", "09:00", "13:00")])).to eq [t("13:00"), t("18:00"), false]
-    end
-
-    it "休暇 09:00-18:00 → 出勤締切 >= 退勤基準 になり全休" do
-      expect(plan_for([span("休暇", "09:00", "18:00")]).last).to be true
-    end
-
-    it "終日休暇 → 全休（00:00〜翌00:00 の休暇として押し出された帰結）" do
-      expect(plan_for([event(title: "夏季休暇", ends_at: nil, all_day: true)]).last).to be true
-    end
-
-    it "「昼休み」12:00-13:00 は休暇だが打刻には影響しない" do
-      expect(plan_for([span("昼休み", "12:00", "13:00")])).to eq [t("09:30"), t("18:00"), false]
-    end
-
-    it "午前休 09:00-12:00 ＋ 午後休 13:00-19:00 → 出勤12:00 / 退勤13:00" do
-      events = [span("午前休み", "09:00", "12:00"), span("午後休み", "13:00", "19:00")]
-      expect(plan_for(events)).to eq [t("12:00"), t("13:00"), false]
-    end
-
-    it "業務イベントと休暇が混在する日（午後休）も業務イベント側は従来どおり評価する" do
-      events = [
-        span("MTG準備", "09:30", "11:00"),
-        span("会食", "11:00", "12:00"), # 退勤側の除外キーワード
-        span("休暇", "12:00", "19:00"),
-      ]
-      expect(plan_for(events)).to eq [t("09:30"), t("12:00"), false]
-    end
-
-    it "休暇イベントは業務イベントの判定から除外される（退勤の採用候補にならない）" do
-      allow(calendar_client).to receive(:events).and_return([span("休暇", "15:00", "20:00")])
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_plan].considered_events).to be_empty
-      expect(day[:in_plan].considered_events).to be_empty
-    end
-
-    it "押し出しの根拠（どのイベントでどこからどこへ動かしたか）を返す" do
-      allow(calendar_client).to receive(:events).and_return([span("午後休暇", "12:00", "19:00")])
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_leave_shifts].map(&:label))
-        .to eq ["休暇『午後休暇』(12:00-19:00) により 18:00 → 12:00"]
-      expect(day[:in_leave_shifts]).to be_empty
-      expect(day[:leave_periods].map(&:label)).to eq ["『午後休暇』(12:00-19:00)"]
-    end
-  end
-
-  # 揺らぎ（jitter）と休暇境界の相互作用を固定する。上の表は window=0 で押し出し自体を
-  # 見ているため、ここで揺らぎを載せた実運用相当の設定を検証する。
-  #
-  # 設計判断（ユーザー承認済み）: 揺らぎは常に勤務時間を広げる向き（出勤＝締切から手前、
-  # 退勤＝基準から後ろ）で、休暇の境界でも向きを反転しない。したがって休暇で押し出した
-  # 締切・基準から揺らいだ目標は、休暇の時間帯の内側に入る（午前休なら休暇終了の直前に出勤、
-  # 午後休なら休暇開始の直後に退勤）。「休暇境界では揺らぎを反転して常に休暇の外側にする」
-  # 案は検討のうえ不採用。これは意図した挙動なので、黙って変えないこと。
-  describe "揺らぎと休暇境界" do
-    # 実運用に近い設定: 所定 09:25 + ウィンドウ5分 → 所定の打刻締切は 09:30 / 退勤は 18:00。
-    let(:config) do
-      Ak4Punch::Config.new(
-        data: {
-          "company_id" => "x",
-          "work" => { "clock_in" => "09:25", "clock_out" => "18:00", "random_window_minutes" => 5 },
-          "calendar" => { "enabled" => true, "exclude_keywords" => ["会食"] },
-          "daemon" => { "manage_wake" => false, "late_grace_minutes" => 10, "morning_wake_at" => "07:45" },
-        },
-        root: Dir.pwd,
-      )
-    end
-
-    # 日毎・kind毎に固定の揺らぎ秒（Daemon と同じ導出）
-    def jitter(kind, window: 5, day: 10)
-      seed = Time.new(2026, 7, day, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
-      Random.new(seed).rand(0..(window * 60))
-    end
-
-    def leaves_of(events)
-      Ak4Punch::LeaveSchedule.build(events: events, keywords: config.calendar_leave_keywords, date: date)
-    end
-
-    it "午前休は「休暇の終了 − 揺らぎ」に出勤する（目標は休暇の時間帯の内側）" do
-      events = [event(title: "午前休み", starts_at: t("09:00"), ends_at: t("13:00"))]
-      allow(calendar_client).to receive(:events).and_return(events)
-
-      day = daemon.build_day_plan(date: date)
-      expect(day[:in_deadline]).to eq t("13:00")               # 所定の締切 09:30 が休暇の外へ後ろ倒し
-      expect(day[:in_target]).to eq t("13:00") - jitter(:in)   # 揺らぎは締切から手前＝休暇側へ戻る
-      expect(day[:in_target]).to be_between(t("12:55"), t("13:00"))
-      expect(leaves_of(events).covers?(day[:in_target])).to be true
-    end
-
-    it "午後休は「休暇の開始 + 揺らぎ」に退勤する（目標は休暇の時間帯の内側）" do
-      events = [event(title: "午後休暇", starts_at: t("12:00"), ends_at: t("19:00"))]
-      allow(calendar_client).to receive(:events).and_return(events)
-
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_base]).to eq t("12:00")                  # 所定 18:00 が休暇の外へ前倒し
-      expect(day[:out_target]).to eq t("12:00") + jitter(:out) # 揺らぎは基準から後ろ＝休暇側へ入る
-      expect(day[:out_target]).to be_between(t("12:00"), t("12:05"))
-      expect(leaves_of(events).covers?(day[:out_target])).to be true
-    end
-
-    it "休暇のない日は従来どおり所定の締切・基準から揺らぐ" do
-      allow(calendar_client).to receive(:events).and_return([])
-
-      day = daemon.build_day_plan(date: date)
-      expect(day[:in_target]).to eq t("09:30") - jitter(:in)
-      expect(day[:out_target]).to eq t("18:00") + jitter(:out)
-    end
-  end
-
   # 退勤目標は「基準 + 揺らぎ」なので、基準が当日内でも目標が翌日に跨ることがある。
   # 翌日に出た目標は日付変化で計画が破棄され（start_new_day）必ず未打刻になるため、
   # そういう日は揺らぎを落として基準そのものを目標にする（23:59:59 で頭を押さえるのでは、
   # tick（既定30秒）が日付変更までに入る余裕がなく、位相次第で結局打刻されない）。
+  # 目標の計算そのものは day_planner_spec の同名 describe を参照。ここでは tick が
+  # 日付変更前に発火することを検証する。
   describe "退勤目標が翌日に出る日は揺らぎを落とす" do
     let(:config) do
       Ak4Punch::Config.new(
@@ -1405,41 +1257,6 @@ RSpec.describe Ak4Punch::Daemon do
         },
         root: Dir.pwd,
       )
-    end
-
-    # 退勤側の揺らぎ秒（Daemon と同じ導出。2026-07-10 は 183秒）
-    def jitter_out(day: 10)
-      seed = Time.new(2026, 7, day, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
-      Random.new(seed).rand(0..300)
-    end
-
-    it "23:59 終了のイベントの日は基準（23:59:00）が目標になる" do
-      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59"))])
-
-      # 前提の確認: 揺らぎを足すと目標は翌日 00:02:03 になる
-      expect(t("23:59") + jitter_out).to eq t("00:02", 3, day: 11)
-
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_base]).to eq t("23:59")
-      expect(day[:out_target]).to eq t("23:59")      # 23:59:59 ではなく基準そのもの
-      expect(day[:out_target].to_date).to eq date
-      # 日付変更まで60秒あり、tick(30秒)がどの位相でも1回は入る
-      expect(t("00:00", 0, day: 11) - day[:out_target]).to be >= config.daemon_tick_seconds
-    end
-
-    it "落とした結果も基準を下回らない（退勤基準より前には打刻しない）" do
-      allow(calendar_client).to receive(:events).and_return([event(title: "障害対応", ends_at: t("23:59"))])
-
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_target]).to be >= day[:out_base]
-    end
-
-    it "当日内に収まる目標はそのまま（従来どおり基準+揺らぎ）" do
-      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
-
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_target]).to eq t("18:30") + jitter_out
-      expect(day[:out_plan].source).to eq :calendar
     end
 
     it "目標は再取得で動かず、日付変更前の tick で退勤が打刻される" do
@@ -1509,11 +1326,8 @@ RSpec.describe Ak4Punch::Daemon do
       )
     end
 
-    # 退勤側の揺らぎ秒（Daemon と同じ導出。2026-07-10 は 183秒）
-    def jitter_out
-      seed = Time.new(2026, 7, 10, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(:out)
-      Random.new(seed).rand(0..300)
-    end
+    # 退勤側の揺らぎ秒（式は spec_helper の JitterHelper に集約。2026-07-10 は 183秒）
+    def jitter_out = jitter_seconds_for(Date.new(2026, 7, 10), :out, 5)
 
     # tick の途中で時計が進むクロック（配列を順に返し、最後の値は以降ずっと返す）。
     # 位相総当たりテストのように tick 内で時刻を固定する形では、この退行（tick 冒頭は当日／
@@ -1831,20 +1645,6 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("09:30", 5)
       d.tick
       expect(stamper).to have_received(:punch).with(kind: :in, date: date, window_minutes: 0, deadline: anything)
-    end
-
-    it "build_day_plan は全休フラグと休暇イベントの時間帯を返す" do
-      allow(calendar_client).to receive(:events).and_return([leave_event])
-      day = daemon.build_day_plan(date: date)
-      expect(day[:full_leave]).to be true
-      expect(day[:leave_periods].map { |p| p.event.title }).to eq ["夏季休暇"]
-    end
-
-    it "build_day_plan は休暇がなければ全休でなく休暇イベントも空" do
-      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
-      day = daemon.build_day_plan(date: date)
-      expect(day[:full_leave]).to be false
-      expect(day[:leave_periods]).to be_empty
     end
   end
 
@@ -2239,70 +2039,6 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("18:00", 5)
       disabled_daemon.tick
     end
-
-    it "build_day_plan は連動OFF（plan なし・error なし・所定時刻）を返す" do
-      expect(calendar_client).not_to receive(:events)
-      day = disabled_daemon.build_day_plan(date: date)
-      expect(day[:out_plan]).to be_nil
-      expect(day[:out_error]).to be_nil
-      expect(day[:out_target]).to eq t("18:00")
-    end
-  end
-
-  describe "build_day_plan（plan コマンド用）" do
-    it "対象日はイベントを反映した計画を返す" do
-      allow(calendar_client).to receive(:events).with(date: date)
-        .and_return([event(title: "実装", ends_at: t("19:00")), event(title: "会食", ends_at: t("21:00"))])
-      day = daemon.build_day_plan(date: date)
-      expect(day[:target?]).to be true
-      expect(day[:in_target]).to eq t("09:30")
-      expect(day[:out_target]).to eq t("19:00") # 会食は除外され実装採用
-      expect(day[:out_plan].adopted_event.title).to eq "実装"
-    end
-
-    it "出勤側も判断根拠（in_plan / in_deadline）を返す" do
-      # 朝の予定をアンカーにするには下限（morning_wake_at）を所定より前に置く必要がある
-      cfg = Ak4Punch::Config.new(
-        data: {
-          "company_id" => "x",
-          "work" => { "clock_in" => "09:30", "clock_out" => "18:00" },
-          "calendar" => { "enabled" => true },
-          "daemon" => { "manage_wake" => false, "morning_wake_at" => "07:45" },
-        },
-        root: Dir.pwd,
-      )
-      d = described_class.new(
-        config: cfg, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
-        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
-        notifier: notifier, clock: clock, sleeper: ->(_s) {},
-      )
-      allow(calendar_client).to receive(:events).with(date: date)
-        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
-      day = d.build_day_plan(date: date)
-      expect(day[:in_plan].adopted_event.title).to eq "定例会議"
-      expect(day[:in_deadline]).to eq t("09:00")
-      expect(day[:in_target]).to eq t("09:00") # window=0 なので揺らぎなし
-      expect(day[:in_error]).to be_nil
-    end
-
-    it "morning_wake_at 未設定なら下限が所定出勤時刻になり、朝の予定はアンカーにならない" do
-      allow(calendar_client).to receive(:events).with(date: date)
-        .and_return([event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))])
-      day = daemon.build_day_plan(date: date) # 既定 config は morning_wake_at 未設定
-      expect(day[:in_plan].adopted_event).to be_nil
-      expect(day[:in_plan].too_early_events.map(&:title)).to eq ["定例会議"]
-      expect(day[:in_deadline]).to eq t("09:30") # 所定の締切のまま
-      expect(day[:in_target]).to eq t("09:30")
-    end
-
-    it "取得失敗時は out_error を持ち所定時刻へフォールバック" do
-      allow(calendar_client).to receive(:events).and_raise(Ak4Punch::CalendarClient::ApiError, "接続拒否")
-      day = daemon.build_day_plan(date: date)
-      expect(day[:out_error]).to include "接続拒否"
-      expect(day[:out_target]).to eq t("18:00")
-      expect(day[:in_error]).to include "接続拒否"
-      expect(day[:in_target]).to eq t("09:30")
-    end
   end
 
   describe "出勤のカレンダー連動" do
@@ -2326,10 +2062,9 @@ RSpec.describe Ak4Punch::Daemon do
       )
     end
 
-    # 日毎・kind毎に固定の揺らぎ秒（Daemon と同じ導出）。目標＝締切−この秒数。
+    # 日毎・kind毎に固定の揺らぎ秒（式は spec_helper の JitterHelper に集約）。目標＝締切−この秒数。
     def jitter(kind, window: 5, day: 10)
-      seed = Time.new(2026, 7, day, 0, 0, 0, Ak4Punch::JST).to_i ^ Ak4Punch::Daemon::KIND_SALT.fetch(kind)
-      Random.new(seed).rand(0..(window * 60))
+      jitter_seconds_for(Date.new(2026, 7, day), kind, window)
     end
 
     def in_target(deadline_hhmm, day: 10)
