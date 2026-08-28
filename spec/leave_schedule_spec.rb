@@ -12,7 +12,7 @@ RSpec.describe Ak4Punch::LeaveSchedule do
 
   def ev(title:, all_day: false, starts_at: nil, ends_at: nil)
     Ak4Punch::CalendarClient::Event.new(
-      id: "x", title: title, starts_at: starts_at, ends_at: ends_at, location: nil, all_day: all_day,
+      id: "x", title: title, starts_at: starts_at, ends_at: ends_at, all_day: all_day,
     )
   end
 

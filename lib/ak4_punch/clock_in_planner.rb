@@ -35,7 +35,7 @@ module Ak4Punch
     )
 
     def initialize(exclude_keywords:)
-      @exclude_keywords = Array(exclude_keywords).map(&:to_s).reject(&:empty?)
+      @exclude_keywords = TitleKeywords.normalize(exclude_keywords)
     end
 
     # events: CalendarClient::Event 配列
@@ -108,12 +108,7 @@ module Ak4Punch
       end
     end
 
-    # title が nil のイベントは除外しない（業務扱い）。部分一致で判定。
-    def excluded_by_keyword?(event)
-      title = event.title
-      return false if title.nil? || title.to_s.empty?
-
-      @exclude_keywords.any? { |kw| title.include?(kw) }
-    end
+    # title が nil のイベントは除外しない（業務扱い）。部分一致で判定（規則は TitleKeywords）。
+    def excluded_by_keyword?(event) = TitleKeywords.match?(event.title, @exclude_keywords)
   end
 end

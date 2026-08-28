@@ -24,9 +24,16 @@ module Ak4Punch
   def now = Time.now.getlocal(JST)
   def today = now.to_date
 
+  # 「未設定」とみなす値か（nil・空文字・空白のみ）。
+  # 設定値・API 応答の値の未設定判定をこの1箇所に集約する（判定が箇所ごとにずれると、
+  # 片方は「設定あり」もう片方は「未設定」という食い違いが起きるため）。
+  # 空白のみを未設定に含めるのは、.env や config.yml に空白が紛れ込んだ値を救うため。
+  # タイトルの判定（TitleKeywords）だけは空白のみを通常の文字列として扱うのでこれを使わない。
+  def blank?(value) = value.nil? || value.to_s.strip.empty?
+
   # AKASHI 形式の時刻文字列を Time にする。空文字・パース不能な値は nil を返す。
   def parse_akashi_time(str)
-    return nil if str.nil? || str.to_s.strip.empty?
+    return nil if blank?(str)
 
     Time.strptime("#{str} #{JST}", "#{AKASHI_TIME_FORMAT} %z")
   rescue ArgumentError
@@ -38,6 +45,8 @@ module Ak4Punch
 end
 
 require_relative "ak4_punch/version"
+require_relative "ak4_punch/http"
+require_relative "ak4_punch/title_keywords"
 require_relative "ak4_punch/env_file"
 require_relative "ak4_punch/config"
 require_relative "ak4_punch/client"
@@ -47,6 +56,7 @@ require_relative "ak4_punch/work_calendar"
 require_relative "ak4_punch/clock_in_planner"
 require_relative "ak4_punch/clock_out_planner"
 require_relative "ak4_punch/leave_schedule"
+require_relative "ak4_punch/day_planner"
 require_relative "ak4_punch/wake_scheduler"
 require_relative "ak4_punch/slack_notifier"
 require_relative "ak4_punch/stamper"

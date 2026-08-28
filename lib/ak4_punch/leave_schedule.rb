@@ -58,20 +58,12 @@ module Ak4Punch
     # events: CalendarClient::Event 配列（nil 可＝連動OFF・取得失敗。休暇なしとして扱う）
     # keywords: 休暇と見なすタイトルのキーワード（部分一致・時間の閾値はなし）
     # date: 対象日(Date)。終日・時刻欠落イベントの時間帯をこの日を基準に正規化する。
+    # title が nil・空のイベントは休暇にしない（業務イベント扱い・規則は TitleKeywords）。
     def self.build(events:, keywords:, date:)
-      kws = Array(keywords).map(&:to_s).reject(&:empty?)
-      leaves, works = Array(events).partition { |ev| leave_title?(ev, kws) }
+      kws = TitleKeywords.normalize(keywords)
+      leaves, works = Array(events).partition { |ev| TitleKeywords.match?(ev.title, kws) }
       new(leave_events: leaves, work_events: works, date: date)
     end
-
-    # title が nil・空のイベントは休暇にしない（業務イベント扱い）。
-    def self.leave_title?(event, keywords)
-      title = event.title
-      return false if title.nil? || title.to_s.empty?
-
-      keywords.any? { |kw| title.include?(kw) }
-    end
-    private_class_method :leave_title?
 
     # events: 休暇イベント配列 / work_events: 休暇以外のイベント配列 / periods: 正規化した時間帯
     attr_reader :events, :work_events, :periods

@@ -310,7 +310,7 @@ module Ak4Punch
       raise Error, "#{key} の時刻指定が不正です（HH:MM 形式で指定してください）: #{value}"
     end
 
-    def blank?(value) = value.nil? || value.to_s.strip.empty?
+    def blank?(value) = Ak4Punch.blank?(value)
     def to_date(value) = value.is_a?(Date) ? value : Date.parse(value.to_s)
 
     # 分を 0..MAX_WINDOW_MINUTES に丸める（負値は0、上限超過は上限）。

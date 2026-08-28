@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "set" # parse_pmset_wakes が Set を使う（Ruby の暗黙 autoload に依存しない）
+
 module Ak4Punch
   # pmset の「一回限り起床予約」を add-only 方式で管理する小さなクラス。
   # Daemon の tick 毎に、当日の残り打刻目標（と翌営業日朝のブートストラップ）の
@@ -69,7 +71,7 @@ module Ak4Punch
     # targets: 起床させたい打刻目標時刻(Time)の配列。
     # 既存の予約は一切消さず、各目標の lead 分前（未来のもの）のうち未登録のものだけ追加する。
     def reschedule(targets)
-      return if @disabled
+      return if disabled?
 
       out, ok = @reader.call
       unless ok

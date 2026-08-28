@@ -30,10 +30,12 @@ module Ak4Punch
   #     ただし定期再取得の失敗は実害がないため、連続失敗が閾値に達するまで通知しない
   #     （DarkWake 中の無通信による一過性の失敗で鳴らさない）。
   #   - 長い sleep はせず tick で進める（Mac スリープ復帰後に正しく追随するため）。
+  #
+  # 目標時刻そのものの計算（上の出勤・退勤・揺らぎ・休暇の押し出し）は DayPlanner に切り出してある
+  # （可変状態を持たない純ロジック）。このクラスの責務は「いつ計算するか・結果をどう状態へ反映するか・
+  # いつ打刻するか」で、打刻計画・休暇スナップショット・通知のデデュープ・起床予約を持つ。
   class Daemon
     KINDS = %i[in out].freeze
-    # 揺らぎ乱数のシードを in/out で分けるための salt。
-    KIND_SALT = { in: 0x1111, out: 0x2222 }.freeze
     # 「翌日 00:00 の直前」を表すために引く最小の差（end_of_plan_day）。
     # Time.now の分解能（clock_gettime）はナノ秒なので、これで
     # 「now <= 端 ⟺ now は日付が変わる前」が実用上厳密に成り立つ。
@@ -50,18 +52,13 @@ module Ak4Punch
 
     # 当日「最後に sukesan から取得できたときの休暇情報」。取得に失敗した tick でも
     # 休暇中かどうかを判定できるようにするために保持する（POST 直前の休暇ゲートの判定材料）。
-    #   leaves:     そのときの LeaveSchedule
-    #   in_target:  そのとき計算した休暇反映後の出勤目標
-    #   out_target: そのとき計算した休暇反映後の退勤目標
+    #   day_plan:   そのとき計算した DayPlanner::DayPlan（休暇の時間帯と、それを反映した出勤・退勤目標）
     #   fetched_at: 取得した時刻（ログ・通知で「いつ時点の情報か」を示す）
-    # 各 target が「実際に採用された @punch_plans[kind].target_at」ではないのが肝。
-    # 日中に休暇が入って新目標が到達不能になった日は、set_in_plan/set_out_plan が更新を見送って
+    # day_plan の各 target が「実際に採用された @punch_plans[kind].target_at」ではないのが肝。
+    # 日中に休暇が入って新目標が到達不能になった日は、set_plan が更新を見送って
     # 旧目標（休暇を知らない目標）が残る。まさにその日を止めるための情報なので、
     # 採用されたかどうかに関わらず「休暇を反映して計算した目標」を持っておく必要がある。
-    LeaveSnapshot = Struct.new(:leaves, :in_target, :out_target, :fetched_at, keyword_init: true) do
-      # kind に対応する「休暇を反映して計算した目標」。
-      def target_for(kind) = kind == :in ? in_target : out_target
-    end
+    LeaveSnapshot = Struct.new(:day_plan, :fetched_at, keyword_init: true)
 
     # プロセス生存確認（シグナル0は送達せず存在チェックのみ）。
     DEFAULT_ALIVE_CHECK = lambda do |pid|
@@ -99,6 +96,8 @@ module Ak4Punch
       @notifier = notifier
       @clock = clock
       @sleeper = sleeper
+      # 当日の出勤・退勤目標を計算する純ロジック（可変状態を持たないので使い回してよい）。
+      @planner = DayPlanner.new(config: config, logger: logger)
 
       @current_date = nil       # 日付遷移の副作用（前日未打刻の通知・状態リセット）を実施済みの日付
       @plan_date = nil          # 計画の作成に成功した日付（失敗した日は進めず、次の tick で再試行する）
@@ -153,32 +152,6 @@ module Ak4Punch
     #       イベントを修正してから `punch recheck` で即時に再判定させる。
     def request_recheck!
       @recheck_requested = true
-    end
-
-    # 指定日の計画を組み立てて返す（`punch plan` のドライラン表示にも使う）。
-    # sukesan の取得は1回だけ行い、休暇・出勤・退勤の計画で共用する。
-    def build_day_plan(date:)
-      fetched = @config.calendar_enabled ? fetch_events(date) : { events: nil, error: nil }
-      leaves = leave_schedule(fetched[:events], date)
-      in_plan = plan_clock_in(date: date, events: fetched[:events], leaves: leaves, error: fetched[:error])
-      out_plan = plan_clock_out(date: date, events: fetched[:events], leaves: leaves, error: fetched[:error])
-      {
-        date: date,
-        target?: @calendar.target?(date),
-        reason: @calendar.reason(date),
-        leave_periods: leaves.periods,
-        full_leave: full_leave?(in_plan[:deadline], out_plan[:base], leaves),
-        in_plan: in_plan[:plan],
-        in_target: in_plan[:target],
-        in_deadline: in_plan[:deadline],
-        in_leave_shifts: in_plan[:leave_shifts],
-        in_error: in_plan[:error],
-        out_plan: out_plan[:plan],
-        out_target: out_plan[:target],
-        out_base: out_plan[:base],
-        out_leave_shifts: out_plan[:leave_shifts],
-        out_error: out_plan[:error],
-      }
     end
 
     private
@@ -271,27 +244,25 @@ module Ak4Punch
       # 再試行の対象になるのは想定外の例外だけ。
       fetched = @config.calendar_enabled ? fetch_events(today) : { events: nil, error: nil }
       @last_refresh_at = now # ここが当日最初の取得。次の定期再取得はこの時刻から interval 後。
-      leaves = leave_schedule(fetched[:events], today)
-      in_plan = plan_clock_in(date: today, events: fetched[:events], leaves: leaves, error: fetched[:error])
-      out = plan_clock_out(date: today, events: fetched[:events], leaves: leaves, error: fetched[:error])
-      remember_leaves(leaves, in_plan, out, now) if fetched[:events]
+      day_plan = @planner.call(date: today, events: fetched[:events], error: fetched[:error])
+      remember_leaves(day_plan, now) if fetched[:events]
 
       notify_sukesan_fallback(fetched[:error]) if fetched[:error]
 
       # 全休（休暇の押し出しで勤務時間が消えた日）は打刻計画を持たない。
       # 再チェックで休暇イベントが消えていれば下の通常計画に戻る。
-      if full_leave?(in_plan[:deadline], out[:base], leaves)
+      if day_plan.full_leave?
         @leave_day = true
         @punch_plans = {}
-        @logger.info("休暇イベント#{leaves.labels} により本日は勤務時間がないため、打刻しません")
+        @logger.info("休暇イベント#{day_plan.leaves.labels} により本日は勤務時間がないため、打刻しません")
         # 計画なし＝tick 末尾の突き合わせで翌営業日ブートストラップのみが維持される。
         @plan_date = today
         return
       end
 
       @leave_day = false # 再チェックで全休状態を解除できるよう毎回明示的に設定する
-      set_in_plan(in_plan, now)
-      set_out_plan(out, now)
+      set_plan(:in, day_plan.clock_in, now)
+      set_plan(:out, day_plan.clock_out, now)
       @plan_date = today
     end
 
@@ -337,16 +308,13 @@ module Ak4Punch
       end
 
       # 全休判定には出勤締切・退勤基準の両方が要るため、片方だけが未完了でも両方を計算する
-      # （どちらも純粋な計算で副作用はない。計画へ反映するのは未完了の kind だけ）。
-      date = now.to_date
-      leaves = leave_schedule(fetched[:events], date)
-      in_plan = plan_clock_in(date: date, events: fetched[:events], leaves: leaves)
-      out = plan_clock_out(date: date, events: fetched[:events], leaves: leaves)
-      remember_leaves(leaves, in_plan, out, now)
-      return if switch_to_full_leave?(leaves, in_plan, out)
+      # （DayPlanner は純粋な計算で副作用はない。計画へ反映するのは未完了の kind だけ）。
+      day_plan = @planner.call(date: now.to_date, events: fetched[:events])
+      remember_leaves(day_plan, now)
+      return if switch_to_full_leave?(day_plan)
 
-      set_in_plan(in_plan, now) if pending.include?(:in)
-      set_out_plan(out, now) if pending.include?(:out)
+      set_plan(:in, day_plan.clock_in, now) if pending.include?(:in)
+      set_plan(:out, day_plan.clock_out, now) if pending.include?(:out)
     end
 
     # 打刻期限（目標時刻の窓の終端 ＝ 目標 + grace）。grace の解釈をここ1箇所に閉じ込める。
@@ -390,7 +358,7 @@ module Ak4Punch
     end
 
     # 打刻期限（punch_deadline_at）を過ぎていて、もう打刻できないか。
-    # fire_due_punches の give_up 発火条件そのものであり、set_in_plan / set_out_plan の
+    # fire_due_punches の give_up 発火条件そのものであり、set_plan の
     # 「到達不能な新目標では更新を見送る」ガードの正しさは、この2つが同じ規則であることに
     # 依っている（片方だけ変えるとガードが黙って意味を失う）。必ずこの述語を共有すること。
     #
@@ -407,52 +375,20 @@ module Ak4Punch
       now > punch_deadline_at(target)
     end
 
-    # 出勤計画を @punch_plans[:in] に反映する（set_out_plan の鏡像）。
-    # 目標が同じなら完了・リトライ状態（done/attempted/last_error）を引き継ぎ、
-    # 目標が変わったらリセットする。final_checked は出勤では使わないため常に false。
-    #
-    # 既存計画の更新で、新目標が到達不能（unreachable_target?）なら更新せず既存の目標を維持する。
-    # 例: 9:40 に 9:00 開始の会議が追加されると新目標は 08:55 になるが、grace(10分)を
-    # 過ぎているので採用した瞬間に窓超過と判定され、出勤が恒久スキップ（give_up で done 確定）
-    # になってしまう。退勤側の「定期再取得の失敗で目標を巻き戻さない」と同じクラスの事故を防ぐ。
-    # 逆に grace 内の前倒しは採用する（同じ tick で打刻され「予定の開始までに打刻する」目的に適う）。
-    # 起動時の新規作成（既存計画なし）は、目標が過去でもそのまま計画する（従来どおり
-    # grace 内なら打刻し、超過していれば give_up の経路に乗せる）。
-    def set_in_plan(plan_result, now)
-      target = plan_result[:target]
-      existing = @punch_plans[:in]
-      same_target = !existing.nil? && existing.target_at == target
-
-      if existing && !same_target && unreachable_target?(target, now)
-        @logger.warn("出勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
-                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{plan_result[:summary]}）")
-        return
-      end
-
-      if existing && !same_target
-        @logger.info("出勤目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{plan_result[:summary]}）")
-      elsif existing.nil?
-        @logger.info("出勤目標を設定: #{fmt(target)}（#{plan_result[:summary]}）")
-      end
-
-      @punch_plans[:in] = PunchPlan.new(
-        kind: :in, target_at: target, done: same_target ? existing.done? : false,
-        attempted: same_target ? existing.attempted : false,
-        last_error: same_target ? existing.last_error : nil,
-        final_checked: false,
-      )
-    end
-
-    # 退勤計画を @punch_plans[:out] に反映する。
+    # 打刻計画を @punch_plans[kind] に反映する（出勤・退勤で規則は同一）。
     # 目標が同じなら完了・リトライ状態（done/attempted/last_error/final_checked）を引き継ぎ、
     # 目標が変わったらリセットする（新目標では改めて最終チェック→打刻の順で進む）。
     # done を目標一致でゲートするのは、断念（done）した目標の状態が別の目標に伝染して
     # 「打刻もされず起床予約もされない」計画になるのを防ぐため。
+    # final_checked は fire_due_punches が退勤にしか立てない（`kind == :out && !plan.final_checked`）
+    # ため、出勤の計画では常に false のままになる。両者で同じ式を使ってよいのはこのため。
     #
-    # 出勤と同じく、既存計画の更新で新目標が到達不能（unreachable_target?）なら見送る。
-    # 会議が短縮されて目標が前倒しされた場合は、これまでどおり grace 窓内で速やかに打刻する。
-    # 見送るのは「採用した瞬間に give_up にしかならない」場合だけ。
-    # 例: 18:30-19:00 の会議で退勤目標が 19:01 の日に、18:45 にその会議が削除されると
+    # 既存計画の更新で、新目標が到達不能（unreachable_target?）なら更新せず既存の目標を維持する。
+    # 見送るのは「採用した瞬間に give_up にしかならない」場合だけで、これは出勤・退勤の両方で起きる。
+    # 出勤の例: 9:40 に 9:00 開始の会議が追加されると新目標は 08:55 になるが、grace(10分)を
+    # 過ぎているので採用した瞬間に窓超過と判定され、出勤が恒久スキップ（give_up で done 確定）
+    # になってしまう。「定期再取得の失敗で目標を巻き戻さない」と同じクラスの事故を防ぐ。
+    # 退勤の例: 18:30-19:00 の会議で退勤目標が 19:01 の日に、18:45 にその会議が削除されると
     # 新目標は所定へ戻って 18:01 になるが、grace を過ぎているので採用した瞬間に窓超過と
     # 判定され、退勤が打刻されないまま「目標 18:01／現在 18:45・44分超過」と通知される。
     # give_up は「Mac がスリープして窓を逃した」ときの誤時刻打刻ガードであり、デーモン自身の
@@ -460,25 +396,29 @@ module Ak4Punch
     # 既存目標（19:01）で打刻すると記録は遅れるが、正解の 18:00 は既に過ぎていて AKASHI は
     # 遡って打刻できない以上どの選択肢でも誤記録になるため、打刻されず手動対応を強いるより
     # 既存目標で打刻する方を採る。
-    def set_out_plan(out, now)
-      target = out[:target]
-      existing = @punch_plans[:out]
+    # 逆に grace 内の前倒しは採用する（同じ tick で打刻され「予定の開始までに打刻する」目的に適う。
+    # 会議が短縮されて目標が前倒しされた場合も、これまでどおり grace 窓内で速やかに打刻する）。
+    # 起動時の新規作成（既存計画なし）は、目標が過去でもそのまま計画する（従来どおり
+    # grace 内なら打刻し、超過していれば give_up の経路に乗せる）。
+    def set_plan(kind, plan_result, now)
+      target = plan_result.target
+      existing = @punch_plans[kind]
       same_target = !existing.nil? && existing.target_at == target
 
       if existing && !same_target && unreachable_target?(target, now)
-        @logger.warn("退勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
-                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{out[:summary]}）")
+        @logger.warn("#{label(kind)}目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
+                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{plan_result.summary}）")
         return
       end
 
       if existing && !same_target
-        @logger.info("退勤目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{out[:summary]}）")
+        @logger.info("#{label(kind)}目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{plan_result.summary}）")
       elsif existing.nil?
-        @logger.info("退勤目標を設定: #{fmt(target)}（#{out[:summary]}）")
+        @logger.info("#{label(kind)}目標を設定: #{fmt(target)}（#{plan_result.summary}）")
       end
 
-      @punch_plans[:out] = PunchPlan.new(
-        kind: :out, target_at: target, done: same_target ? existing.done? : false,
+      @punch_plans[kind] = PunchPlan.new(
+        kind: kind, target_at: target, done: same_target ? existing.done? : false,
         attempted: same_target ? existing.attempted : false,
         last_error: same_target ? existing.last_error : nil,
         final_checked: same_target ? existing.final_checked : false,
@@ -624,22 +564,19 @@ module Ak4Punch
       # 取得できたので定期再取得の起点も進める（直後に同じ内容をもう一度取りにいかない）。
       @last_refresh_at = now
 
-      date = now.to_date
-      leaves = leave_schedule(fetched[:events], date)
-      in_plan = plan_clock_in(date: date, events: fetched[:events], leaves: leaves)
-      out = plan_clock_out(date: date, events: fetched[:events], leaves: leaves)
-      remember_leaves(leaves, in_plan, out, now)
+      day_plan = @planner.call(date: now.to_date, events: fetched[:events])
+      remember_leaves(day_plan, now)
 
       # まず全休判定（休暇で勤務時間が消えていたら以降の打刻を中止）。
-      return true if switch_to_full_leave?(leaves, in_plan, out)
+      return true if switch_to_full_leave?(day_plan)
 
       # 目標が後ろへ動いていたら延期する。休暇より後ろに予定がある日（中抜け）は、
       # いま休暇の時間帯にいても休暇明けの目標へ延期されるので、この判定を
       # 「現在が休暇の時間帯か」より先に置くこと（順序を逆にすると中抜けの日の退勤を落とす）。
-      if out[:target] > now
+      if day_plan.clock_out.target > now
         @logger.info("退勤直前チェック: 目標が後ろ倒しされたため打刻を延期します")
-        # 新目標は now より後（上のガードで確認済み）なので、set_out_plan の到達不能ガードには掛からない。
-        set_out_plan(out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
+        # 新目標は now より後（上のガードで確認済み）なので、set_plan の到達不能ガードには掛からない。
+        set_plan(:out, day_plan.clock_out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
         return true
       end
 
@@ -688,9 +625,8 @@ module Ak4Punch
 
     # 当日最後に取得できた休暇情報（@leave_snapshot）を保存する。
     # POST 直前の休暇ゲートはこれを唯一の判定材料にする。
-    def remember_leaves(leaves, in_plan, out, now)
-      @leave_snapshot = LeaveSnapshot.new(leaves: leaves, in_target: in_plan[:target],
-                                          out_target: out[:target], fetched_at: now)
+    def remember_leaves(day_plan, now)
+      @leave_snapshot = LeaveSnapshot.new(day_plan: day_plan, fetched_at: now)
     end
 
     # 出勤・退勤の POST の直前に必ず通す休暇ゲート。休暇による中止判定はこの1箇所だけに置く。
@@ -703,16 +639,16 @@ module Ak4Punch
     # 午後休は「休暇の開始+揺らぎ」なので、目標自体が休暇の時間帯の中に入る）。
     # 不一致は「休暇を知らない古い目標を持っている」ことの証拠なので中止する。
     # これで次の3つが kind を問わず同じ規則で塞がる:
-    #   ① 日中に休暇が入り、新目標が到達不能で set_in_plan/set_out_plan が更新を見送った日
+    #   ① 日中に休暇が入り、新目標が到達不能で set_plan が更新を見送った日
     #   ② recheck 直後の取得失敗で、所定フォールバックの計画に作り直された日（全休日・半休日とも）
     #   ③ 打刻失敗のリトライ中に定期再取得で休暇を把握した日（退勤の直前チェックを通らない経路）
     # snapshot が無い日（当日一度も取得に成功していない）は判定材料がないので打刻する。
     def abort_punch_in_leave?(plan, now)
       snapshot = @leave_snapshot
       return false if snapshot.nil?
-      return false unless snapshot.leaves.covers?(now)
+      return false unless snapshot.day_plan.leaves.covers?(now)
 
-      planned = snapshot.target_for(plan.kind)
+      planned = snapshot.day_plan.target_for(plan.kind)
       return false if plan.target_at == planned && !unreachable_target?(plan.target_at, now)
 
       # 中止は確定。ここから先は通知の要否だけを判断する。
@@ -734,7 +670,7 @@ module Ak4Punch
           "現在の#{label(plan.kind)}目標 #{hhmm(plan.target_at)} は、#{hhmm(snapshot.fetched_at)} 時点の" \
             "休暇を反映した目標 #{hhmm(planned, base: now)} と一致しません（休暇を知らない古い目標です）"
         end
-      @logger.warn("現在時刻が休暇#{snapshot.leaves.labels}の時間帯のため、" \
+      @logger.warn("現在時刻が休暇#{snapshot.day_plan.leaves.labels}の時間帯のため、" \
                    "#{label(plan.kind)}打刻を中止します。#{reason}")
       # 次の tick で毎回やり直さないよう done にする（窓超過の断念通知も出さない）。復帰は punch recheck。
       plan.done = true
@@ -742,7 +678,7 @@ module Ak4Punch
       # 後の別目標での中止は、同じ日でも改めて通知する必要があるため。
       notify_once([:leave_abort, plan.kind, plan.target_at],
                   "#{label(plan.kind)}打刻を中止しました（現在 #{hhmm(now)} は" \
-                  "休暇#{snapshot.leaves.labels}の時間帯です。#{reason}）。" \
+                  "休暇#{snapshot.day_plan.leaves.labels}の時間帯です。#{reason}）。" \
                   "必要であれば AKASHI で手動打刻してください")
       true
     end
@@ -752,18 +688,19 @@ module Ak4Punch
     #
     # 通知は「日中に全休へ切り替わった」場合だけ出す（同日1回）。この経路の呼び出し元は
     # 定期再取得（refresh_if_due）と退勤の直前チェック（postpone_out_by_final_check?）だけで、
-    # 初期計画は build_and_apply_day_plan が full_leave? を直接呼ぶためここを通らない
+    # 初期計画は build_and_apply_day_plan が DayPlan#full_leave? を直接呼ぶためここを通らない
     # （休暇を取った日に毎回通知が来るのを避けるため、この構造は変えないこと）。
     # 打刻済みの分の手動削除が必要になる＝ユーザの対応が要る事象なので、ログだけでは足りない。
-    def switch_to_full_leave?(leaves, in_plan, out)
-      return false unless full_leave?(in_plan[:deadline], out[:base], leaves)
+    def switch_to_full_leave?(day_plan)
+      return false unless day_plan.full_leave?
 
+      labels = day_plan.leaves.labels
       @leave_day = true
       @punch_plans = {}
-      @logger.warn("休暇イベント#{leaves.labels} により本日の勤務時間がなくなったため、以降の打刻を中止します。" \
+      @logger.warn("休暇イベント#{labels} により本日の勤務時間がなくなったため、以降の打刻を中止します。" \
                    "打刻済みの分は手動で削除してください")
       notify_once(:switched_to_full_leave,
-                  "休暇イベント#{leaves.labels} により本日の勤務時間がなくなったため、以降の打刻を中止しました。" \
+                  "休暇イベント#{labels} により本日の勤務時間がなくなったため、以降の打刻を中止しました。" \
                   "既に打刻済みの分は AKASHI で手動削除が必要です")
       # 当日 targets が空になる。既存の予約は消さず、tick 末尾の突き合わせで
       # 翌営業日ブートストラップのみが維持される（残った当日予約は発火しても無害）。
@@ -784,19 +721,6 @@ module Ak4Punch
       @calendar_failure_count += 1
       { events: nil, error: e.message }
     end
-
-    # 取得済みイベントを「休暇」と「業務」に仕分けた LeaveSchedule を作る。
-    # events が nil（連動OFF・取得失敗）なら休暇なしの空の集合になる。
-    def leave_schedule(events, date)
-      LeaveSchedule.build(events: events, keywords: @config.calendar_leave_keywords, date: date)
-    end
-
-    # 休暇の押し出し後に「出勤締切 >= 退勤基準」＝勤務時間ゼロになったか（＝全休）。
-    # 終日休暇（00:00〜翌00:00）もこの判定で全休になるため、全休は特別ルールではなく帰結。
-    # 判定は揺らぎを足す前の締切・基準で行う（揺らぎの向きで勤務時間の有無が変わらないように）。
-    # 休暇イベントが1件もない日は判定しない（所定退勤 <= 所定出勤 という設定ミスのときに
-    # 「全休」として黙って打刻を止めないため）。
-    def full_leave?(deadline, base, leaves) = leaves.any? && deadline >= base
 
     # 実際の打刻。トークン更新（CLI#run_punch 相当）→ Stamper#punch（window=0 で即時）。
     # 揺らぎは目標時刻に織込済みのため window は 0 で呼ぶ。冪等・対象日判定は Stamper に委ねる。
@@ -889,203 +813,11 @@ module Ak4Punch
     def next_workday_morning_wake(now)
       date = now.to_date + 1
       366.times do
-        return morning_wake_time(date) if @calendar.target?(date)
+        return @planner.morning_wake_at(date) if @calendar.target?(date)
 
         date += 1
       end
       nil
-    end
-
-    # その日の朝に Mac を起こす時刻。出勤アンカーの下限（ClockInPlanner の earliest_at）も
-    # これと同じ値を使い、「Mac が確実に起きている時刻以降に始まる予定しかアンカーにしない」
-    # という不変条件を1本で保つ。
-    #   daemon.morning_wake_at 設定あり → min(その時刻, 所定出勤時刻)
-    #   未設定                          → 所定出勤時刻
-    # min を取るのは、morning_wake_at を所定より遅く設定してしまっても
-    # 従来より起床が遅くならない（出勤に間に合う）ようにするため。
-    # 未設定時に nil（下限なし）にしないのは、深夜の予定（例 00:30）をアンカーにしてしまい、
-    # 寝ている Mac では grace 超過で出勤が打刻されず、起きていれば 00:29 に打刻される、
-    # という従来（所定＋揺らぎ固定）より危険な挙動になるため。
-    # 代償として morning_wake_at 未設定だと下限＝所定出勤時刻になり、所定より前に始まる
-    # 予定はアンカーにならない（＝出勤のカレンダー連動が実質無効。この設定が有効化スイッチを兼ねる）。
-    # 出勤目標は plan_clock_in でこの時刻にクランプするため、これを下回らない。
-    def morning_wake_time(date)
-      default = clock_in_default_at(date)
-      hhmm = @config.daemon_morning_wake_at
-      return default if hhmm.nil?
-
-      [time_on(date, hhmm), default].min
-    end
-
-    # 出勤の目標時刻を計算する。events は取得済みイベント配列
-    # （nil は未取得＝連動OFF、または取得失敗。失敗時は error にメッセージ）。
-    # 取得自体は呼び出し側が fetch_events で行い、休暇・退勤計画と共用する。
-    # leaves は当日の休暇イベント（LeaveSchedule）。業務イベントの判定から休暇を外し、
-    # 決めた締切が休暇の時間帯に入っていたら休暇の外（終了時刻）へ後ろ倒しする。
-    #
-    # 出勤は「締切ベース」で決める: 打刻締切 = min(所定出勤時刻+ウィンドウ, 最初の業務イベント開始)、
-    # 目標 = 締切 − 揺らぎ（朝の起床時刻でクランプ）。
-    # 予定なしの日の範囲（所定〜所定+ウィンドウ）は従来と変わらない。
-    # 返り値: { target:, plan:(Plan or nil), deadline:, summary:(String), error:(String or nil),
-    #          leave_shifts:(Shift 配列) }
-    def plan_clock_in(date:, events:, leaves:, error: nil)
-      default = clock_in_deadline_at(date)
-      earliest = morning_wake_time(date) # アンカーの下限 兼 目標のクランプ下限
-      plan = nil
-
-      if !@config.calendar_enabled
-        # 連動OFFなら所定の締切（−揺らぎ）を使う（sukesan にはアクセスしない前提）。
-        deadline = default
-        summary = "カレンダー連動OFF（所定時刻）"
-        error = nil
-      elsif events.nil?
-        @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定出勤時刻へフォールバックします。")
-        deadline = default
-        summary = "sukesan 障害のため所定時刻へフォールバック"
-      else
-        plan = ClockInPlanner.new(exclude_keywords: @config.calendar_clock_in_exclude_keywords)
-                             .plan(events: leaves.work_events, date: date, default_deadline: default,
-                                   earliest_at: earliest)
-        deadline = plan.deadline_at
-        summary =
-          if plan.source == :calendar
-            "採用: #{start_event_label(plan.adopted_event)}"
-          else
-            "所定時刻（#{plan.fallback_reason}）"
-          end
-        error = nil
-      end
-
-      # 締切が休暇の時間帯に入っていたら休暇の外へ後ろ倒しする（午前休の日に出勤が
-      # 休暇明けになる経路）。連動OFF・取得失敗時は休暇が空なので no-op。
-      deadline, shifts = leaves.push_after(deadline)
-      summary = "#{summary}／#{shifts.map(&:label).join('、')}" unless shifts.empty?
-
-      { target: in_target_at(deadline, date, earliest), plan: plan, deadline: deadline,
-        summary: summary, error: error, leave_shifts: shifts }
-    end
-
-    # 出勤の目標時刻 = 締切 − 揺らぎ。ただし朝の起床時刻より前には出さない（クランプ）。
-    # 締切は下限（＝起床時刻）ちょうどまで下がりうるため、そこから揺らぎを引くと起床前になり、
-    # 「ウィンドウ − wake_lead > grace」の設定では起床した時点で既に grace 超過＝出勤が
-    # 恒久スキップになってしまう。クランプは連動OFF・取得失敗の経路にも一律で適用する
-    # （それらは締切が所定+ウィンドウなので実質 no-op）。
-    def in_target_at(deadline, date, earliest)
-      [apply_jitter_before(deadline, date, :in), earliest].max
-    end
-
-    # 退勤の目標時刻を計算する。events は取得済みイベント配列
-    # （nil は未取得＝連動OFF、または取得失敗。失敗時は error にメッセージ）。
-    # 取得自体は呼び出し側が fetch_events で行い、休暇・出勤計画と共用する。
-    # leaves は当日の休暇イベント（LeaveSchedule）。業務イベントの判定から休暇を外し、
-    # 決めた基準が休暇の時間帯に入っていたら休暇の外（開始時刻）へ前倒しする。
-    # 返り値: { target:, plan:(Plan or nil), base:, summary:(String), error:(String or nil),
-    #          leave_shifts:(Shift 配列) }
-    def plan_clock_out(date:, events:, leaves:, error: nil)
-      default = clock_out_default_at(date)
-      plan = nil
-
-      if !@config.calendar_enabled
-        # 連動OFFなら所定時刻（+揺らぎ）を使う（sukesan にはアクセスしない前提）。
-        base = default
-        summary = "カレンダー連動OFF（所定時刻）"
-        error = nil
-      elsif events.nil?
-        @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定退勤時刻へフォールバックします。")
-        base = default
-        summary = "sukesan 障害のため所定時刻へフォールバック"
-      else
-        plan = ClockOutPlanner.new(exclude_keywords: @config.calendar_exclude_keywords)
-                              .plan(events: leaves.work_events, date: date, default_clock_out: default)
-        base = plan.target_at
-        summary =
-          if plan.source == :calendar
-            "採用: #{event_label(plan.adopted_event)}"
-          else
-            "所定時刻（#{plan.fallback_reason}）"
-          end
-        error = nil
-      end
-
-      # 基準が休暇の時間帯に入っていたら休暇の外へ前倒しする（午後休の日に退勤が
-      # 休暇の開始になる経路）。基準を先に決めてから押し出すのが肝で、休暇の後ろに
-      # 業務イベントがある日（中抜け）は基準がそのイベントの終了になり押し出しは起きない。
-      base, shifts = leaves.push_before(base)
-      summary = "#{summary}／#{shifts.map(&:label).join('、')}" unless shifts.empty?
-
-      jittered = apply_jitter(base, date, :out)
-      target = out_target_at(jittered, base, date)
-      summary = "#{summary}／揺らぎ後 #{hhmm(jittered, base: base)} が翌日になるため基準時刻に戻す" if target != jittered
-
-      { target: target, plan: plan, base: base,
-        summary: summary, error: error, leave_shifts: shifts }
-    end
-
-    # 退勤の目標時刻 = 基準 + 揺らぎ。ただし揺らぎ後が翌日に出る日は揺らぎを落として基準そのものにする。
-    # 目標が翌日に出ると、日付が変わった最初の tick で当日の計画が破棄される（start_new_day）ため
-    # その日の退勤は必ず未打刻になる。基準（base）が当日内でも「基準+揺らぎ」は翌日に跨りうる
-    # （実測: 23:59 終了のイベント + clock_out_window 5分 で 12日サンプル中8日が翌日になった。
-    #  例 2026-07-10 は揺らぎ183秒で翌日 00:02:03）。設定由来の跨ぎは Config が起動時に弾くが、
-    # カレンダー由来はここで押さえる必要がある。
-    #
-    # 「当日内に収める」（23:59:59 で頭を押さえる）のでは足りない。fire_due_punches は
-    # 目標到達後（now >= target）に発火し、tick は daemon.tick_seconds（既定30秒）間隔なので、
-    # 目標が日付変更の直前だと発火機会がほぼ無く、tick の位相次第で結局打刻されない
-    # （23:59:59 なら窓は1秒＝30通りの位相のうち1通りだけ。基準 23:59:00 に戻せば窓は60秒になり
-    #  どの位相でも1回は tick が入る）。揺らぎの忠実さより「そもそも打刻されること」を優先する。
-    #
-    # 基準は「最終業務イベントの終了（または所定退勤時刻）」なので、そこへ落としても
-    # target >= base（退勤基準より前には打刻しない）は等号で保たれる。揺らぎは日付と kind から
-    # 決まる決定論的な値のままで、この分岐も基準が同じなら同じ結果になるため
-    # 「再取得のたびに目標がブレない」不変条件も壊さない。
-    # 基準自体が 23:59:59 付近だと窓は縮むが、それはイベントの終了時刻そのものが
-    # 日付変更の直前という打つ手のない縮退ケース。
-    def out_target_at(jittered, base, date) = jittered.to_date == date ? jittered : base
-
-    # 基準時刻に「日毎・kind毎に固定した揺らぎ秒」を足す（退勤: 基準は下限なので後ろへずらす）。
-    def apply_jitter(base_time, date, kind) = base_time + jitter_seconds(date, kind)
-
-    # 締切から「日毎・kind毎に固定した揺らぎ秒」を引く（出勤: 基準は締切なので手前へずらす）。
-    def apply_jitter_before(deadline, date, kind) = deadline - jitter_seconds(date, kind)
-
-    # 日毎・kind毎に固定した揺らぎ秒。定期再取得のたびに目標がブレないよう、
-    # 日付とkindから決定論的に決める（このシードの導出は変えないこと＝目標時刻を動かさないこと）。
-    # 起点は「その日の JST 午前0時」。Date#to_time はローカルタイムゾーン依存なので使わない
-    # （TZ が JST 以外の環境では同じ日でも別の揺らぎになり、「日付・時刻ロジックはすべて JST 基準」
-    #  という不変条件から外れる。旅行先で Mac の TZ を変えると当日の目標が動く／CI が落ちる）。
-    # JST 環境では Date#to_time と同値なので、既存の目標時刻は変わらない（366日分で実測確認済み）。
-    def jitter_seconds(date, kind)
-      window = kind == :in ? @config.clock_in_window : @config.clock_out_window
-      return 0 unless window.positive?
-
-      day_start = Time.new(date.year, date.month, date.day, 0, 0, 0, Ak4Punch::JST)
-      seed = day_start.to_i ^ KIND_SALT.fetch(kind)
-      Random.new(seed).rand(0..(window * 60))
-    end
-
-    def clock_in_default_at(date) = time_on(date, @config.clock_in_time)
-    def clock_out_default_at(date) = time_on(date, @config.clock_out_time)
-
-    # 所定の出勤締切 = 所定出勤時刻 + ウィンドウ分。カレンダー由来の締切がなければこれを使う
-    # （目標は締切 −0〜ウィンドウ分になるので、範囲は従来の「所定 +0〜ウィンドウ分」と同じ）。
-    def clock_in_deadline_at(date) = clock_in_default_at(date) + (@config.clock_in_window * 60)
-
-    def time_on(date, hhmm)
-      h, m = hhmm.split(":").map(&:to_i)
-      Time.new(date.year, date.month, date.day, h, m, 0, Ak4Punch::JST)
-    end
-
-    def event_label(event)
-      return "(不明なイベント)" if event.nil?
-
-      "#{event.display_title} 〜#{event.ends_at.strftime('%H:%M')}"
-    end
-
-    # 出勤側のログ用ラベル（アンカーは開始時刻なので開始を出す）。
-    def start_event_label(event)
-      return "(不明なイベント)" if event.nil?
-
-      "#{event.display_title} #{event.starts_at.strftime('%H:%M')}〜"
     end
 
     def label(kind) = KIND_LABELS.fetch(kind)
