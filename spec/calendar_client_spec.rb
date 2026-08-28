@@ -237,12 +237,13 @@ RSpec.describe Ak4Punch::CalendarClient do
         expect(events[1].all_day).to be false
       end
 
-      it "id と location の型は検証しない（id は数値で返る可能性があり location は保持のみ）" do
+      # location のように Event が保持しないキーは、型が何であっても素通りする
+      # （実在の応答にはあるが本アプリでは使わないため、検証も保持もしない）。
+      it "id の型は検証しない（数値で返る可能性がある）。使わないキーは型を問わず無視する" do
         stub_body({ events: [{ id: 12_345, title: "会議", location: 3,
                                ends_at: "2026-07-10T18:00:00+09:00", all_day: false }] }.to_json)
         ev = client.events(date: date).first
         expect(ev.id).to eq 12_345
-        expect(ev.location).to eq 3
         expect(ev.ends_at).to eq Time.new(2026, 7, 10, 18, 0, 0, "+09:00")
       end
     end

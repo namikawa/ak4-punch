@@ -32,7 +32,7 @@ module Ak4Punch
     end
 
     def enabled?
-      !@webhook_url.nil? && !@webhook_url.to_s.strip.empty?
+      !Ak4Punch.blank?(@webhook_url)
     end
 
     # メッセージを送信する。無効時は何もしない。失敗しても例外は上げない。
@@ -65,12 +65,7 @@ module Ak4Punch
     # warn_on_failure: true のときだけ失敗を warn ログに出す。
     def deliver(message, warn_on_failure:)
       uri = URI(@webhook_url)
-      # ホストは URI#hostname（IPv6 の角括弧を外した形）を渡す。URI#host は "[::1]" を返し、
-      # Net::HTTP がそのまま getaddrinfo に渡して名前解決に失敗する（CalendarClient#send_request 参照）。
-      http = Net::HTTP.new(uri.hostname, uri.port)
-      http.use_ssl = uri.scheme == "https"
-      http.open_timeout = @open_timeout
-      http.read_timeout = @read_timeout
+      http = Ak4Punch::Http.build(uri, open_timeout: @open_timeout, read_timeout: @read_timeout)
 
       req = Net::HTTP::Post.new(uri)
       req["Content-Type"] = "application/json"

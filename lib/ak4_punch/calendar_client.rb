@@ -31,8 +31,8 @@ module Ak4Punch
     #   title             … LeaveSchedule のキーワード判定（include?）と display_title（empty?）
     #   starts_at/ends_at … parse_time が Time.iso8601 に渡す（rescue は ArgumentError のみなので
     #                       数値だと TypeError が素通しし、定期再取得が毎 tick 例外になる）
-    # id と location は意図的に検証しない: id は数値で返る可能性があり、location は保持するだけで
-    # 型に依存した処理をしていない（実在の応答を弾かない側に倒す）。
+    # id は意図的に検証しない: 数値で返る可能性があり、型に依存した処理もしていない
+    # （実在の応答を弾かない側に倒す）。
     # キー自体が無い場合は nil 扱いで正常（実際に starts_at を持たない応答がある）。
     STRING_FIELDS = %w[title starts_at ends_at].freeze
 
@@ -57,7 +57,7 @@ module Ak4Punch
     TIME_FIELDS = %w[starts_at ends_at].freeze
 
     # 1件のイベント。時刻は JST に正規化済みの Time または nil。
-    Event = Struct.new(:id, :title, :starts_at, :ends_at, :location, :all_day, keyword_init: true) do
+    Event = Struct.new(:id, :title, :starts_at, :ends_at, :all_day, keyword_init: true) do
       # ログ・CLI 表示用のタイトル。nil と空文字はプレースホルダに置き換える。
       def display_title = title.nil? || title.empty? ? "(タイトルなし)" : title
     end
@@ -134,9 +134,11 @@ module Ak4Punch
       invalid_response!("events[#{index}].all_day が真偽値ではありません: #{summarize(all_day)}")
     end
 
-    # parse_time が nil として扱う値（nil・空文字・空白のみ）。判定を parse_time と揃えること
-    # （食い違うと「検証は通るのに parse_time が nil にする」あるいはその逆が起きる）。
-    def blank_time?(value) = value.nil? || value.to_s.strip.empty?
+    # parse_time が nil として扱う値（nil・空文字・空白のみ）。
+    # parse_time と同じ述語（Ak4Punch.blank?）を共有しているので判定は食い違わない。
+    # 別々に書くと「検証は通るのに parse_time が nil にする」あるいはその逆が起きるため、
+    # 片方だけ条件を変えないこと（変えるなら Ak4Punch.blank? を両方が使う形を保つ）。
+    def blank_time?(value) = Ak4Punch.blank?(value)
 
     # 時刻フィールドが不正な理由（正常なら nil）。メッセージに埋めて位置と併せて示す。
     def time_field_error(value)
@@ -180,7 +182,6 @@ module Ak4Punch
         title: raw["title"],
         starts_at: parse_time(raw["starts_at"]),
         ends_at: parse_time(raw["ends_at"]),
-        location: raw["location"],
         all_day: raw["all_day"] == true,
       )
     end
@@ -190,7 +191,7 @@ module Ak4Punch
     # +09:00 以外のオフセットで届く。そのまま下流に渡すと to_date が JST の日付とずれ、
     # 当日判定（ClockOutPlanner）や表示が狂うので、境界であるここで揃えておく。
     def parse_time(str)
-      return nil if str.nil? || str.to_s.strip.empty?
+      return nil if Ak4Punch.blank?(str)
 
       Time.iso8601(str).getlocal(Ak4Punch::JST)
     rescue ArgumentError
@@ -198,7 +199,7 @@ module Ak4Punch
     end
 
     def request(path)
-      raise ApiError, "sukesan APIキー(SUKESAN_API_KEY)が未設定です" if @api_key.nil? || @api_key.to_s.strip.empty?
+      raise ApiError, "sukesan APIキー(SUKESAN_API_KEY)が未設定です" if Ak4Punch.blank?(@api_key)
 
       attempt = 0
       begin
@@ -216,18 +217,9 @@ module Ak4Punch
     end
 
     # 1回分の HTTP 取得。通信エラーは一過性(TransientError)としてラップする。
-    #
-    # Net::HTTP に渡すホストは URI#host ではなく URI#hostname（IPv6 の角括弧を外した形）にすること。
-    # URI#host は IPv6 を "[::1]" と角括弧付きで返し、Net::HTTP.new("[::1]", 3000) は
-    # getaddrinfo が失敗して Socket::ResolutionError になる（hostname なら "::1" が渡り接続できる）。
-    # sukesan はループバック運用で SUKESAN_BASE_URL に http://[::1]:3000 を設定できるため、
-    # ここが実害の当事者になる。通常のホスト名では host == hostname で挙動は変わらない。
     def send_request(path)
       uri = URI("#{@base_url.chomp('/')}#{path}")
-      http = Net::HTTP.new(uri.hostname, uri.port)
-      http.use_ssl = uri.scheme == "https"
-      http.open_timeout = @open_timeout
-      http.read_timeout = @read_timeout
+      http = Ak4Punch::Http.build(uri, open_timeout: @open_timeout, read_timeout: @read_timeout)
       # Net::HTTP は既定 max_retries=1 で、ReadTimeout/EOFError/ECONNRESET 等では
       # ここで暗黙に1回再試行する（バックオフなし）。本クラスの request のリトライと二重になり
       # 実リクエストが最大6回になるのを防ぐため、内蔵リトライは無効化して制御を一本化する。

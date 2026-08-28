@@ -17,7 +17,7 @@ RSpec.describe Ak4Punch::ClockInPlanner do
   def event(title:, starts_at:, ends_at: nil, all_day: false, id: nil)
     Ak4Punch::CalendarClient::Event.new(
       id: id || "e#{starts_at&.to_i}#{title}",
-      title: title, starts_at: starts_at, ends_at: ends_at, location: nil, all_day: all_day,
+      title: title, starts_at: starts_at, ends_at: ends_at, all_day: all_day,
     )
   end
 

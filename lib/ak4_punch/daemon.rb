@@ -55,7 +55,7 @@ module Ak4Punch
     #   out_target: そのとき計算した休暇反映後の退勤目標
     #   fetched_at: 取得した時刻（ログ・通知で「いつ時点の情報か」を示す）
     # 各 target が「実際に採用された @punch_plans[kind].target_at」ではないのが肝。
-    # 日中に休暇が入って新目標が到達不能になった日は、set_in_plan/set_out_plan が更新を見送って
+    # 日中に休暇が入って新目標が到達不能になった日は、set_plan が更新を見送って
     # 旧目標（休暇を知らない目標）が残る。まさにその日を止めるための情報なので、
     # 採用されたかどうかに関わらず「休暇を反映して計算した目標」を持っておく必要がある。
     LeaveSnapshot = Struct.new(:leaves, :in_target, :out_target, :fetched_at, keyword_init: true) do
@@ -290,8 +290,8 @@ module Ak4Punch
       end
 
       @leave_day = false # 再チェックで全休状態を解除できるよう毎回明示的に設定する
-      set_in_plan(in_plan, now)
-      set_out_plan(out, now)
+      set_plan(:in, in_plan, now)
+      set_plan(:out, out, now)
       @plan_date = today
     end
 
@@ -345,8 +345,8 @@ module Ak4Punch
       remember_leaves(leaves, in_plan, out, now)
       return if switch_to_full_leave?(leaves, in_plan, out)
 
-      set_in_plan(in_plan, now) if pending.include?(:in)
-      set_out_plan(out, now) if pending.include?(:out)
+      set_plan(:in, in_plan, now) if pending.include?(:in)
+      set_plan(:out, out, now) if pending.include?(:out)
     end
 
     # 打刻期限（目標時刻の窓の終端 ＝ 目標 + grace）。grace の解釈をここ1箇所に閉じ込める。
@@ -390,7 +390,7 @@ module Ak4Punch
     end
 
     # 打刻期限（punch_deadline_at）を過ぎていて、もう打刻できないか。
-    # fire_due_punches の give_up 発火条件そのものであり、set_in_plan / set_out_plan の
+    # fire_due_punches の give_up 発火条件そのものであり、set_plan の
     # 「到達不能な新目標では更新を見送る」ガードの正しさは、この2つが同じ規則であることに
     # 依っている（片方だけ変えるとガードが黙って意味を失う）。必ずこの述語を共有すること。
     #
@@ -407,52 +407,20 @@ module Ak4Punch
       now > punch_deadline_at(target)
     end
 
-    # 出勤計画を @punch_plans[:in] に反映する（set_out_plan の鏡像）。
-    # 目標が同じなら完了・リトライ状態（done/attempted/last_error）を引き継ぎ、
-    # 目標が変わったらリセットする。final_checked は出勤では使わないため常に false。
-    #
-    # 既存計画の更新で、新目標が到達不能（unreachable_target?）なら更新せず既存の目標を維持する。
-    # 例: 9:40 に 9:00 開始の会議が追加されると新目標は 08:55 になるが、grace(10分)を
-    # 過ぎているので採用した瞬間に窓超過と判定され、出勤が恒久スキップ（give_up で done 確定）
-    # になってしまう。退勤側の「定期再取得の失敗で目標を巻き戻さない」と同じクラスの事故を防ぐ。
-    # 逆に grace 内の前倒しは採用する（同じ tick で打刻され「予定の開始までに打刻する」目的に適う）。
-    # 起動時の新規作成（既存計画なし）は、目標が過去でもそのまま計画する（従来どおり
-    # grace 内なら打刻し、超過していれば give_up の経路に乗せる）。
-    def set_in_plan(plan_result, now)
-      target = plan_result[:target]
-      existing = @punch_plans[:in]
-      same_target = !existing.nil? && existing.target_at == target
-
-      if existing && !same_target && unreachable_target?(target, now)
-        @logger.warn("出勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
-                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{plan_result[:summary]}）")
-        return
-      end
-
-      if existing && !same_target
-        @logger.info("出勤目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{plan_result[:summary]}）")
-      elsif existing.nil?
-        @logger.info("出勤目標を設定: #{fmt(target)}（#{plan_result[:summary]}）")
-      end
-
-      @punch_plans[:in] = PunchPlan.new(
-        kind: :in, target_at: target, done: same_target ? existing.done? : false,
-        attempted: same_target ? existing.attempted : false,
-        last_error: same_target ? existing.last_error : nil,
-        final_checked: false,
-      )
-    end
-
-    # 退勤計画を @punch_plans[:out] に反映する。
+    # 打刻計画を @punch_plans[kind] に反映する（出勤・退勤で規則は同一）。
     # 目標が同じなら完了・リトライ状態（done/attempted/last_error/final_checked）を引き継ぎ、
     # 目標が変わったらリセットする（新目標では改めて最終チェック→打刻の順で進む）。
     # done を目標一致でゲートするのは、断念（done）した目標の状態が別の目標に伝染して
     # 「打刻もされず起床予約もされない」計画になるのを防ぐため。
+    # final_checked は fire_due_punches が退勤にしか立てない（`kind == :out && !plan.final_checked`）
+    # ため、出勤の計画では常に false のままになる。両者で同じ式を使ってよいのはこのため。
     #
-    # 出勤と同じく、既存計画の更新で新目標が到達不能（unreachable_target?）なら見送る。
-    # 会議が短縮されて目標が前倒しされた場合は、これまでどおり grace 窓内で速やかに打刻する。
-    # 見送るのは「採用した瞬間に give_up にしかならない」場合だけ。
-    # 例: 18:30-19:00 の会議で退勤目標が 19:01 の日に、18:45 にその会議が削除されると
+    # 既存計画の更新で、新目標が到達不能（unreachable_target?）なら更新せず既存の目標を維持する。
+    # 見送るのは「採用した瞬間に give_up にしかならない」場合だけで、これは出勤・退勤の両方で起きる。
+    # 出勤の例: 9:40 に 9:00 開始の会議が追加されると新目標は 08:55 になるが、grace(10分)を
+    # 過ぎているので採用した瞬間に窓超過と判定され、出勤が恒久スキップ（give_up で done 確定）
+    # になってしまう。「定期再取得の失敗で目標を巻き戻さない」と同じクラスの事故を防ぐ。
+    # 退勤の例: 18:30-19:00 の会議で退勤目標が 19:01 の日に、18:45 にその会議が削除されると
     # 新目標は所定へ戻って 18:01 になるが、grace を過ぎているので採用した瞬間に窓超過と
     # 判定され、退勤が打刻されないまま「目標 18:01／現在 18:45・44分超過」と通知される。
     # give_up は「Mac がスリープして窓を逃した」ときの誤時刻打刻ガードであり、デーモン自身の
@@ -460,25 +428,29 @@ module Ak4Punch
     # 既存目標（19:01）で打刻すると記録は遅れるが、正解の 18:00 は既に過ぎていて AKASHI は
     # 遡って打刻できない以上どの選択肢でも誤記録になるため、打刻されず手動対応を強いるより
     # 既存目標で打刻する方を採る。
-    def set_out_plan(out, now)
-      target = out[:target]
-      existing = @punch_plans[:out]
+    # 逆に grace 内の前倒しは採用する（同じ tick で打刻され「予定の開始までに打刻する」目的に適う。
+    # 会議が短縮されて目標が前倒しされた場合も、これまでどおり grace 窓内で速やかに打刻する）。
+    # 起動時の新規作成（既存計画なし）は、目標が過去でもそのまま計画する（従来どおり
+    # grace 内なら打刻し、超過していれば give_up の経路に乗せる）。
+    def set_plan(kind, plan_result, now)
+      target = plan_result[:target]
+      existing = @punch_plans[kind]
       same_target = !existing.nil? && existing.target_at == target
 
       if existing && !same_target && unreachable_target?(target, now)
-        @logger.warn("退勤目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
-                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{out[:summary]}）")
+        @logger.warn("#{label(kind)}目標の更新を見送ります（新目標 #{fmt(target)} は既に打刻期限切れ）。" \
+                     "現在の目標 #{fmt(existing.target_at)} を維持します（#{plan_result[:summary]}）")
         return
       end
 
       if existing && !same_target
-        @logger.info("退勤目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{out[:summary]}）")
+        @logger.info("#{label(kind)}目標を更新: #{fmt(existing.target_at)} → #{fmt(target)}（#{plan_result[:summary]}）")
       elsif existing.nil?
-        @logger.info("退勤目標を設定: #{fmt(target)}（#{out[:summary]}）")
+        @logger.info("#{label(kind)}目標を設定: #{fmt(target)}（#{plan_result[:summary]}）")
       end
 
-      @punch_plans[:out] = PunchPlan.new(
-        kind: :out, target_at: target, done: same_target ? existing.done? : false,
+      @punch_plans[kind] = PunchPlan.new(
+        kind: kind, target_at: target, done: same_target ? existing.done? : false,
         attempted: same_target ? existing.attempted : false,
         last_error: same_target ? existing.last_error : nil,
         final_checked: same_target ? existing.final_checked : false,
@@ -638,8 +610,8 @@ module Ak4Punch
       # 「現在が休暇の時間帯か」より先に置くこと（順序を逆にすると中抜けの日の退勤を落とす）。
       if out[:target] > now
         @logger.info("退勤直前チェック: 目標が後ろ倒しされたため打刻を延期します")
-        # 新目標は now より後（上のガードで確認済み）なので、set_out_plan の到達不能ガードには掛からない。
-        set_out_plan(out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
+        # 新目標は now より後（上のガードで確認済み）なので、set_plan の到達不能ガードには掛からない。
+        set_plan(:out, out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
         return true
       end
 
@@ -703,7 +675,7 @@ module Ak4Punch
     # 午後休は「休暇の開始+揺らぎ」なので、目標自体が休暇の時間帯の中に入る）。
     # 不一致は「休暇を知らない古い目標を持っている」ことの証拠なので中止する。
     # これで次の3つが kind を問わず同じ規則で塞がる:
-    #   ① 日中に休暇が入り、新目標が到達不能で set_in_plan/set_out_plan が更新を見送った日
+    #   ① 日中に休暇が入り、新目標が到達不能で set_plan が更新を見送った日
     #   ② recheck 直後の取得失敗で、所定フォールバックの計画に作り直された日（全休日・半休日とも）
     #   ③ 打刻失敗のリトライ中に定期再取得で休暇を把握した日（退勤の直前チェックを通らない経路）
     # snapshot が無い日（当日一度も取得に成功していない）は判定材料がないので打刻する。

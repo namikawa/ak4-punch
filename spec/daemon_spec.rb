@@ -40,7 +40,7 @@ RSpec.describe Ak4Punch::Daemon do
   def event(title:, ends_at:, starts_at: nil, all_day: false, id: nil)
     Ak4Punch::CalendarClient::Event.new(
       id: id || "e#{title}", title: title, starts_at: starts_at, ends_at: ends_at,
-      location: nil, all_day: all_day,
+      all_day: all_day,
     )
   end
 
