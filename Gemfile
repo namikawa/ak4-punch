@@ -15,5 +15,5 @@ group :development, :test do
   # require できない）ので、webmock → crack の推移依存に頼らず明示する。
   gem "rexml", "~> 3.4"
   gem "rspec", "~> 3.13"
-  gem "webmock", "~> 3.20"
+  gem "webmock", "~> 3.26"
 end
