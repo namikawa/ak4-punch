@@ -2,7 +2,7 @@
 
 source "https://rubygems.org"
 
-# 下限は Gemfile.lock が要求する Ruby に合わせる（bundler 4.0.14 と public_suffix 7.0.5 が
+# 下限は Gemfile.lock が要求する Ruby に合わせる（bundler 4.0.20 と public_suffix 7.0.5 が
 # いずれも required_ruby_version >= 3.2）。開発・CI は .ruby-version（3.4.10）で確認。
 ruby ">= 3.2"
 
