@@ -14,7 +14,7 @@ RSpec.describe Ak4Punch::EnvFile do
     path
   end
 
-  it "日本語コメントを含む .env を US-ASCII ロケール（cron相当）でも壊れず読める" do
+  it "日本語コメントを含む .env を US-ASCII ロケール（launchd 相当）でも壊れず読める" do
     path = write_env(<<~ENV)
       # 企業ID（日本語コメント：バイト列に注意）
       AK4_TEST_COMPANY='soldout'

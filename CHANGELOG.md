@@ -4,7 +4,9 @@
 
 ### 変更
 
-内部構造の整理のみで、打刻の挙動・ログ・Slack 通知・`punch plan` の出力は変えていない。
+内部構造の整理のみで、打刻の挙動・Slack 通知・`punch plan` の出力は変えていない
+（変わるのは下記2点だけ: sukesan 取得失敗の警告ログが2行から1行になること、
+`--dry-run` / `--force` が打刻コマンド専用のオプションになること）。
 
 - 打刻計画の計算（出勤締切・退勤基準・揺らぎ・休暇の押し出し・朝の起床時刻）を `Daemon` から
   `DayPlanner` へ切り出した。`config` と `logger` しか持たず可変状態がないため、同じ入力からは
@@ -37,6 +39,34 @@
 - `CalendarClient::Event` から `location` を削除した。代入されるだけで一度も参照されていなかった。
 - `WakeScheduler` で `Set` を明示的に require し（Ruby の暗黙 autoload に依存しない）、
   `reschedule` の無効化判定に公開メソッドの `disabled?` を使うようにした。
+- `Daemon` の `@leave_day` を撤去した。true にする箇所（初期計画の全休・日中の全休切り替え）は
+  いずれも `@punch_plans` を空にしており、参照していた2つのガードは直後の「計画がなければ
+  何もしない」判定と同じ結果になるため、同じ状態を二重に持っていた。「打刻計画なし」（非対象日・
+  全休）を表す状態は空の `@punch_plans` だけになった。
+- sukesan 取得失敗の警告ログを `DayPlanner#call` で1回だけ出すようにした。従来は出勤・退勤の
+  計画それぞれで「所定出勤時刻へフォールバックします」「所定退勤時刻へフォールバックします」の
+  2行が出ていた。取得失敗のメッセージも `ClockInResult` / `ClockOutResult` が同じ値を持つのをやめ、
+  日単位の `DayPlan#error` に一元化した。
+- `DayPlanner` の出勤・退勤で同型だった「連動OFF / 取得失敗 / Planner 実行」の3分岐を
+  `fallback_summary` に切り出した。ログに出る判断根拠の要約の文言は従来どおり。
+- `--dry-run` / `--force` を全コマンド共通の `class_option` から `clock_in` / `clock_out` の
+  `method_option` へ移した。参照するのは打刻の実行経路だけなので、他コマンドの `--help` には
+  出なくなる。併せて、他コマンド（`plan` / `status` / `recheck` など）にこの2つを渡した場合は
+  従来の黙って無視する挙動ではなく、Thor が引数として扱って usage を表示して終了するようになる
+  （打刻コマンドに渡したときの挙動は変わらない）。
+- 到達しないコードを削除した: 常に配列である `LeaveSchedule#periods` と `leave_shifts` への
+  nil ガード、常に配列を渡される `Array(events)`、参照されていない `TokenStore#path`、
+  および呼び出し1箇所だけの委譲メソッド（`Config#blank?` / `CalendarClient#blank_time?` /
+  各 Planner の `excluded_by_keyword?` / `DayPlanner` の `apply_jitter` など）。
+- 同じ機序を複数箇所に書いていたコメントを1箇所へ寄せた（目標時刻の計算は `Daemon` 冒頭から
+  `DayPlanner` を参照する1行に、「計画日の終端を 23:59:59 にすると当日の最終1秒が期限外になる」は
+  `end_of_plan_day` に、`execute_punch` が壁時計の日付を渡していた頃の経緯は lib 側だけに）。
+- 廃止済みの cron への言及を launchd に直した（UTF-8 固定・stdout の即時フラッシュが必要な理由は
+  launchd でもそのまま当てはまる）。
+- spec の重複を整理した。`Daemon` の生成・`Config` の組み立て・打刻の期待引数をヘルパに集約し、
+  各 spec が個別に持っていた `t()` / `event()` を `spec/spec_helper.rb` の `SpecHelpers` へ移した。
+  同一シナリオで assertion だけが違うテストは1本に統合し、370 examples から 362 examples になった
+  （検証している内容は減っていない）。
 
 ## [1.0.2] - 2026-08-28
 

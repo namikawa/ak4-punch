@@ -3,11 +3,15 @@
 require "spec_helper"
 
 RSpec.describe Ak4Punch::Config do
+  # 既定値（未設定時）の一覧。同時に「既定値だけで validate! を通る」ことの検証も兼ねる
+  # （所定時刻の書式・出勤締切 < 退勤・翌日跨ぎのいずれにも掛からない）。
   it "既定値を持つ" do
     cfg = described_class.new(data: { "company_id" => "soldout" }, root: Dir.pwd)
     expect(cfg.company_id).to eq "soldout"
     expect(cfg.clock_in_time).to eq "09:30"
     expect(cfg.clock_out_time).to eq "18:00"
+    expect(cfg.clock_in_window).to eq 0
+    expect(cfg.clock_out_window).to eq 0
     expect(cfg.weekdays_only).to be true
     expect(cfg.skip_japanese_holidays).to be true
     expect(cfg.check_existing).to be true
@@ -40,12 +44,6 @@ RSpec.describe Ak4Punch::Config do
       expect(cfg.clock_in_time).to eq "9:30"
       expect(cfg.clock_out_time).to eq "23:59"
       expect(cfg_with("clock_in" => "00:00", "clock_out" => "09:30").clock_in_time).to eq "00:00"
-    end
-
-    it "既定値（未設定時）も検証を通る" do
-      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
-      expect(cfg.clock_in_time).to eq "09:30"
-      expect(cfg.clock_out_time).to eq "18:00"
     end
 
     it "時が範囲外ならエラー（どのキーがどの値で不正か分かる）" do
@@ -146,12 +144,6 @@ RSpec.describe Ak4Punch::Config do
       cfg = cfg_with("clock_out" => "23:58", "clock_out_window" => 1)
       expect(cfg.clock_out_window).to eq 1
     end
-
-    it "既定値（09:30/18:00・ウィンドウ0）は受理する" do
-      cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
-      expect(cfg.clock_in_time).to eq "09:30"
-      expect(cfg.clock_out_time).to eq "18:00"
-    end
   end
 
   describe "token.refresh_threshold_days の検証" do
@@ -214,7 +206,6 @@ RSpec.describe Ak4Punch::Config do
       cfg = described_class.new(data: { "company_id" => "x" }, root: Dir.pwd)
       expect(cfg.calendar_enabled).to be false
       expect(cfg.calendar_exclude_keywords).to eq described_class::DEFAULT_EXCLUDE_KEYWORDS
-      expect(cfg.calendar_clock_in_exclude_keywords).to eq described_class::DEFAULT_CLOCK_IN_EXCLUDE_KEYWORDS
       expect(cfg.calendar_clock_in_exclude_keywords).to eq %w[移動 私用]
       expect(cfg.calendar_refresh_interval_minutes).to eq 15
       expect(cfg.calendar_refresh_failure_notify_threshold).to eq 3

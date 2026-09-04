@@ -43,7 +43,8 @@ module Ak4Punch
       excluded = []
       adopted = nil
       considered.reverse_each do |ev|
-        if excluded_by_keyword?(ev)
+        # title が nil のイベントは除外しない（業務扱い）。部分一致で判定（規則は TitleKeywords）。
+        if TitleKeywords.match?(ev.title, @exclude_keywords)
           excluded << ev
           next
         end
@@ -82,12 +83,9 @@ module Ak4Punch
 
     # 対象: all_day:false かつ ends_at 非null かつ ends_at の日付が当日。
     def target_events(events, date)
-      Array(events).select do |ev|
+      events.select do |ev|
         !ev.all_day && !ev.ends_at.nil? && ev.ends_at.to_date == date
       end
     end
-
-    # title が nil のイベントは除外しない（業務扱い）。部分一致で判定（規則は TitleKeywords）。
-    def excluded_by_keyword?(event) = TitleKeywords.match?(event.title, @exclude_keywords)
   end
 end

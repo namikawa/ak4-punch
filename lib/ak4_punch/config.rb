@@ -154,8 +154,8 @@ module Ak4Punch
     end
 
     def validate!
-      raise Error, "企業ID(AK4_COMPANY_ID)が未設定です。.env に設定してください。" if blank?(@company_id)
-      raise Error, "エンドポイント(base_url)が未設定です。" if blank?(@base_url)
+      raise Error, "企業ID(AK4_COMPANY_ID)が未設定です。.env に設定してください。" if Ak4Punch.blank?(@company_id)
+      raise Error, "エンドポイント(base_url)が未設定です。" if Ak4Punch.blank?(@base_url)
       validate_urls!
       validate_time!("work.clock_in", @clock_in_time)
       validate_time!("work.clock_out", @clock_out_time)
@@ -177,7 +177,7 @@ module Ak4Punch
     def validate_urls!
       validate_https_url!("AK4_BASE_URL(base_url)", @base_url)
       # Slack は未設定・空文字が正常（通知機能が無効になるだけ）なので、設定時のみ検証する。
-      validate_https_url!("SLACK_WEBHOOK_URL", @slack_webhook_url) unless blank?(@slack_webhook_url)
+      validate_https_url!("SLACK_WEBHOOK_URL", @slack_webhook_url) unless Ak4Punch.blank?(@slack_webhook_url)
       validate_sukesan_url!
     end
 
@@ -310,7 +310,6 @@ module Ak4Punch
       raise Error, "#{key} の時刻指定が不正です（HH:MM 形式で指定してください）: #{value}"
     end
 
-    def blank?(value) = Ak4Punch.blank?(value)
     def to_date(value) = value.is_a?(Date) ? value : Date.parse(value.to_s)
 
     # 分を 0..MAX_WINDOW_MINUTES に丸める（負値は0、上限超過は上限）。
