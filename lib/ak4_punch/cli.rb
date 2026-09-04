@@ -21,13 +21,14 @@ module Ak4Punch
     def self.exit_on_failure? = true
 
     class_option :config, type: :string, desc: "config.yml のパス（既定: <root>/config/config.yml）"
-    class_option :dry_run, type: :boolean, default: false, desc: "POST せず動作予定のみ表示"
-    class_option :force, type: :boolean, default: false, desc: "対象日判定・重複チェックを無視して打刻"
 
-    # 出勤/退勤共通のランダム打刻オプション。
+    # 出勤/退勤共通の打刻オプション（参照するのは run_punch / resolve_window だけなので、
+    # 全コマンド共通の class_option ではなく打刻コマンドの method_option として持たせる）。
     def self.punch_options
       method_option :window, type: :numeric,
                              desc: "指定時刻から N 分以内のランダムな時刻に打刻（0=ちょうど・最大#{Config::MAX_WINDOW_MINUTES}）"
+      method_option :dry_run, type: :boolean, default: false, desc: "POST せず動作予定のみ表示"
+      method_option :force, type: :boolean, default: false, desc: "対象日判定・重複チェックを無視して打刻"
     end
 
     desc "clock_in", "出勤(type=11)を打刻する"
@@ -342,7 +343,7 @@ module Ak4Punch
     # 半休の日（通常の計画を表示する日）でも必ず併記する。
     def print_leave_periods(day)
       periods = day.leaves.periods
-      return if periods.nil? || periods.empty?
+      return if periods.empty?
 
       puts "[休暇として扱ったイベント]"
       periods.each { |p| puts "  #{p.range_label} #{p.event.display_title}" }
@@ -354,8 +355,8 @@ module Ak4Punch
     def print_out_plan(day, cfg)
       puts "[退勤]"
       plan = day.clock_out.plan
-      if day.clock_out.error
-        puts "カレンダー取得: 失敗（#{day.clock_out.error}）→ 所定退勤時刻へフォールバック"
+      if day.error
+        puts "カレンダー取得: 失敗（#{day.error}）→ 所定退勤時刻へフォールバック"
       elsif !cfg.calendar_enabled
         puts "カレンダー連動: OFF（config の calendar.enabled=false）→ 所定退勤時刻"
       elsif plan
@@ -382,8 +383,8 @@ module Ak4Punch
     def print_in_plan(day, cfg)
       puts "[出勤]"
       plan = day.clock_in.plan
-      if day.clock_in.error
-        puts "カレンダー取得: 失敗（#{day.clock_in.error}）→ 所定出勤時刻へフォールバック"
+      if day.error
+        puts "カレンダー取得: 失敗（#{day.error}）→ 所定出勤時刻へフォールバック"
       elsif !cfg.calendar_enabled
         puts "カレンダー連動: OFF（config の calendar.enabled=false）→ 所定出勤時刻"
       elsif plan
@@ -405,7 +406,7 @@ module Ak4Punch
       adopted = plan&.adopted_event
       shifts = day.clock_in.leave_shifts
       note =
-        if shifts && !shifts.empty?
+        if !shifts.empty?
           "休暇の時間帯の外へ後ろ倒し"
         elsif adopted && deadline == adopted.starts_at
           "採用イベントの開始"
@@ -420,7 +421,7 @@ module Ak4Punch
 
     # 休暇による押し出しの根拠（どのイベントで、どこからどこへ動かしたか）。
     def print_leave_shifts(shifts)
-      Array(shifts).each { |s| puts "  #{s.label}" }
+      shifts.each { |s| puts "  #{s.label}" }
     end
 
     # 判定に使ったイベント一覧を採否のマーク付きで出力する（出勤・退勤で共通）。

@@ -22,7 +22,7 @@ module Ak4Punch
       )
     end
 
-    attr_reader :token, :expired_at, :path
+    attr_reader :token, :expired_at
 
     def initialize(path:, token:, expired_at:, threshold_days: 7)
       @path = path

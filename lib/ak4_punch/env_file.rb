@@ -9,7 +9,7 @@ module Ak4Punch
     def load(path)
       return unless File.exist?(path)
 
-      # cron 等の US-ASCII ロケールでも日本語コメントで壊れないよう UTF-8 で読む。
+      # launchd 等の US-ASCII ロケールでも日本語コメントで壊れないよう UTF-8 で読む。
       File.readlines(path, encoding: "UTF-8").each do |line|
         line = line.strip
         next if line.empty? || line.start_with?("#")

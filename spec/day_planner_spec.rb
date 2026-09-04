@@ -3,12 +3,6 @@
 require "spec_helper"
 
 RSpec.describe Ak4Punch::DayPlanner do
-  # 当日(2026-07-10 金曜)の HH:MM:SS を JST の Time にする
-  def t(hhmm, sec = 0, day: 10)
-    h, m = hhmm.split(":").map(&:to_i)
-    Time.new(2026, 7, day, h, m, sec, "+09:00")
-  end
-
   let(:date) { Date.new(2026, 7, 10) }
 
   # 揺らぎ0で目標時刻が所定/イベント終了ちょうどになるよう window=0 の設定を使う
@@ -27,13 +21,6 @@ RSpec.describe Ak4Punch::DayPlanner do
   let(:logger) { instance_double(Logger, info: nil, warn: nil, error: nil) }
 
   subject(:planner) { described_class.new(config: config, logger: logger) }
-
-  def event(title:, ends_at:, starts_at: nil, all_day: false, id: nil)
-    Ak4Punch::CalendarClient::Event.new(
-      id: id || "e#{title}", title: title, starts_at: starts_at, ends_at: ends_at,
-      all_day: all_day,
-    )
-  end
 
   # 「休暇」イベントは『その時間帯は勤務しない』の意味。打刻の基準時刻がその時間帯に
   # 入っていたら休暇の外へ押し出す（出勤＝終了へ後ろ倒し／退勤＝開始へ前倒し）。
@@ -141,7 +128,7 @@ RSpec.describe Ak4Punch::DayPlanner do
       )
     end
 
-    # 日毎・kind毎に固定の揺らぎ秒（式は spec_helper の JitterHelper に集約）
+    # 日毎・kind毎に固定の揺らぎ秒（式は spec_helper の SpecHelpers に集約）
     def jitter(kind, window: 5, day: 10)
       jitter_seconds_for(Date.new(2026, 7, day), kind, window)
     end
@@ -256,11 +243,10 @@ RSpec.describe Ak4Punch::DayPlanner do
     # 連動OFF のとき呼び出し側（Daemon・CLI）は sukesan を取得せず events: nil を渡す。
     it "plan なし・error なし・所定時刻を返す" do
       day = planner.call(date: date, events: nil)
+      expect(day.error).to be_nil
       expect(day.clock_out.plan).to be_nil
-      expect(day.clock_out.error).to be_nil
       expect(day.clock_out.target).to eq t("18:00")
       expect(day.clock_in.plan).to be_nil
-      expect(day.clock_in.error).to be_nil
       expect(day.clock_in.target).to eq t("09:30")
     end
   end
@@ -292,7 +278,7 @@ RSpec.describe Ak4Punch::DayPlanner do
       expect(day.clock_in.plan.adopted_event.title).to eq "定例会議"
       expect(day.clock_in.deadline).to eq t("09:00")
       expect(day.clock_in.target).to eq t("09:00") # window=0 なので揺らぎなし
-      expect(day.clock_in.error).to be_nil
+      expect(day.error).to be_nil
     end
 
     it "morning_wake_at 未設定なら下限が所定出勤時刻になり、朝の予定はアンカーにならない" do
@@ -306,9 +292,8 @@ RSpec.describe Ak4Punch::DayPlanner do
 
     it "取得失敗（events なし + error あり）は error を持ち所定時刻へフォールバック" do
       day = planner.call(date: date, events: nil, error: "接続拒否")
-      expect(day.clock_out.error).to include "接続拒否"
+      expect(day.error).to include "接続拒否"
       expect(day.clock_out.target).to eq t("18:00")
-      expect(day.clock_in.error).to include "接続拒否"
       expect(day.clock_in.target).to eq t("09:30")
     end
   end

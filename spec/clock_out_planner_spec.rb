@@ -8,19 +8,6 @@ RSpec.describe Ak4Punch::ClockOutPlanner do
   let(:date) { Date.new(2026, 7, 10) }
   let(:default_clock_out) { t("18:00") }
 
-  # 当日(2026-07-10)の HH:MM を JST の Time にする
-  def t(hhmm, day: 10)
-    h, m = hhmm.split(":").map(&:to_i)
-    Time.new(2026, 7, day, h, m, 0, "+09:00")
-  end
-
-  def event(title:, ends_at:, starts_at: nil, all_day: false, id: nil)
-    Ak4Punch::CalendarClient::Event.new(
-      id: id || "e#{ends_at&.to_i}#{title}",
-      title: title, starts_at: starts_at, ends_at: ends_at, all_day: all_day,
-    )
-  end
-
   it "通常: 末尾の業務イベントの終了時刻を採用（所定より遅い）" do
     events = [
       event(title: "朝会", ends_at: t("10:00")),

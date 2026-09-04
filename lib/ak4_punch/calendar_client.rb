@@ -120,7 +120,8 @@ module Ak4Punch
       # 型が String でも、日時として読めない値・オフセットのない値は取得失敗にする（詳細は TIME_FIELDS）。
       TIME_FIELDS.each do |field|
         value = raw[field]
-        next if blank_time?(value)
+        # parse_time と同じ述語（Ak4Punch.blank?）で「時刻なし」を判定する（判定が食い違わないように）。
+        next if Ak4Punch.blank?(value)
 
         reason = time_field_error(value)
         invalid_response!("events[#{index}].#{field} #{reason}: #{summarize(value)}") if reason
@@ -133,12 +134,6 @@ module Ak4Punch
       # all_day=false として扱うと終日イベントを通常の予定として打刻判定に使ってしまう。
       invalid_response!("events[#{index}].all_day が真偽値ではありません: #{summarize(all_day)}")
     end
-
-    # parse_time が nil として扱う値（nil・空文字・空白のみ）。
-    # parse_time と同じ述語（Ak4Punch.blank?）を共有しているので判定は食い違わない。
-    # 別々に書くと「検証は通るのに parse_time が nil にする」あるいはその逆が起きるため、
-    # 片方だけ条件を変えないこと（変えるなら Ak4Punch.blank? を両方が使う形を保つ）。
-    def blank_time?(value) = Ak4Punch.blank?(value)
 
     # 時刻フィールドが不正な理由（正常なら nil）。メッセージに埋めて位置と併せて示す。
     def time_field_error(value)

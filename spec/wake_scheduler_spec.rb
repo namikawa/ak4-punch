@@ -19,11 +19,6 @@ RSpec.describe Ak4Punch::WakeScheduler do
     )
   end
 
-  def t(hhmm, day: 10)
-    h, m = hhmm.split(":").map(&:to_i)
-    Time.new(2026, 7, day, h, m, 0, "+09:00")
-  end
-
   # `pmset -g sched` の Scheduled power events ブロックを組み立てる。
   def sched_output(*hhmms)
     lines = hhmms.each_with_index.map do |hhmm, i|

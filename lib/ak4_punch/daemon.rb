@@ -6,21 +6,12 @@ module Ak4Punch
   # カレンダー連動の常駐デーモン。
   #
   # 方針（AKASHI は記録時刻＝リクエスト到着時刻のため「打刻したい時刻にPOST」する）:
-  #   - 出勤 = ClockInPlanner（カレンダー連動）が決めた打刻締切 − 揺らぎ
-  #     （締切 = min(所定出勤時刻+ウィンドウ, 最初の業務イベントの開始)。予定の開始までに打刻を済ませる）
-  #   - 退勤 = ClockOutPlanner（カレンダー連動）が決めた基準時刻 + 揺らぎ
-  #     （基準 = max(所定退勤時刻, 最後の業務イベントの終了)）
-  #   - 揺らぎは日毎・kind毎に固定した秒数（従来のウィンドウ機構を織込）。出勤は締切から手前へ、
-  #     退勤は基準から後ろへずらすため、向きが逆になる。
+  #   - 目標時刻の計算（出勤締切・退勤基準・揺らぎ・休暇の押し出し）は DayPlanner を参照。
   #   - 15分毎に sukesan を再取得して出勤・退勤の目標を再計算し、変わったら再スケジュール
   #   - tick 毎に due（目標<=現在<=目標+grace）を判定し、範囲内なら打刻。
   #     打刻失敗は grace 窓内で tick 毎にリトライし、窓超過で諦めて通知する。
   #     due 到達時点で既に grace 超過（寝過ごし）なら打刻せず警告＋通知（誤時刻打刻ガード）。
-  #   - カレンダーの休暇イベント（タイトルがキーワードに部分一致・時間の閾値なし）は
-  #     「その時間帯は勤務しない」の意味で扱う（LeaveSchedule）。業務イベントの判定からは常に
-  #     除外し、上で決めた出勤締切・退勤基準がその時間帯に入っていたら休暇の外へ押し出す
-  #     （出勤は休暇の終了へ後ろ倒し／退勤は休暇の開始へ前倒し）。押し出しの結果
-  #     「出勤締切 >= 退勤基準」になった日は勤務時間ゼロ＝全休として打刻しない
+  #   - 全休（休暇で勤務時間ゼロ）の日は打刻しない。休暇の時間帯に入っている打刻も中止する
   #     （AKASHI は休暇申請日でも打刻を受理するため、この判定が誤打刻を防ぐ主手段）。
   #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害/休暇中のため打刻中止/
   #     日中に全休へ切り替わって以降の打刻を中止/当日計画の作成失敗/未打刻のまま日付変更）のみ
@@ -36,9 +27,7 @@ module Ak4Punch
   # いつ打刻するか」で、打刻計画・休暇スナップショット・通知のデデュープ・起床予約を持つ。
   class Daemon
     KINDS = %i[in out].freeze
-    # 「翌日 00:00 の直前」を表すために引く最小の差（end_of_plan_day）。
-    # Time.now の分解能（clock_gettime）はナノ秒なので、これで
-    # 「now <= 端 ⟺ now は日付が変わる前」が実用上厳密に成り立つ。
+    # 「翌日 00:00 の直前」を表すために引く最小の差（端の取り方は end_of_plan_day 参照）。
     ONE_NANOSECOND = Rational(1, 1_000_000_000)
 
     # 1日分の打刻計画（1 kind 分）。
@@ -101,8 +90,10 @@ module Ak4Punch
 
       @current_date = nil       # 日付遷移の副作用（前日未打刻の通知・状態リセット）を実施済みの日付
       @plan_date = nil          # 計画の作成に成功した日付（失敗した日は進めず、次の tick で再試行する）
-      @punch_plans = {}         # kind => PunchPlan（対象日のみ）
-      @leave_day = false        # 全休（休暇で当日の勤務時間がゼロ）。true の間は再取得も打刻もしない
+      # kind => PunchPlan（対象日のみ）。空の Hash が「打刻計画なし」を表す唯一の状態で、
+      # 非対象日・全休（初期計画・日中の切り替えとも）はこれを空にすることで
+      # 再取得（refresh_if_due）も打刻（fire_due_punches）も自然に止まる。
+      @punch_plans = {}
       @leave_snapshot = nil     # 当日最後に取得できた休暇情報（直前取得が失敗した時の判定に使う）
       @last_refresh_at = nil    # 最後に sukesan を再取得した時刻
       @calendar_failure_count = 0 # sukesan 取得の連続失敗回数（成功でリセット。定期再取得の通知判定に使う）
@@ -216,7 +207,6 @@ module Ak4Punch
 
       @current_date = today
       @punch_plans = {}
-      @leave_day = false
       @leave_snapshot = nil # 前日の休暇情報を持ち越さない
       @last_refresh_at = nil
       @calendar_failure_count = 0 # 前日の連続失敗を持ち越さない
@@ -233,7 +223,6 @@ module Ak4Punch
         # 計画なし＝当日 targets は空。起床予約は tick 末尾の突き合わせで
         # 翌営業日ブートストラップのみが維持される（既存の予約は消さない）。
         @punch_plans = {}
-        @leave_day = false
         @plan_date = today
         return
       end
@@ -252,7 +241,6 @@ module Ak4Punch
       # 全休（休暇の押し出しで勤務時間が消えた日）は打刻計画を持たない。
       # 再チェックで休暇イベントが消えていれば下の通常計画に戻る。
       if day_plan.full_leave?
-        @leave_day = true
         @punch_plans = {}
         @logger.info("休暇イベント#{day_plan.leaves.labels} により本日は勤務時間がないため、打刻しません")
         # 計画なし＝tick 末尾の突き合わせで翌営業日ブートストラップのみが維持される。
@@ -260,7 +248,6 @@ module Ak4Punch
         return
       end
 
-      @leave_day = false # 再チェックで全休状態を解除できるよう毎回明示的に設定する
       set_plan(:in, day_plan.clock_in, now)
       set_plan(:out, day_plan.clock_out, now)
       @plan_date = today
@@ -270,10 +257,10 @@ module Ak4Punch
     # 会議の追加・キャンセル・延長に追随させるため、未完了（done でない）の kind だけを作り直す。
     # 再取得結果が全休（休暇で勤務時間ゼロ）になっていたら残りの打刻を中止する。
     def refresh_if_due(now)
-      return if @leave_day # 全休日は打刻計画がなく、再取得も停止する
       return unless @config.calendar_enabled
 
       # 打刻済み・断念済みの計画は作り直さない。全て完了していれば再取得の必要もない。
+      # 計画が無い日（非対象日・全休）も @punch_plans が空なので、ここで再取得が止まる。
       pending = KINDS.select { |kind| @punch_plans[kind] && !@punch_plans[kind].done? }
       return if pending.empty?
 
@@ -326,7 +313,7 @@ module Ak4Punch
     # 「リトライ上限に達した」という実態と違う内容で通知されることになる。
     # ②だけは計画日の終端（＝翌日 00:00 の直前）でも丸める（post_deadline_at）。2つの判定が
     # 食い違うのは現在時刻が日付を跨いだ後だけで、そこは日付ガードと start_new_day が先に止めるため
-    # 上の空回りは起きない。この「跨いだ後だけ」は端の取り方に依存する（詳細は post_deadline_at）。
+    # 上の空回りは起きない。この「跨いだ後だけ」は端の取り方に依存する（詳細は end_of_plan_day）。
     def punch_deadline_at(target) = target + (@config.daemon_late_grace_minutes * 60)
 
     # POST の期限 ＝ min(目標+grace, 計画日の終端)。execute_punch に渡す値。
@@ -341,16 +328,19 @@ module Ak4Punch
     # ① 同じ tick では日付ガードが execute_punch を呼ばせない
     # ② 次の tick では ensure_day_plan → start_new_day が当日の計画を破棄する
     # ため、「窓は開いているのに Stamper が拒み続ける」空回りにはならない。
-    # ただしこれは end_of_plan_day を「翌日 00:00 の直前」に取って初めて成り立つ。23:59:59
-    # （その秒の開始点）にすると当日の最終1秒（23:59:59.000000001〜.999999999）が
-    # 「日付ガードは通るのに期限外」になり、この不変条件が1秒だけ破れる。
+    # ただしこれは端を「翌日 00:00 の直前」に取って初めて成り立つ（端の取り方は end_of_plan_day 参照）。
     def post_deadline_at(plan) = [punch_deadline_at(plan.target_at), end_of_plan_day].min
 
     # 計画日（@current_date）の終端 ＝ 翌日 00:00 の直前。日付が変わると当日の計画は破棄されるため、
     # POST は「日付が変わる前」に完了していなければならない。
     # 期限の判定は Stamper#ensure_within_deadline! / Client#post_stamp が `now <= deadline` で
-    # 行うため、この条件を表す端は「翌日 00:00 のちょうど直前」でなければならない
-    # （23:59:59 だと当日の最終1秒が期限外になる。上の post_deadline_at のコメント参照）。
+    # 行うため、この条件を表す端は「翌日 00:00 のちょうど直前」でなければならない。
+    # 23:59:59（その秒の開始点）にすると当日の最終1秒（23:59:59.000000001〜.999999999）が
+    # 「日付ガードは通るのに期限外」になり、「日付ガードを通った打刻は期限内」という不変条件が
+    # 1秒だけ破れる（post_deadline_at と unreachable_target? が食い違うのは日付を跨いだ後だけ、
+    # という前提もここに依っている）。
+    # 引く差は ONE_NANOSECOND。Time.now の分解能（clock_gettime）はナノ秒なので、これで
+    # 「now <= 端 ⟺ now は日付が変わる前」が実用上厳密に成り立つ。
     # 減算は Rational で行う（Time は秒を有理数で保持するので Float だと丸め誤差が出る）。
     def end_of_plan_day
       next_day = @current_date + 1
@@ -429,10 +419,9 @@ module Ak4Punch
     # 失敗は grace 窓内で tick 毎にリトライし、窓超過で諦めて通知する。
     # due 到達時点で既に窓超過（未試行＝寝過ごし）なら打刻せず警告＋通知する。
     def fire_due_punches(now)
-      return if @leave_day # 全休日は打刻しない
-
       KINDS.each do |kind|
         plan = @punch_plans[kind]
+        # 計画が無い日（非対象日・全休）は @punch_plans が空なので、ここで打刻が止まる。
         next if plan.nil? || plan.done?
         next if now < plan.target_at # まだ
 
@@ -695,7 +684,6 @@ module Ak4Punch
       return false unless day_plan.full_leave?
 
       labels = day_plan.leaves.labels
-      @leave_day = true
       @punch_plans = {}
       @logger.warn("休暇イベント#{labels} により本日の勤務時間がなくなったため、以降の打刻を中止します。" \
                    "打刻済みの分は手動で削除してください")

@@ -32,18 +32,18 @@ module Ak4Punch
     #   deadline:     打刻締切（休暇の押し出し適用後）
     #   plan:         ClockInPlanner::Plan（連動OFF・取得失敗時は nil）
     #   summary:      判断根拠の要約（ログ用）
-    #   error:        sukesan 取得失敗のメッセージ（正常時 nil）
     #   leave_shifts: 休暇による押し出しの記録（LeaveSchedule::Shift 配列）
-    ClockInResult = Struct.new(:target, :deadline, :plan, :summary, :error, :leave_shifts,
+    ClockInResult = Struct.new(:target, :deadline, :plan, :summary, :leave_shifts,
                                keyword_init: true)
 
     # 退勤側の計画結果。出勤の deadline（締切＝打刻の上限）に対して base（基準＝下限）を持つ。
     # 他のフィールドの意味は ClockInResult と同じ。
-    ClockOutResult = Struct.new(:target, :base, :plan, :summary, :error, :leave_shifts,
+    ClockOutResult = Struct.new(:target, :base, :plan, :summary, :leave_shifts,
                                 keyword_init: true)
 
     # 1日分の打刻計画（出勤・退勤・その日の休暇）。
-    DayPlan = Struct.new(:date, :leaves, :clock_in, :clock_out, keyword_init: true) do
+    #   error: sukesan 取得失敗のメッセージ（正常時 nil）。出勤・退勤で同じ値なので日単位で持つ。
+    DayPlan = Struct.new(:date, :leaves, :clock_in, :clock_out, :error, keyword_init: true) do
       # 休暇の押し出し後に「出勤締切 >= 退勤基準」＝勤務時間ゼロになったか（＝全休）。
       # 終日休暇（00:00〜翌00:00）もこの判定で全休になるため、全休は特別ルールではなく帰結。
       # 判定は揺らぎを足す前の締切・基準で行う（揺らぎの向きで勤務時間の有無が変わらないように）。
@@ -65,10 +65,15 @@ module Ak4Punch
     # error:  sukesan 取得失敗のメッセージ（正常時 nil）
     # sukesan の取得は呼び出し側が1回だけ行い、休暇・出勤・退勤の計画で共用する（二重 fetch 回避）。
     def call(date:, events:, error: nil)
-      leaves = leave_schedule(events, date)
-      clock_in = clock_in_result(date: date, events: events, leaves: leaves, error: error)
-      clock_out = clock_out_result(date: date, events: events, leaves: leaves, error: error)
-      DayPlan.new(date: date, leaves: leaves, clock_in: clock_in, clock_out: clock_out)
+      # events が nil（連動OFF・取得失敗）なら休暇なしの空の集合になる。
+      leaves = LeaveSchedule.build(events: events, keywords: @config.calendar_leave_keywords, date: date)
+      # 取得失敗の警告は出勤・退勤で同じ内容になるため、両方の計画を作る前に1回だけ出す。
+      if @config.calendar_enabled && events.nil?
+        @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定時刻へフォールバックします。")
+      end
+      clock_in = clock_in_result(date: date, events: events, leaves: leaves)
+      clock_out = clock_out_result(date: date, events: events, leaves: leaves)
+      DayPlan.new(date: date, leaves: leaves, clock_in: clock_in, clock_out: clock_out, error: error)
     end
 
     # その日の朝に Mac を起こす時刻。出勤アンカーの下限（ClockInPlanner の earliest_at）も
@@ -94,28 +99,32 @@ module Ak4Punch
 
     private
 
-    # 出勤の目標時刻を計算する。events は取得済みイベント配列
-    # （nil は未取得＝連動OFF、または取得失敗。失敗時は error にメッセージ）。
+    # 所定時刻へ倒す理由（ログ用の要約）。カレンダーを使う正常系なら nil。
+    # 連動OFF・取得失敗はどちらも「カレンダーを見ずに所定時刻で決める」経路で、出勤・退勤で
+    # 判定も文言も同じなのでここに集約する（連動OFFなら sukesan にはアクセスしない前提で、
+    # 呼び出し元は events: nil を渡す）。
+    def fallback_summary(events)
+      return "カレンダー連動OFF（所定時刻）" unless @config.calendar_enabled
+      return "sukesan 障害のため所定時刻へフォールバック" if events.nil?
+
+      nil
+    end
+
+    # 出勤の目標時刻を計算する。events は取得済みイベント配列（nil は未取得＝連動OFF、または取得失敗）。
     # leaves は当日の休暇イベント（LeaveSchedule）。業務イベントの判定から休暇を外し、
     # 決めた締切が休暇の時間帯に入っていたら休暇の外（終了時刻）へ後ろ倒しする。
     #
     # 出勤は「締切ベース」で決める: 打刻締切 = min(所定出勤時刻+ウィンドウ, 最初の業務イベント開始)、
     # 目標 = 締切 − 揺らぎ（朝の起床時刻でクランプ）。
     # 予定なしの日の範囲（所定〜所定+ウィンドウ）は従来と変わらない。
-    def clock_in_result(date:, events:, leaves:, error: nil)
+    def clock_in_result(date:, events:, leaves:)
       default = clock_in_deadline_at(date)
       earliest = morning_wake_at(date) # アンカーの下限 兼 目標のクランプ下限
+      summary = fallback_summary(events)
       plan = nil
 
-      if !@config.calendar_enabled
-        # 連動OFFなら所定の締切（−揺らぎ）を使う（sukesan にはアクセスしない前提）。
+      if summary
         deadline = default
-        summary = "カレンダー連動OFF（所定時刻）"
-        error = nil
-      elsif events.nil?
-        @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定出勤時刻へフォールバックします。")
-        deadline = default
-        summary = "sukesan 障害のため所定時刻へフォールバック"
       else
         plan = ClockInPlanner.new(exclude_keywords: @config.calendar_clock_in_exclude_keywords)
                              .plan(events: leaves.work_events, date: date, default_deadline: default,
@@ -127,7 +136,6 @@ module Ak4Punch
           else
             "所定時刻（#{plan.fallback_reason}）"
           end
-        error = nil
       end
 
       # 締切が休暇の時間帯に入っていたら休暇の外へ後ろ倒しする（午前休の日に出勤が
@@ -136,7 +144,7 @@ module Ak4Punch
       summary = "#{summary}／#{shifts.map(&:label).join('、')}" unless shifts.empty?
 
       ClockInResult.new(target: in_target_at(deadline, date, earliest), deadline: deadline,
-                        plan: plan, summary: summary, error: error, leave_shifts: shifts)
+                        plan: plan, summary: summary, leave_shifts: shifts)
     end
 
     # 出勤の目標時刻 = 締切 − 揺らぎ。ただし朝の起床時刻より前には出さない（クランプ）。
@@ -145,26 +153,19 @@ module Ak4Punch
     # 恒久スキップになってしまう。クランプは連動OFF・取得失敗の経路にも一律で適用する
     # （それらは締切が所定+ウィンドウなので実質 no-op）。
     def in_target_at(deadline, date, earliest)
-      [apply_jitter_before(deadline, date, :in), earliest].max
+      [deadline - jitter_seconds(date, :in), earliest].max
     end
 
-    # 退勤の目標時刻を計算する。events は取得済みイベント配列
-    # （nil は未取得＝連動OFF、または取得失敗。失敗時は error にメッセージ）。
+    # 退勤の目標時刻を計算する。events は取得済みイベント配列（nil は未取得＝連動OFF、または取得失敗）。
     # leaves は当日の休暇イベント（LeaveSchedule）。業務イベントの判定から休暇を外し、
     # 決めた基準が休暇の時間帯に入っていたら休暇の外（開始時刻）へ前倒しする。
-    def clock_out_result(date:, events:, leaves:, error: nil)
+    def clock_out_result(date:, events:, leaves:)
       default = clock_out_default_at(date)
+      summary = fallback_summary(events)
       plan = nil
 
-      if !@config.calendar_enabled
-        # 連動OFFなら所定時刻（+揺らぎ）を使う（sukesan にはアクセスしない前提）。
+      if summary
         base = default
-        summary = "カレンダー連動OFF（所定時刻）"
-        error = nil
-      elsif events.nil?
-        @logger.warn("sukesan からのイベント取得に失敗しました（#{error}）。所定退勤時刻へフォールバックします。")
-        base = default
-        summary = "sukesan 障害のため所定時刻へフォールバック"
       else
         plan = ClockOutPlanner.new(exclude_keywords: @config.calendar_exclude_keywords)
                               .plan(events: leaves.work_events, date: date, default_clock_out: default)
@@ -175,7 +176,6 @@ module Ak4Punch
           else
             "所定時刻（#{plan.fallback_reason}）"
           end
-        error = nil
       end
 
       # 基準が休暇の時間帯に入っていたら休暇の外へ前倒しする（午後休の日に退勤が
@@ -184,12 +184,12 @@ module Ak4Punch
       base, shifts = leaves.push_before(base)
       summary = "#{summary}／#{shifts.map(&:label).join('、')}" unless shifts.empty?
 
-      jittered = apply_jitter(base, date, :out)
+      jittered = base + jitter_seconds(date, :out)
       target = out_target_at(jittered, base, date)
       summary = "#{summary}／揺らぎ後 #{hhmm(jittered, base: base)} が翌日になるため基準時刻に戻す" if target != jittered
 
       ClockOutResult.new(target: target, base: base, plan: plan,
-                         summary: summary, error: error, leave_shifts: shifts)
+                         summary: summary, leave_shifts: shifts)
     end
 
     # 退勤の目標時刻 = 基準 + 揺らぎ。ただし揺らぎ後が翌日に出る日は揺らぎを落として基準そのものにする。
@@ -213,14 +213,9 @@ module Ak4Punch
     # 日付変更の直前という打つ手のない縮退ケース。
     def out_target_at(jittered, base, date) = jittered.to_date == date ? jittered : base
 
-    # 基準時刻に「日毎・kind毎に固定した揺らぎ秒」を足す（退勤: 基準は下限なので後ろへずらす）。
-    def apply_jitter(base_time, date, kind) = base_time + jitter_seconds(date, kind)
-
-    # 締切から「日毎・kind毎に固定した揺らぎ秒」を引く（出勤: 基準は締切なので手前へずらす）。
-    def apply_jitter_before(deadline, date, kind) = deadline - jitter_seconds(date, kind)
-
-    # 日毎・kind毎に固定した揺らぎ秒。定期再取得のたびに目標がブレないよう、
-    # 日付とkindから決定論的に決める（このシードの導出は変えないこと＝目標時刻を動かさないこと）。
+    # 日毎・kind毎に固定した揺らぎ秒（出勤は締切から手前へ引き、退勤は基準から後ろへ足す）。
+    # 定期再取得のたびに目標がブレないよう、日付とkindから決定論的に決める
+    # （このシードの導出は変えないこと＝目標時刻を動かさないこと）。
     # 起点は「その日の JST 午前0時」。Date#to_time はローカルタイムゾーン依存なので使わない
     # （TZ が JST 以外の環境では同じ日でも別の揺らぎになり、「日付・時刻ロジックはすべて JST 基準」
     #  という不変条件から外れる。旅行先で Mac の TZ を変えると当日の目標が動く／CI が落ちる）。
@@ -244,12 +239,6 @@ module Ak4Punch
     def time_on(date, hhmm)
       h, m = hhmm.split(":").map(&:to_i)
       Time.new(date.year, date.month, date.day, h, m, 0, Ak4Punch::JST)
-    end
-
-    # 取得済みイベントを「休暇」と「業務」に仕分けた LeaveSchedule を作る。
-    # events が nil（連動OFF・取得失敗）なら休暇なしの空の集合になる。
-    def leave_schedule(events, date)
-      LeaveSchedule.build(events: events, keywords: @config.calendar_leave_keywords, date: date)
     end
 
     def event_label(event)

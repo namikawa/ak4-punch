@@ -8,19 +8,6 @@ RSpec.describe Ak4Punch::ClockInPlanner do
   let(:date) { Date.new(2026, 7, 10) }
   let(:default_deadline) { t("09:30") } # 所定の出勤締切（所定出勤時刻 + ウィンドウ）
 
-  # 当日(2026-07-10)の HH:MM を JST の Time にする
-  def t(hhmm, day: 10)
-    h, m = hhmm.split(":").map(&:to_i)
-    Time.new(2026, 7, day, h, m, 0, "+09:00")
-  end
-
-  def event(title:, starts_at:, ends_at: nil, all_day: false, id: nil)
-    Ak4Punch::CalendarClient::Event.new(
-      id: id || "e#{starts_at&.to_i}#{title}",
-      title: title, starts_at: starts_at, ends_at: ends_at, all_day: all_day,
-    )
-  end
-
   it "通常: 最初の業務イベントの開始時刻を締切に採用（所定より早い）" do
     events = [
       event(title: "定例MTG", starts_at: t("09:00")),
