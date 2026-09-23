@@ -88,9 +88,68 @@ RSpec.describe Ak4Punch::CalendarClient do
     expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /通信エラー/)
   end
 
-  it "JSON不正は ApiError" do
-    stub_request(:get, %r{/events}).to_return(status: 200, body: "not json{")
-    expect { client.events(date: date) }.to raise_error(Ak4Punch::CalendarClient::ApiError, /JSONパース/)
+  it "200 の JSON不正は本文を含めず ApiError、リトライしない" do
+    body = "<html>障害 dummy-secret-500 \xFF</html>".b
+    stub = stub_request(:get, %r{/events}).to_return(status: 200, body: body)
+    expect { client.events(date: date) }
+      .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan JSONパースに失敗") { |error|
+        expect(error.cause).to be_nil
+        expect(error.full_message).not_to include("<html>", "dummy-secret-500")
+      }
+    expect(stub).to have_been_requested.once
+    expect(slept).to be_empty
+  end
+
+  describe "HTTP エラー詳細" do
+    it "binary の非 ASCII HTML は本文とダミートークンを隠し、500 を3回試行する" do
+      body = "<html>障害 dummy-secret-500 \xFF</html>".b
+      stub = stub_request(:get, %r{/events}).to_return(status: 500, body: body)
+
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::TransientError, "sukesan HTTP 500") { |error|
+          expect(error.cause).to be_nil
+          expect(error.full_message).not_to include("<html>", "dummy-secret-500")
+        }
+      expect(stub).to have_been_requested.times(3)
+      expect(slept).to eq [2, 4]
+    end
+
+    it "プレーンテキスト、空本文、想定外の JSON 構造は status のみ表示する" do
+      ["plain dummy-secret", "", { error: "dummy-secret" }.to_json,
+       { error: { message: 123, code: false } }.to_json].each do |body|
+        stub_request(:get, %r{/events}).to_return(status: 401, body: body)
+        expect { client.events(date: date) }
+          .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan HTTP 401")
+      end
+      expect(slept).to be_empty
+    end
+
+    it "構造化された message を code より優先し、空・非文字列 message なら code を使う" do
+      stub_request(:get, %r{/events}).to_return(
+        { status: 401, body: { error: { message: "認証に失敗", code: "unauthorized" } }.to_json },
+        { status: 403, body: { error: { message: "", code: "forbidden" } }.to_json },
+        { status: 403, body: { error: { message: 123, code: "forbidden" } }.to_json },
+      )
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan HTTP 401: 認証に失敗")
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan HTTP 403: forbidden")
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan HTTP 403: forbidden")
+    end
+
+    it "長い日本語の詳細は200文字で切り詰め、不正 UTF-8 バイトは置換する" do
+      long_message = "障" * 201
+      invalid_message = %Q({"error":{"message":"abc\xFFxyz"}}).b
+      stub_request(:get, %r{/events}).to_return(
+        { status: 400, body: { error: { message: long_message } }.to_json },
+        { status: 400, body: invalid_message },
+      )
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan HTTP 400: #{'障' * 200}…")
+      expect { client.events(date: date) }
+        .to raise_error(Ak4Punch::CalendarClient::ApiError, "sukesan HTTP 400: abc�xyz")
+    end
   end
 
   describe "レスポンスのスキーマ検証" do
