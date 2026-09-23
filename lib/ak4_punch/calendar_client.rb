@@ -23,8 +23,7 @@ module Ak4Punch
 
     EVENTS_PATH = "/api/v1/calendars/google/events"
 
-    # 形式不正のエラーメッセージに載せる値の最大長（超過分は切り詰める）。
-    # 応答本文をそのまま全部載せるとログ・Slack が読めなくなるため。
+    # エラーメッセージに載せる詳細の最大長（超過分は切り詰める）。
     MAX_DETAIL_LENGTH = 200
 
     # 「nil か文字列」であることを検証するイベントのフィールド。下流が String 前提で扱うものだけを挙げる。
@@ -229,18 +228,40 @@ module Ak4Punch
     end
 
     def parse_response(res)
-      json = (JSON.parse(res.body) rescue nil)
+      json = parse_json_body(res.body)
       code = res.code.to_i
-
-      if code != 200
-        detail = json&.dig("error", "message") || json&.dig("error", "code") || res.body
-        # 5xx はサーバ/プロバイダ側の一過性障害としてリトライ対象、4xx は恒久エラーとして即 surface。
-        error_class = code >= 500 ? TransientError : ApiError
-        raise error_class, "sukesan HTTP #{code}: #{detail}"
-      end
-      raise ApiError, "sukesan JSONパースに失敗: #{res.body}" if json.nil?
+      raise_http_error(code, json) unless code == 200
+      raise ApiError, "sukesan JSONパースに失敗" if json.nil?
 
       json
+    end
+
+    def parse_json_body(body)
+      JSON.parse(body.to_s)
+    rescue JSON::ParserError
+      nil
+    end
+
+    def raise_http_error(code, json = nil)
+      detail = http_error_detail(json)
+      # 5xx はサーバ/プロバイダ側の一過性障害としてリトライ対象、4xx は恒久エラーとして即 surface。
+      error_class = code >= 500 ? TransientError : ApiError
+      message = "sukesan HTTP #{code}"
+      message += ": #{detail}" if detail
+      raise error_class, message
+    end
+
+    def http_error_detail(json)
+      return unless json.is_a?(Hash) && json["error"].is_a?(Hash)
+
+      error = json["error"]
+      detail = [error["message"], error["code"]].find { |value| value.is_a?(String) && !value.empty? }
+      return unless detail
+
+      detail = detail.dup
+      detail.force_encoding(Encoding::UTF_8) if detail.encoding == Encoding::BINARY
+      detail = detail.encode(Encoding::UTF_8, invalid: :replace, undef: :replace).scrub
+      detail.length > MAX_DETAIL_LENGTH ? "#{detail[0, MAX_DETAIL_LENGTH]}…" : detail
     end
   end
 end

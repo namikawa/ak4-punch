@@ -306,6 +306,43 @@ RSpec.describe Ak4Punch::Daemon do
   end
 
   describe "sukesan 障害時のフォールバック" do
+    it "binary HTML の HTTP 500 でも当日計画を作り、本文を漏らさず所定時刻に打刻する" do
+      body = "<html>障害 dummy-secret-500 \xFF</html>".b
+      stub = stub_request(:get, "http://127.0.0.1:3000/api/v1/calendars/google/events?date=2026-07-10")
+             .to_return(status: 500, body: body)
+      real_client = Ak4Punch::CalendarClient.new(
+        base_url: "http://127.0.0.1:3000", api_key: "dummy-api-key",
+        sleeper: ->(_seconds) {},
+      )
+      messages = []
+      notifications = []
+      allow(logger).to receive(:info) { |message| messages << message }
+      allow(logger).to receive(:warn) { |message| messages << message }
+      allow(logger).to receive(:error) { |message| messages << message }
+      allow(notifier).to receive(:notify) { |message| notifications << message }
+      allow(stamper).to receive(:punch)
+      d = build_daemon(calendar_client: real_client)
+
+      d.tick # 初回取得は3試行。取得失敗から所定時刻の計画を作る。
+      expect(stub).to have_been_requested.times(3)
+      expect(notifications.join("\n")).to include("sukesan HTTP 500")
+      expect(messages.join("\n")).to include("sukesan HTTP 500", "所定時刻へフォールバック")
+      expect((messages + notifications).join("\n")).not_to include("<html>", "dummy-secret-500")
+
+      clock_time[:now] = t("08:10") # refresh 間隔前は追加で取得しない
+      d.tick
+      expect(stub).to have_been_requested.times(3)
+
+      clock_time[:now] = t("09:30", 5)
+      d.tick
+      expect(stamper).to have_received(:punch).with(**punch_args(:in)).once
+
+      clock_time[:now] = t("18:00", 5)
+      d.tick
+      expect(stamper).to have_received(:punch).with(**punch_args(:out)).once
+      expect((messages + notifications).join("\n")).not_to include("<html>", "dummy-secret-500")
+    end
+
     it "取得失敗時は所定退勤時刻へフォールバックする" do
       allow(calendar_client).to receive(:events)
         .and_raise(Ak4Punch::CalendarClient::ApiError, "接続拒否")
