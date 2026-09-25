@@ -19,16 +19,17 @@ RSpec.describe Ak4Punch::WakeScheduler do
     )
   end
 
-  # `pmset -g sched` の Scheduled power events ブロックを組み立てる。
-  def sched_output(*hhmms)
+  # `pmset -g sched` の Scheduled power events ブロックを組み立てる（既定の登録元は自分）。
+  def sched_output(*hhmms, owner: "ak4-punch")
     lines = hhmms.each_with_index.map do |hhmm, i|
-      " [#{i}]  wake at #{t(hhmm).strftime('%m/%d/%Y %H:%M:%S')} by 'pmset'"
+      " [#{i}]  wake at #{t(hhmm).strftime('%m/%d/%Y %H:%M:%S')} by '#{owner}'"
     end
     (["Scheduled power events:"] + lines).join("\n") + "\n"
   end
 
+  # 書き込みのコマンド列（最後の引数が登録元 owner）。
   def wake_cmd(hhmm)
-    ["sudo", "-n", "/usr/bin/pmset", "schedule", "wake", t(hhmm).strftime("%m/%d/%Y %H:%M:%S")]
+    ["sudo", "-n", "/usr/bin/pmset", "schedule", "wake", t(hhmm).strftime("%m/%d/%Y %H:%M:%S"), "ak4-punch"]
   end
 
   # --- パーサ ---------------------------------------------------------
@@ -38,23 +39,27 @@ RSpec.describe Ak4Punch::WakeScheduler do
         Repeating power events:
           wakepoweron at 9:19AM Some days
         Scheduled power events:
-         [0]  wake at 07/10/2026 09:29:00 by 'pmset'
-         [1]  wake at 07/10/2026 18:29:00 by 'pmset'
-         [2]  wake at 07/10/2026 23:00:00 by 'powerd'
+         [0]  wake at 07/10/2026 09:29:00 by 'ak4-punch'
+         [1]  wake at 07/10/2026 09:29:00 by 'pmset'
+         [2]  wake at 07/10/2026 12:00:00 by 'pmset'
+         [3]  wake at 07/10/2026 18:29:00 by 'ak4-punch'
+         [4]  wake at 07/10/2026 23:00:00 by 'powerd'
       SCHED
     end
 
-    it "by 'pmset' の wake 行だけを Time(JST) に変換する" do
+    it "by 'ak4-punch' の wake 行だけを Time(JST) に変換する（by 'pmset' は owner なしの予約として無視）" do
       expect(described_class.parse_pmset_wakes(sample)).to contain_exactly(t("09:29"), t("18:29"))
     end
 
-    it "他所有者・非 wake 行・繰返しイベント・不正な日時はスキップする" do
+    it "他の登録元・非 wake 行・繰返しイベント・不正な日時はスキップする" do
       text = <<~SCHED
          [0]  wake at 07/10/2026 09:29:00 by 'powerd'
-         [1]  sleep at 07/10/2026 23:00:00 by 'pmset'
+         [1]  wake at 07/10/2026 09:30:00 by 'pmset'
+         [2]  sleep at 07/10/2026 23:00:00 by 'ak4-punch'
         まったく関係のない行
-         [2]  wake at NOT-A-DATE by 'pmset'
-         [3]  wake at 13/40/2026 99:99:99 by 'pmset'
+         [3]  wake at NOT-A-DATE by 'ak4-punch'
+         [4]  wake at 13/40/2026 99:99:99 by 'ak4-punch'
+         [5]  wake at 07/10/2026 10:00:00 by 'ak4-punch-other'
       SCHED
       expect(described_class.parse_pmset_wakes(text)).to be_empty
     end
@@ -96,12 +101,31 @@ RSpec.describe Ak4Punch::WakeScheduler do
       expect(calls).to be_empty
     end
 
-    it "同時刻に他所有者(by 'powerd')の予約があっても自分の追加判定に影響しない" do
-      # 09:29 は powerd の予約。parse は by 'pmset' のみ拾うので自分の予約は無しと判定し、
-      # desired 09:29 を通常どおり追加する（他所有者の予約は消さない・突き合わせに使わない）。
-      state[:sched] = " [0]  wake at 07/10/2026 09:29:00 by 'powerd'\n"
+    it "同時刻に他の登録元(by 'powerd')の予約があっても自分の追加判定に影響しない" do
+      # 09:29 は powerd の予約。parse は by 'ak4-punch' のみ拾うので自分の予約は無しと判定し、
+      # desired 09:29 を通常どおり追加する（他の登録元の予約は消さない・突き合わせに使わない）。
+      state[:sched] = sched_output("09:29", owner: "powerd")
       scheduler.reschedule([t("09:30")])
       expect(calls).to eq [wake_cmd("09:29")]
+    end
+
+    it "owner なしで登録された同時刻の予約(by 'pmset')は自分の予約とみなさず、owner 付きで追加する" do
+      # owner を付ける前に登録した自分の予約は by 'pmset' と表示される。これは消さずに放置し、
+      # 自分の予約（by 'ak4-punch'）として改めて追加する。
+      state[:sched] = sched_output("09:29", owner: "pmset")
+      scheduler.reschedule([t("09:30")])
+      expect(calls).to eq [wake_cmd("09:29")]
+    end
+
+    it "by 'pmset' の旧予約と自分の予約が同時刻に並んでいれば、登録済みとして追加しない" do
+      # pmset は owner が違えば同時刻でも別の予約として並べる。追加後の次のポーリングはこの状態になる。
+      state[:sched] = <<~SCHED
+        Scheduled power events:
+         [0]  wake at 07/10/2026 09:29:00 by 'pmset'
+         [1]  wake at 07/10/2026 09:29:00 by 'ak4-punch'
+      SCHED
+      scheduler.reschedule([t("09:30")])
+      expect(calls).to be_empty
     end
 
     it "空配列なら書き込みは行わない（読み取りのみ）" do
@@ -110,7 +134,8 @@ RSpec.describe Ak4Punch::WakeScheduler do
       expect(reads).not_to be_empty
     end
 
-    it "cancelall / cancel は一切実行しない" do
+    it "cancelall / cancel は一切実行しない（owner なしの旧予約があっても消さない）" do
+      state[:sched] = sched_output("09:29", "18:29", owner: "pmset")
       scheduler.reschedule([t("09:30"), t("18:30")])
       expect(calls.flatten).not_to include("cancelall")
       expect(calls.flatten).not_to include("cancel")

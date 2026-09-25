@@ -176,7 +176,7 @@ cmd_status() {
 
   echo
   echo "--- 起床予約 (pmset -g sched) ---"
-  pmset -g sched | grep "by 'pmset'" || echo "(pmset による起床予約なし)"
+  pmset -g sched | grep "by 'ak4-punch'" || echo "(ak4-punch の起床予約なし)"
 }
 
 cmd_log() {

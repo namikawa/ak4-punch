@@ -134,16 +134,18 @@ module Ak4Punch
     def sudoers
       user = ENV["USER"] || Etc.getpwuid(Process.uid).name
       pmset = WakeScheduler::PMSET
+      owner = WakeScheduler::OWNER
       puts <<~GUIDE
         # ===== sudoers 設定（pmset の自動起床予約を無パスワードで許可）=====
-        # デーモンが実行するのは起床予約の追加（`sudo -n pmset schedule wake <日時>`）だけです。
+        # デーモンが実行するのは起床予約の追加（`sudo -n pmset schedule wake <日時> #{owner}`）だけです。
+        #   （最後の #{owner} は予約の登録元の名前で、`pmset -g sched` に by '#{owner}' と表示されます）
         # 予約状態の読み取り（`pmset -g sched`）は sudo なしで実行するため、許可は要りません。
         # 下記1行を /etc/sudoers.d/ak4-punch に設置してください（visudo で構文検証されます）:
 
         #{user} ALL=(root) NOPASSWD: #{pmset} schedule wake *
 
-        #   ※ 末尾の `*` は日時の引数に一致します（sudoers は引数を1つに連結した文字列として
-        #     照合します）。`wake` の後の空白まで含むパターンなので、引数のない
+        #   ※ 末尾の `*` は日時と登録元（#{owner}）の引数に一致します（sudoers は引数を1つに連結した
+        #     文字列として照合します）。`wake` の後の空白まで含むパターンなので、引数のない
         #     `#{pmset} schedule wake` には一致しませんが、デーモンは必ず日時を渡すため問題ありません。
 
         # 設置手順:
