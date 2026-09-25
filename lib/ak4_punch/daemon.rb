@@ -14,7 +14,8 @@ module Ak4Punch
   #   - 全休（休暇で勤務時間ゼロ）の日は打刻しない。休暇の時間帯に入っている打刻も中止する
   #     （AKASHI は休暇申請日でも打刻を受理するため、この判定が誤打刻を防ぐ主手段）。
   #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害/休暇中のため打刻中止/
-  #     日中に全休へ切り替わって以降の打刻を中止/当日計画の作成失敗/未打刻のまま日付変更）のみ
+  #     日中に全休へ切り替わって以降の打刻を中止/当日計画の作成失敗/未打刻のまま日付変更/
+  #     起床予約の処理が戻らない）のみ
   #     Slack に通知する。成功・目標変更・計画時点で全休の日は通知しない
   #     （休暇を取った日に毎回鳴らさない。日中の切り替えだけは打刻済み分の手動削除が要るため通知する）。
   #     休暇中の打刻中止は、既に AKASHI に記録があれば通知しない（give_up と同じ扱い）。
@@ -29,6 +30,10 @@ module Ak4Punch
     KINDS = %i[in out].freeze
     # 「翌日 00:00 の直前」を表すために引く最小の差（端の取り方は end_of_plan_day 参照）。
     ONE_NANOSECOND = Rational(1, 1_000_000_000)
+    # 起床予約のワーカーが処理中のまま迎えた tick がこの回数連続したら通知する（reschedule_wakes 参照）。
+    WAKE_STUCK_TICKS = 10
+    # 起床予約のワーカーの既定の実行器（ブロックを別スレッドで実行する）。
+    DEFAULT_WAKE_EXECUTOR = ->(&job) { Thread.new(&job) }
 
     # 1日分の打刻計画（1 kind 分）。
     #   attempted:     窓内で打刻を試行したか（寝過ごしスキップとリトライ枯渇の区別用）
@@ -70,10 +75,12 @@ module Ak4Punch
     # 依存はすべて注入可能にしてテストで実時間 sleep なしに検証できるようにする。
     #   clock:   -> Time を返す（既定 Ak4Punch.now）
     #   sleeper: ->(sec) 実際の待機（既定 Kernel#sleep）
+    #   wake_executor: ->(&job) 起床予約のワーカーを起動し、alive? に応答するものを返す（既定 Thread.new）
     def initialize(config:, stamper:, calendar:, calendar_client:, token_store:, client:,
                    wake_scheduler:, logger:,
                    notifier: SlackNotifier.new(webhook_url: nil),
-                   clock: -> { Ak4Punch.now }, sleeper: Kernel.method(:sleep))
+                   clock: -> { Ak4Punch.now }, sleeper: Kernel.method(:sleep),
+                   wake_executor: DEFAULT_WAKE_EXECUTOR)
       @config = config
       @stamper = stamper
       @calendar = calendar
@@ -85,6 +92,7 @@ module Ak4Punch
       @notifier = notifier
       @clock = clock
       @sleeper = sleeper
+      @wake_executor = wake_executor
       # 当日の出勤・退勤目標を計算する純ロジック（可変状態を持たないので使い回してよい）。
       @planner = DayPlanner.new(config: config, logger: logger)
 
@@ -99,6 +107,8 @@ module Ak4Punch
       @calendar_failure_count = 0 # sukesan 取得の連続失敗回数（成功でリセット。定期再取得の通知判定に使う）
       @notified_keys = []       # 当日通知済みのイベント種別（同日デデュープ用。日付変化でリセット）
       @recheck_requested = false # SIGUSR1（punch recheck）による再計画要求フラグ
+      @wake_worker = nil        # 最後に起動した起床予約のワーカー（処理中か＝alive? を見るだけ）
+      @wake_busy_ticks = 0      # ワーカーが処理中のまま迎えた tick の連続回数（終了でリセット。日付では戻さない）
       @running = false
     end
 
@@ -118,6 +128,7 @@ module Ak4Punch
         @sleeper.call(@config.daemon_tick_seconds) if @running
       end
 
+      # 起床予約のワーカーは待たずに終了する（reschedule_wakes 参照）。
       @logger.info("デーモンを終了しました")
     end
 
@@ -135,6 +146,7 @@ module Ak4Punch
       # 毎 tick で pmset 起床予約を現状の計画に突き合わせる（add-only・不足分のみ追加）。
       # 同居デーモンの cancelall などで自分の予約が消えても、次の tick で再追加され自己回復する。
       # 予約が揃っていれば pmset -g sched の読み取り1回だけで無言終了する軽い処理。
+      # 突き合わせはバックグラウンドのワーカーで行い、tick は終了を待たない（reschedule_wakes 参照）。
       reschedule_wakes(now)
     end
 
@@ -782,9 +794,24 @@ module Ak4Punch
     # 現状の計画（未完了の打刻目標＋翌営業日ブートストラップ）に pmset 起床予約を
     # 突き合わせ、不足分だけを追加する。tick 末尾から毎回呼ばれる。WakeScheduler は
     # add-only（不足分のみ追加・何も消さない）なので、揃っていれば読み取り1回で無言終了し、
-    # 消されていれば再追加する。manage_wake=false のときは pmset に一切触らない。
+    # 消されていれば再追加する。manage_wake=false のときは pmset に一切触らない（ワーカーも起動しない）。
+    #
+    # 突き合わせ（WakeScheduler#reschedule）はバックグラウンドのワーカーで実行し、tick は終了を待たない。
+    # WakeScheduler は pmset を子プロセスとして起動するが（tick の中で fork するのはここだけ）、
+    # ユーザーのプロセス数が上限に達して fork が EAGAIN になると、Open3（Process.spawn）は
+    # 例外を上げずに戻らなくなり、上限を下回ってから戻る（ulimit -u で上限を下げて実測）。
+    # tick の中で直接呼ぶとそこで tick ループ全体が止まり、fork を必要としない打刻（Net::HTTP）や
+    # sukesan の再取得まで止まる。2026-09-25 には、プロセス数が上限（kern.maxprocperuid）に
+    # 達していた約8時間 tick が止まり、退勤が打刻されなかった。
+    #   - 目標の計算はメインスレッドで済ませ、ワーカーには配列だけを渡す（ワーカーは Daemon の状態に触らない）。
+    #   - 前回のワーカーが処理中なら新しいワーカーは起動しない（積み重ねない）。代わりに処理中のまま
+    #     迎えた tick の連続回数を数え、WAKE_STUCK_TICKS 回で警告し Slack に同日1回通知する。
+    #     経過時間ではなく回数で判定するのは、Mac がスリープをまたぐと経過時間だけが伸びて
+    #     誤って通知してしまうため（@calendar_failure_count と同じ考え方）。
+    #   - 終了時（SIGTERM）はワーカーを待たない（固まっていても終了できるように）。
     def reschedule_wakes(now)
       return unless @config.daemon_manage_wake
+      return if wake_worker_busy?
 
       targets = @punch_plans.values.reject(&:done?).map(&:target_at).select { |t| t > now }
       # ブートストラップ起床: 当日の打刻が全て完了する（targets が空になる）と、
@@ -794,7 +821,38 @@ module Ak4Punch
       # 当日計画が作られて正確な打刻目標の wake が再予約される。
       bootstrap = next_workday_morning_wake(now)
       targets << bootstrap if bootstrap
-      @wake_scheduler.reschedule(targets)
+      start_wake_worker(targets.freeze)
+    end
+
+    # 前回の起床予約のワーカーがまだ処理中か。処理中なら連続回数を数え、閾値で警告・通知する。
+    # 処理中でなければ（前回が終わっていれば）連続回数を戻し、固まっていた場合は復旧を記録する。
+    def wake_worker_busy?
+      if @wake_worker&.alive?
+        @wake_busy_ticks += 1
+        if @wake_busy_ticks == WAKE_STUCK_TICKS
+          @logger.warn("起床予約の処理（pmset）が #{@wake_busy_ticks} tick 連続で戻っていません。" \
+                       "打刻は続けますが、起床予約の追加は止まっています")
+          notify_once(:wake_stuck,
+                      "起床予約の処理（pmset）が戻りません。打刻は続けますが、起床予約の追加が止まっています")
+        end
+        return true
+      end
+
+      if @wake_busy_ticks.positive?
+        @logger.info("起床予約の処理（pmset）が戻りました（処理中のまま迎えた tick が連続 #{@wake_busy_ticks} 回）")
+        @wake_busy_ticks = 0
+      end
+      false
+    end
+
+    # 起床予約のワーカーを起動する。ワーカー内の例外はログに出すだけで daemon を落とさない
+    # （tick の rescue と同じ扱い。次の tick で新しいワーカーが再試行する）。
+    def start_wake_worker(targets)
+      @wake_worker = @wake_executor.call do
+        @wake_scheduler.reschedule(targets)
+      rescue StandardError => e
+        @logger.error("起床予約の処理中にエラー: #{e.class}: #{e.message}")
+      end
     end
 
     # 翌日以降で最初の営業日の朝の起床時刻(Time)を返す。安全のため最大366日で打ち切り。

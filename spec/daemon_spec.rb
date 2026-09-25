@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "timeout" # 起床予約のワーカーの spec で、tick が戻らない退行を hang ではなく失敗にする
 
 RSpec.describe Ak4Punch::Daemon do
   let(:date) { Date.new(2026, 7, 10) }
@@ -36,13 +37,19 @@ RSpec.describe Ak4Punch::Daemon do
   let(:clock_time) { { now: t("08:00") } }
   let(:clock) { -> { clock_time[:now] } }
 
+  # 起床予約のワーカーをその場で同期実行する実行器（tick が戻った時点で reschedule が済んでいる）。
+  # 返すワーカーは終了済み（alive? が false）なので、次の tick は常に新しいワーカーを起動する。
+  def sync_wake_executor = ->(&job) { job.call; instance_double(Thread, alive?: false) }
+
   # Daemon の生成。依存はすべて上の let（double）を既定にし、差し替えたいものだけ渡す。
+  # 起床予約のワーカーは既定で同期実行にする（ワーカー自体の挙動は「起床予約のワーカー」で検証）。
   def build_daemon(config: self.config, clock: self.clock, stamper: self.stamper,
-                   calendar_client: self.calendar_client, notifier: self.notifier)
+                   calendar_client: self.calendar_client, notifier: self.notifier,
+                   wake_executor: sync_wake_executor)
     described_class.new(
       config: config, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
       token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
-      notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      notifier: notifier, clock: clock, sleeper: ->(_s) {}, wake_executor: wake_executor,
     )
   end
 
@@ -640,6 +647,165 @@ RSpec.describe Ak4Punch::Daemon do
       allow(calendar).to receive(:target?) { |d| d == Date.new(2026, 7, 13) } # 次の営業日 = 月曜
       expect(wake_scheduler).to receive(:reschedule).with([t("09:30", day: 13)])
       daemon.tick
+    end
+  end
+
+  # 起床予約の突き合わせはバックグラウンドのワーカーで実行し、tick はその終了を待たない
+  # （理由は Daemon#reschedule_wakes のコメント）。
+  describe "起床予約のワーカー" do
+    # 起動したジョブを実行せずに保持する実行器（処理中のまま戻らないワーカーの再現）。
+    # finish_worker で保持しているジョブを実行し、そのワーカーを終了させる。
+    let(:held_workers) { [] }
+    let(:held_executor) do
+      lambda do |&job|
+        state = { job: job, alive: true }
+        held_workers << state
+        instance_double(Thread).tap { |w| allow(w).to receive(:alive?) { state[:alive] } }
+      end
+    end
+    let(:stuck_daemon) { build_daemon(wake_executor: held_executor) }
+
+    def finish_worker(state)
+      state[:job].call
+      state[:alive] = false
+    end
+
+    # 08:00 から minutes 分後に tick する（09:30 の出勤 due より前なら打刻は起きない）。
+    def tick_after(d, minutes)
+      clock_time[:now] = t("08:00") + (minutes * 60)
+      d.tick
+    end
+
+    let(:stuck_warning) { /起床予約の処理（pmset）が 10 tick 連続で戻っていません。打刻は続けますが/ }
+    let(:stuck_notice) { /起床予約の処理（pmset）が戻りません。打刻は続けますが、起床予約の追加が止まっています/ }
+
+    before do
+      allow(calendar_client).to receive(:events).and_return([]) # 出勤09:30 / 退勤18:00
+      allow(stamper).to receive(:punch)
+    end
+
+    # 今回の回帰（2026-09-25）: pmset の起動が戻らないと tick ループごと止まり、退勤が打刻されなかった。
+    it "reschedule が戻らなくても tick は終了を待たず、固まっている間も打刻は実行される（既定の Thread 実行器）" do
+      gate = Queue.new
+      entered = Queue.new
+      allow(wake_scheduler).to receive(:reschedule) do
+        entered << :entered
+        gate.pop # 解放されるまで戻らない
+      end
+      # wake_executor を渡さない＝既定の実行器（Thread）で動かす。
+      d = described_class.new(
+        config: config, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: ->(_s) {},
+      )
+
+      begin
+        # tick の中で reschedule を直接呼ぶ形に戻ると、ここで戻らなくなる。hang ではなく失敗として
+        # 検出できるよう上限を付ける（正常なら即座に戻るので、実時間の待ちは発生しない）。
+        Timeout.timeout(5) do
+          tick_after(d, 0)              # 計画作成 → ワーカー起動（reschedule の中で止まる）
+          entered.pop                   # ワーカーが reschedule に入ったことを確かめる
+          clock_time[:now] = t("09:30", 5)
+          d.tick                        # 出勤 due（ワーカーは固まったまま）
+        end
+
+        expect(stamper).to have_received(:punch).with(**punch_args(:in))
+        expect(wake_scheduler).to have_received(:reschedule).once # 処理中は2つ目を起動しない
+      ensure
+        gate << :release
+        d.instance_variable_get(:@wake_worker)&.join
+      end
+    end
+
+    it "前回のワーカーが処理中なら新しいワーカーを起動しない" do
+      tick_after(stuck_daemon, 0) # 計画作成 → ワーカー起動
+      tick_after(stuck_daemon, 1)
+      tick_after(stuck_daemon, 2)
+
+      expect(held_workers.size).to eq 1
+      expect(wake_scheduler).not_to have_received(:reschedule) # 保持したジョブはまだ実行されていない
+    end
+
+    it "処理中のまま迎えた tick が10回連続したら警告し、Slack に1回だけ通知する" do
+      tick_after(stuck_daemon, 0) # ワーカー起動（以降、処理中のまま）
+      (1..9).each { |i| tick_after(stuck_daemon, i) }
+      expect(logger).not_to have_received(:warn).with(stuck_warning)
+      expect(notifier).not_to have_received(:notify).with(stuck_notice)
+
+      tick_after(stuck_daemon, 10) # 10回目
+      expect(logger).to have_received(:warn).with(stuck_warning).once
+      expect(notifier).to have_received(:notify).with(stuck_notice).once
+
+      (11..20).each { |i| tick_after(stuck_daemon, i) } # 固まったまま: 警告も通知も繰り返さない
+      expect(logger).to have_received(:warn).with(stuck_warning).once
+      expect(notifier).to have_received(:notify).with(stuck_notice).once
+    end
+
+    it "処理中だったワーカーが終わったら復旧を記録し、連続回数を戻して新しいワーカーを起動する" do
+      tick_after(stuck_daemon, 0)
+      (1..12).each { |i| tick_after(stuck_daemon, i) } # 12回処理中（10回目で警告・通知済み）
+
+      finish_worker(held_workers.first) # 固まっていた pmset が戻った
+      expect(wake_scheduler).to have_received(:reschedule).with([t("09:30"), t("18:00"), t("09:30", day: 11)])
+
+      tick_after(stuck_daemon, 13)
+      expect(logger).to have_received(:info)
+        .with("起床予約の処理（pmset）が戻りました（処理中のまま迎えた tick が連続 12 回）")
+      expect(held_workers.size).to eq 2 # 新しいワーカーを起動した
+
+      # 連続回数は戻っている: 同じ日にまた固まっても、改めて10回数えるまで警告しない。
+      (14..22).each { |i| tick_after(stuck_daemon, i) } # 9回
+      expect(logger).to have_received(:warn).with(stuck_warning).once
+      tick_after(stuck_daemon, 23) # 10回目 → 警告は出すが、Slack は同日1回のみ
+      expect(logger).to have_received(:warn).with(stuck_warning).twice
+      expect(notifier).to have_received(:notify).with(stuck_notice).once
+    end
+
+    it "次の tick までに終わる通常の処理では、復旧ログも警告も出さない" do
+      d = build_daemon # 同期実行（毎回終了済み）
+      (0..15).each { |i| tick_after(d, i) }
+
+      expect(wake_scheduler).to have_received(:reschedule).exactly(16).times
+      expect(logger).not_to have_received(:info).with(/起床予約の処理（pmset）が戻りました/)
+      expect(logger).not_to have_received(:warn).with(/起床予約の処理/)
+    end
+
+    it "ワーカー内の例外はエラーログに出して daemon を落とさず、次の tick で再試行する" do
+      d = build_daemon # 同期実行
+      allow(wake_scheduler).to receive(:reschedule).and_raise(RuntimeError, "boom")
+
+      expect { tick_after(d, 0) }.not_to raise_error
+      expect(logger).to have_received(:error).with("起床予約の処理中にエラー: RuntimeError: boom")
+
+      tick_after(d, 1)
+      expect(wake_scheduler).to have_received(:reschedule).twice
+    end
+
+    it "manage_wake=false ならワーカーを起動しない" do
+      d = build_daemon(config: config_for(daemon: { "manage_wake" => false }), wake_executor: held_executor)
+      tick_after(d, 0)
+      tick_after(d, 1)
+
+      expect(held_workers).to be_empty
+    end
+
+    it "終了時（run のループを抜けたとき）は処理中のワーカーを待たない" do
+      d = nil
+      # SIGTERM の trap と同じく @running を倒して1周で抜けさせる。
+      stop = ->(_s) { d.instance_variable_set(:@running, false) }
+      d = described_class.new(
+        config: config, stamper: stamper, calendar: calendar, calendar_client: calendar_client,
+        token_store: token_store, client: client, wake_scheduler: wake_scheduler, logger: logger,
+        notifier: notifier, clock: clock, sleeper: stop, wake_executor: held_executor,
+      )
+      allow(d).to receive(:install_signal_handlers) # テストのプロセスにシグナルハンドラを入れない
+
+      # 保持したワーカーは alive? にしか応答しない（join などを呼ぶとここで失敗する）。
+      d.run
+
+      expect(held_workers.size).to eq 1
+      expect(held_workers.first[:alive]).to be true
+      expect(logger).to have_received(:info).with("デーモンを終了しました")
     end
   end
 
