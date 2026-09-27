@@ -3,6 +3,7 @@
 マネーフォワード クラウド勤怠Plus（旧AKASHI）へ出勤/退勤を自動打刻する常駐デーモン。
 出勤はローカルのカレンダーAPI（sukesan）の最初の業務イベントの開始までに、退勤は最終業務イベントの終了に追随して打刻し、
 カレンダー上の休暇イベントの時間帯には打刻しません（午前休・午後休は勤務する側に寄せ、勤務時間がなくなる日は打刻しません）。
+sukesan を使わず、設定した所定時刻だけで打刻することもできます（[sukesan を使わない場合](#sukesan-を使わない場合)）。
 
 ## 重要な前提
 
@@ -13,7 +14,9 @@
 
 - Ruby 3.2+（開発は 3.4.10 で確認。`.ruby-version` 参照）、Bundler
 - AKASHI 側で「公開API利用可否」を「利用する」に設定し、マイページでアクセストークンを発行
-- カレンダーAPI sukesan が同一マシンで稼働していること（127.0.0.1 限定）
+- カレンダー連動を使う場合: カレンダーAPI [sukesan](https://github.com/namikawa/sukesan) が同一マシンで稼働していること（127.0.0.1 限定）
+  - sukesan v1.0.0 で動作確認しています。sukesan を更新するときは、その CHANGELOG の「変更」を確認してください（API の互換性のない変更は先頭に書かれます）。
+  - APIキーは `read` 権限で足ります（本ツールはイベント一覧の取得しか行いません）。
 - Mac（launchd で常駐・pmset で自動起床）。電源接続での運用を推奨
 
 ## セットアップ
@@ -27,7 +30,7 @@ install -m 600 .env.example .env
 #   AK4_COMPANY_ID   … 企業ID
 #   AK4_TOKEN        … マイページで発行したアクセストークン
 #   SUKESAN_BASE_URL … 既定 http://127.0.0.1:3000
-#   SUKESAN_API_KEY  … sukesan で発行した APIキー（64文字）
+#   SUKESAN_API_KEY  … sukesan で発行した APIキー（64文字・read 権限）。カレンダー連動を使わない場合は不要
 
 # 2) 動作設定（打刻時刻・揺らぎ・除外/休暇キーワード・除外日など）
 cp config/config.example.yml config/config.yml
@@ -64,6 +67,14 @@ bin/daemonctl restart           # デーモンを再起動（start/stop/log も�
 - 休暇の入れ方: カレンダーに「休暇」「休み」を含むイベントを、実際に休む時間帯で入れるだけ（午前休・午後休は時間指定、全休は終日）。`schedule.exclude_dates` は補助として使えます。
 - 休暇として拾われたイベントは `punch plan` の先頭に一覧表示されます。キーワードは部分一致なので「休み明けMTG」のようなタイトルも休暇になります。意図しない扱いがないか plan で確認できます。
 - 誤って休暇イベントを入れて打刻が止まったら: カレンダーを修正 → `punch recheck`。打刻済みの分は AKASHI 側で手動削除してください。
+
+## sukesan を使わない場合
+
+`config/config.yml` の `calendar.enabled` を `false` にすると、sukesan に接続せず、出勤・退勤とも所定時刻（`work.clock_in` / `work.clock_out`）＋揺らぎで打刻します。`SUKESAN_API_KEY` は不要です。反映は他の設定変更と同じく `bin/daemonctl restart` です。
+
+- 休暇を検知できません。休む日は `schedule.exclude_dates` に入れてください。日単位の指定なので、午前休・午後休の日は手動で打刻してください。
+- 予定に合わせた出勤の前倒し・退勤の後ろ倒しは行いません。
+- 連動を有効にしたまま sukesan が止まっていても、所定時刻で打刻は続きます。ただし休暇を検知できず、sukesan 障害の通知も毎日届くため、sukesan を止める期間が決まっているなら `false` に切り替えてください。
 
 ## 仕組み
 
