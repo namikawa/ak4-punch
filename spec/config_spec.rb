@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "tmpdir"
 
 RSpec.describe Ak4Punch::Config do
   # 既定値（未設定時）の一覧。同時に「既定値だけで validate! を通る」ことの検証も兼ねる
@@ -28,6 +29,42 @@ RSpec.describe Ak4Punch::Config do
     )
     expect(cfg.exclude_dates).to eq [Date.new(2026, 12, 29)]
     expect(cfg.extra_workdays).to eq [Date.new(2026, 7, 11)]
+  end
+
+  describe ".load（config.yml の読み込み）" do
+    # Config.load は root の .env を ENV に読み込むため、root には .env を置かない一時ディレクトリを渡す
+    # （リポジトリの .env を読ませず、ENV も汚さない）。
+    def load_yaml(yaml)
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "config.yml")
+        File.write(path, yaml)
+        described_class.load(config_path: path, root: dir)
+      end
+    end
+
+    it "引用符なしの日付（YAML が Date として読む）も引用符付きの日付も Date として読める" do
+      cfg = load_yaml(<<~YAML)
+        company_id: "x"
+        schedule:
+          exclude_dates:
+            - 2026-12-29
+            - "2026-12-30"
+          extra_workdays:
+            - 2026-07-11
+      YAML
+      expect(cfg.exclude_dates).to eq [Date.new(2026, 12, 29), Date.new(2026, 12, 30)]
+      expect(cfg.extra_workdays).to eq [Date.new(2026, 7, 11)]
+    end
+
+    it "Date 以外の型（引用符なしの日時は Time になる）は許可しない" do
+      yaml = <<~YAML
+        company_id: "x"
+        schedule:
+          exclude_dates:
+            - 2026-12-29 10:00:00
+      YAML
+      expect { load_yaml(yaml) }.to raise_error(Psych::DisallowedClass, /Time/)
+    end
   end
 
   it "company_id 未設定ならエラー" do

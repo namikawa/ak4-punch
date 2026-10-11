@@ -63,7 +63,9 @@ module Ak4Punch
 
     def self.load(config_path:, root:)
       EnvFile.load(File.join(root, ".env"))
-      data = File.exist?(config_path) ? (YAML.safe_load_file(config_path) || {}) : {}
+      # 引用符なしの日付（schedule.exclude_dates の `- 2026-12-29` など）は YAML が Date として読むため、
+      # Date だけを許可する（許可しないと Psych::DisallowedClass で起動に失敗する）。Time などは拒否のまま。
+      data = File.exist?(config_path) ? (YAML.safe_load_file(config_path, permitted_classes: [Date]) || {}) : {}
       new(data: data, root: root)
     end
 

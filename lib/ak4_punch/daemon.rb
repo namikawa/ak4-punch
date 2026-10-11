@@ -38,7 +38,7 @@ module Ak4Punch
     # 1日分の打刻計画（1 kind 分）。
     #   attempted:     窓内で打刻を試行したか（寝過ごしスキップとリトライ枯渇の区別用）
     #   last_error:    最後の打刻失敗のエラー内容（枯渇通知に含める）
-    #   final_checked: この目標に対して退勤直前チェックを実施済みか（リトライ中は再実行しない）
+    #   final_checked: この目標に対して打刻直前チェックを実施済みか（出勤・退勤とも。リトライ中は再実行しない）
     PunchPlan = Struct.new(:kind, :target_at, :done,
                            :attempted, :last_error, :final_checked, keyword_init: true) do
       def done? = done == true
@@ -285,7 +285,7 @@ module Ak4Punch
       # 定期再取得の失敗では打刻目標を所定時刻へ巻き戻さない（直近の有効目標を維持する）。
       # 巻き戻すと、カレンダー由来の遅い目標が所定時刻（＝過去）に化けて grace 超過と判定され、
       # 退勤が恒久スキップ（give_up で done 確定 → 以降 refresh されない）になる事故が起きるため。
-      # 打刻直前チェック（postpone_out_by_final_check?）と同じ「取得失敗は現状維持」の安全側に倒す。
+      # 打刻直前チェック（postpone_by_final_check?）と同じ「取得失敗は現状維持」の安全側に倒す。
       # 次の間隔まで再取得を待つため @last_refresh_at は上で進めてある（30秒毎の連打・ブロッキングを避ける）。
       # Slack 通知は連続失敗が閾値に達するまで抑制する（実害がないため）。DarkWake（同居デーモンの
       # 起床予約に相乗り）で無通信のまま tick が回ると sukesan が Google に到達できず 1 回だけ失敗する、
@@ -382,8 +382,8 @@ module Ak4Punch
     # 目標が変わったらリセットする（新目標では改めて最終チェック→打刻の順で進む）。
     # done を目標一致でゲートするのは、断念（done）した目標の状態が別の目標に伝染して
     # 「打刻もされず起床予約もされない」計画になるのを防ぐため。
-    # final_checked は fire_due_punches が退勤にしか立てない（`kind == :out && !plan.final_checked`）
-    # ため、出勤の計画では常に false のままになる。両者で同じ式を使ってよいのはこのため。
+    # final_checked も出勤・退勤で意味は同じ（その目標で打刻直前チェック（postpone_by_final_check?）を
+    # 実施済みか）なので、目標が変わったら false に戻して新目標で改めて実施させる。
     #
     # 既存計画の更新で、新目標が到達不能（unreachable_target?）なら更新せず既存の目標を維持する。
     # 見送るのは「採用した瞬間に give_up にしかならない」場合だけで、これは出勤・退勤の両方で起きる。
@@ -442,11 +442,11 @@ module Ak4Punch
           next
         end
 
-        # 退勤は打刻直前にカレンダーを最終再取得し、直前の会議延長に追随する。
+        # 出勤・退勤とも打刻直前にカレンダーを最終再取得し、直前に入った休暇や会議の延長に追随する。
         # 同一目標に対しては初回 due 時のみ実施し、リトライ中は打刻だけを再試行する
         # （30秒毎に sukesan を叩かない）。目標が変わったら新目標で改めて実施する。
-        if kind == :out && !plan.final_checked
-          next if postpone_out_by_final_check?(now)
+        unless plan.final_checked
+          next if postpone_by_final_check?(kind, now)
 
           plan.final_checked = true
         end
@@ -464,9 +464,9 @@ module Ak4Punch
         next if postpone_punch_after_date_change?(plan, punch_now)
 
         # 休暇ゲート（POST 直前の単一判定）。出勤・退勤とも、初回もリトライも必ず通す。
-        # 休暇による中止の判定はここ1箇所だけに置く。直前チェック（退勤のみ・初回のみ）の中に
-        # 置くと、そこを通らない経路（出勤全般・recheck 後の計画作り直し・打刻失敗のリトライ）が
-        # 素通しになる。
+        # 休暇による中止の判定はここ1箇所だけに置く。直前チェック（同一目標につき初回 due 時のみ・
+        # 再取得に失敗したら何も判定しない）の中に置くと、打刻失敗のリトライや、直前の再取得に
+        # 失敗した tick が素通しになる。
         next if abort_punch_in_leave?(plan, punch_now)
 
         ok, error = execute_punch(kind, punch_now, deadline: post_deadline_at(plan))
@@ -494,7 +494,7 @@ module Ak4Punch
     #
     # 打刻済み確認は now ではなく計画日（@current_date）について行う。これは「計画日の打刻を
     # 諦める」判断なので、打刻済みかどうかも計画日について見るのが正しい。
-    # fire_due_punches からの2つ目の呼び出しは punch_now（退勤の直前チェック後の時刻）を渡し、
+    # fire_due_punches からの2つ目の呼び出しは punch_now（打刻直前チェック後の時刻）を渡し、
     # 日付ガード（postpone_punch_after_date_change?）より手前にあるため、日付を跨いだ時刻で
     # 呼ばれうる。そこで now.to_date を見ると翌日の打刻履歴を確認してしまい、翌日に何らかの
     # 打刻（0時台の手動打刻など）があると通知を抑止して plan.done = true にする。done が立つと
@@ -543,13 +543,20 @@ module Ak4Punch
       false
     end
 
-    # 退勤打刻の直前チェック。sukesan を強制再取得して退勤目標を再計算し、
+    # 打刻の直前チェック（出勤・退勤で共通）。sukesan を強制再取得してその kind の目標を再計算し、
     # 目標が現在より後ろへ動いていたら計画を更新して打刻を延期する（done にしない。
-    # 新目標で改めて due になったら、その時も最終チェックが走る）。
-    # 直前に休暇イベントが入って全休になった場合・いま打刻すると休暇中の記録になる場合は中止する。
+    # 新目標で改めて due になったら、その時も直前チェックが走る）。
+    # 直前に休暇イベントが入って全休になった場合は、以降の打刻を中止する（switch_to_full_leave?）。
+    # いま打刻すると休暇中の記録になる場合の中止は、ここではなく POST 直前の休暇ゲートが判定する。
     # 戻り値: true = 延期/中止（この tick では打刻しない） / false = このまま打刻してよい。
-    def postpone_out_by_final_check?(now)
-      return false unless @config.calendar_enabled # 連動OFFは最終チェックなし
+    #
+    # 出勤の例: 計画後に午前休 09:00-13:00 が入ると、出勤目標は休暇明け（13:00 − 揺らぎ）へ延期される。
+    # 延期せずに打刻へ進むと、休暇ゲートが「現在の目標が休暇を反映した目標と一致しない」として
+    # 出勤を中止（done）し、休暇明けの出勤が打刻されなくなる。
+    # 退勤の例: 直前に会議が延長されたら、延長後の終了 + 揺らぎへ延期する。
+    # 新目標が現在以前（前倒し）の場合は採用せず、現在の目標のまま打刻する。
+    def postpone_by_final_check?(kind, now)
+      return false unless @config.calendar_enabled # 連動OFFは直前チェックなし
 
       fetched = fetch_events(now.to_date)
 
@@ -558,7 +565,7 @@ module Ak4Punch
       # 当日すでに把握している休暇の判定は POST 直前の休暇ゲート（abort_punch_in_leave?）が
       # @leave_snapshot で行うため、ここでは何もしない（この経路も必ずゲートを通る）。
       if fetched[:error]
-        @logger.warn("退勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します")
+        @logger.warn("#{label(kind)}直前チェック: 再取得に失敗したため、現在の目標のまま打刻します")
         return false
       end
 
@@ -571,13 +578,15 @@ module Ak4Punch
       # まず全休判定（休暇で勤務時間が消えていたら以降の打刻を中止）。
       return true if switch_to_full_leave?(day_plan)
 
-      # 目標が後ろへ動いていたら延期する。休暇より後ろに予定がある日（中抜け）は、
-      # いま休暇の時間帯にいても休暇明けの目標へ延期されるので、この判定を
-      # 「現在が休暇の時間帯か」より先に置くこと（順序を逆にすると中抜けの日の退勤を落とす）。
-      if day_plan.clock_out.target > now
-        @logger.info("退勤直前チェック: 目標が後ろ倒しされたため打刻を延期します")
+      # 目標が後ろへ動いていたら延期する。この判定は休暇ゲートより手前にあるため、
+      # いま休暇の時間帯にいても休暇明けの目標があればそちらへ延期される
+      # （午前休が入った日の出勤・休暇の後ろに予定がある中抜けの日の退勤）。
+      result = day_plan.result_for(kind)
+      if result.target > now
+        @logger.info("#{label(kind)}直前チェック: 目標が後ろ倒しされたため打刻を延期します")
         # 新目標は now より後（上のガードで確認済み）なので、set_plan の到達不能ガードには掛からない。
-        set_plan(:out, day_plan.clock_out, now) # 「退勤目標を更新」ログが出る（起床予約は tick 末尾で新目標に追随）
+        # 「出勤目標を更新」「退勤目標を更新」のログが出る（起床予約は tick 末尾で新目標に追随）。
+        set_plan(kind, result, now)
         return true
       end
 
@@ -642,7 +651,7 @@ module Ak4Punch
     # これで次の3つが kind を問わず同じ規則で塞がる:
     #   ① 日中に休暇が入り、新目標が到達不能で set_plan が更新を見送った日
     #   ② recheck 直後の取得失敗で、所定フォールバックの計画に作り直された日（全休日・半休日とも）
-    #   ③ 打刻失敗のリトライ中に定期再取得で休暇を把握した日（退勤の直前チェックを通らない経路）
+    #   ③ 打刻失敗のリトライ中に定期再取得で休暇を把握した日（同一目標では打刻直前チェックを再実行しない経路）
     # snapshot が無い日（当日一度も取得に成功していない）は判定材料がないので打刻する。
     def abort_punch_in_leave?(plan, now)
       snapshot = @leave_snapshot
@@ -688,7 +697,7 @@ module Ak4Punch
     # 以降の打刻を中止する。戻り値: true = 全休に切り替えた。
     #
     # 通知は「日中に全休へ切り替わった」場合だけ出す（同日1回）。この経路の呼び出し元は
-    # 定期再取得（refresh_if_due）と退勤の直前チェック（postpone_out_by_final_check?）だけで、
+    # 定期再取得（refresh_if_due）と打刻直前チェック（postpone_by_final_check?・出勤・退勤とも）だけで、
     # 初期計画は build_and_apply_day_plan が DayPlan#full_leave? を直接呼ぶためここを通らない
     # （休暇を取った日に毎回通知が来るのを避けるため、この構造は変えないこと）。
     # 打刻済みの分の手動削除が必要になる＝ユーザの対応が要る事象なので、ログだけでは足りない。
