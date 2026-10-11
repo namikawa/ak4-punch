@@ -7,7 +7,7 @@ module Ak4Punch
   # 可変状態を持たない（config と logger だけを持つ）ため、同じ入力からは必ず同じ DayPlan を返す。
   #
   # 呼び出し元は2つ:
-  #   - Daemon … 当日計画の作成・定期再取得・退勤の打刻直前チェック
+  #   - Daemon … 当日計画の作成・定期再取得・打刻直前チェック（出勤・退勤）
   #     （計算結果を打刻計画・休暇スナップショットへ反映するのは Daemon の責務）
   #   - CLI#plan … `punch plan` のドライラン表示
   #
@@ -51,8 +51,11 @@ module Ak4Punch
       # 「全休」として黙って打刻を止めないため）。
       def full_leave? = leaves.any? && clock_in.deadline >= clock_out.base
 
+      # kind に対応する計画結果（出勤は ClockInResult・退勤は ClockOutResult）。
+      def result_for(kind) = kind == :in ? clock_in : clock_out
+
       # kind に対応する「休暇を反映して計算した目標」。
-      def target_for(kind) = kind == :in ? clock_in.target : clock_out.target
+      def target_for(kind) = result_for(kind).target
     end
 
     def initialize(config:, logger:)

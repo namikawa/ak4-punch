@@ -959,7 +959,7 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
-  describe "退勤直前の最終チェック" do
+  describe "打刻直前の最終チェック（出勤・退勤）" do
     # 定期 refresh の干渉を避けるため間隔を大きくし、due 時の fetch が最終チェック由来であることを保証する
     let(:config) { config_for(calendar: { "refresh_interval_minutes" => 999 }) }
 
@@ -1022,19 +1022,6 @@ RSpec.describe Ak4Punch::Daemon do
       expect(stamper).to have_received(:punch).with(**punch_args(:out))
     end
 
-    it "出勤の due では再取得しない" do
-      allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
-      allow(stamper).to receive(:punch)
-
-      clock_time[:now] = t("08:00")
-      daemon.tick # 計画作成で1回 fetch
-
-      clock_time[:now] = t("09:30", 5)
-      daemon.tick # 出勤 due → 打刻（最終チェックは走らない）
-      expect(calendar_client).to have_received(:events).once
-      expect(stamper).to have_received(:punch).with(**punch_args(:in))
-    end
-
     it "退勤リトライ中は最終チェックを再実行しない（同一目標では初回 due 時のみ）" do
       allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
       out_calls = 0
@@ -1050,16 +1037,17 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick # 計画作成（fetch 1回目）
 
       clock_time[:now] = t("09:30", 5)
-      daemon.tick # 出勤打刻（最終チェックなし）
+      daemon.tick # 出勤 due → 出勤の最終チェック（fetch 2回目）→ 出勤打刻
 
       clock_time[:now] = t("18:30", 10)
-      daemon.tick # 退勤 due → 最終チェック（fetch 2回目）→ 打刻失敗1
+      daemon.tick # 退勤 due → 最終チェック（fetch 3回目）→ 打刻失敗1
       clock_time[:now] = t("18:30", 40)
       daemon.tick # リトライ: fetch なしで打刻失敗2
       clock_time[:now] = t("18:31", 10)
       daemon.tick # リトライ: fetch なしで打刻成功
 
-      expect(calendar_client).to have_received(:events).twice
+      # 計画作成・出勤の最終チェック・退勤の最終チェックの3回（リトライで再取得していれば5回になる）
+      expect(calendar_client).to have_received(:events).exactly(3).times
       expect(out_calls).to eq 3
       expect(notifier).not_to have_received(:notify)
     end
@@ -1346,6 +1334,158 @@ RSpec.describe Ak4Punch::Daemon do
       clock_time[:now] = t("15:00", 5)
       daemon.tick
       expect(notifier).not_to have_received(:notify)
+    end
+
+    # 出勤も退勤と同じ規則で、同一目標に対して初回 due 時に1回だけ sukesan を再取得する。
+    # 計画後（定期再取得の間隔内）に入れた休暇へ、出勤の打刻前に追随させるため。
+    context "出勤" do
+      # 実運用と同じく morning_wake_at を所定より前に置き、出勤目標がカレンダーの予定に連動できるようにする。
+      let(:config) do
+        config_for(calendar: { "refresh_interval_minutes" => 999 }, daemon: { "morning_wake_at" => "07:45" })
+      end
+
+      it "出勤の due でも再取得し、目標が不変ならその tick で打刻する" do
+        allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 計画作成で1回 fetch（出勤09:30 / 退勤18:30）
+
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤 due → 最終チェック（fetch 2回目・目標不変）→ 打刻
+        expect(calendar_client).to have_received(:events).twice
+        expect(stamper).to have_received(:punch).with(**punch_args(:in))
+        expect(logger).not_to have_received(:info).with(/出勤直前チェック/)
+      end
+
+      it "計画後に終日の休暇が入っていたら、出勤の due で全休と判定して打刻しない（通知は1回）" do
+        evs = { list: [event(title: "実装", starts_at: t("10:00"), ends_at: t("18:30"))] }
+        allow(calendar_client).to receive(:events) { evs[:list] }
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 通常計画（出勤09:30 / 退勤18:30）
+
+        evs[:list] = [event(title: "休み", ends_at: nil, all_day: true)] # 体調不良の朝に終日の休暇を入れた
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤 due → 最終チェックで全休判定 → 以降の打刻を中止
+        expect(logger).to have_received(:warn)
+          .with(/休暇イベント『休み』\(終日\) により本日の勤務時間がなくなったため、以降の打刻を中止します/)
+        expect(notifier).to have_received(:notify)
+          .with(/休暇イベント『休み』\(終日\) により本日の勤務時間がなくなったため、以降の打刻を中止しました/).once
+        expect(stamper).not_to have_received(:punch)
+
+        # 以降の tick でも打刻しない（計画なし＝再取得もしない）。通知も増えない。
+        clock_time[:now] = t("09:35")
+        daemon.tick
+        clock_time[:now] = t("18:30", 5)
+        daemon.tick
+        expect(stamper).not_to have_received(:punch)
+        expect(calendar_client).to have_received(:events).twice
+        expect(notifier).to have_received(:notify).once
+      end
+
+      it "計画後に午前休が入っていたら、出勤を休暇明けの目標へ延期し、その時刻に打刻する（休暇ゲートで中止しない）" do
+        evs = { list: [] }
+        allow(calendar_client).to receive(:events) { evs[:list] }
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 通常計画（出勤09:30 / 退勤18:00）
+
+        evs[:list] = [event(title: "午前休み", starts_at: t("09:00"), ends_at: t("13:00"))]
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤 due → 最終チェックで休暇明け 13:00 へ延期（この tick では打刻しない）
+        expect(logger).to have_received(:info).with(/出勤直前チェック: 目標が後ろ倒しされたため打刻を延期します/)
+        expect(logger).to have_received(:info).with(/出勤目標を更新: 2026-07-10 09:30:00 → 2026-07-10 13:00:00/)
+        expect(stamper).not_to have_received(:punch)
+        expect(wake_scheduler).to have_received(:reschedule).with([t("13:00"), t("18:00"), t("07:45", day: 11)])
+
+        clock_time[:now] = t("13:00") # 休暇の終端＝閉区間の内側で due になる
+        daemon.tick # 新目標 due → 最終チェック（不変）→ 休暇ゲートは目標一致で通す → 打刻
+        expect(stamper).to have_received(:punch).with(**punch_args(:in)).once
+        expect(logger).not_to have_received(:warn).with(/出勤打刻を中止します/)
+        expect(notifier).not_to have_received(:notify)
+      end
+
+      it "最終チェックで目標が前倒しになっていても採用せず、現在の目標のまま出勤を打刻する" do
+        evs = { list: [] }
+        allow(calendar_client).to receive(:events) { evs[:list] }
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 出勤09:30（予定なし）
+
+        evs[:list] = [event(title: "急な打合せ", starts_at: t("09:20"), ends_at: t("10:00"))]
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤 due → 最終チェックの新目標 09:20 は現在以前なので採用しない → 打刻
+
+        # 期限が 09:30 + grace のまま＝目標は 09:30 のまま打刻した
+        expect(stamper).to have_received(:punch).with(**punch_args(:in, deadline: t("09:40")))
+        expect(logger).not_to have_received(:info).with(/出勤目標を更新/)
+      end
+
+      it "出勤の最終チェックの再取得に失敗したら、警告つきで現在の目標のまま打刻する" do
+        calls = 0
+        allow(calendar_client).to receive(:events) do
+          calls += 1
+          raise Ak4Punch::CalendarClient::ApiError, "接続拒否" if calls > 1
+
+          [event(title: "定例会議", starts_at: t("09:00"), ends_at: t("10:00"))]
+        end
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 出勤目標 09:00（カレンダー由来。所定の締切は 09:30）
+        expect(logger).to have_received(:info).with(/出勤目標を設定: 2026-07-10 09:00:00/)
+
+        clock_time[:now] = t("09:00", 5)
+        daemon.tick # due → 最終チェックの再取得が失敗 → 現在の目標のまま打刻
+        expect(logger).to have_received(:warn).with(/出勤直前チェック: 再取得に失敗したため、現在の目標のまま打刻します/)
+        expect(stamper).to have_received(:punch).with(**punch_args(:in, deadline: t("09:10")))
+        # 所定時刻へ巻き戻して延期しない（計画は更新しない）
+        expect(logger).not_to have_received(:info).with(/出勤目標を更新/)
+      end
+
+      it "出勤の打刻失敗のリトライ中は再取得しない（同一目標では初回 due 時のみ）" do
+        allow(calendar_client).to receive(:events).and_return([event(title: "実装", ends_at: t("18:30"))])
+        in_calls = 0
+        allow(stamper).to receive(:punch) do |kind:, **|
+          if kind == :in
+            in_calls += 1
+            raise Ak4Punch::Client::ApiError, "一時エラー" if in_calls <= 2
+          end
+          :ok
+        end
+
+        clock_time[:now] = t("08:00")
+        daemon.tick # 計画作成（fetch 1回目）
+
+        clock_time[:now] = t("09:30", 5)
+        daemon.tick # 出勤 due → 最終チェック（fetch 2回目）→ 打刻失敗1
+        clock_time[:now] = t("09:30", 35)
+        daemon.tick # リトライ: fetch なしで打刻失敗2
+        clock_time[:now] = t("09:31", 5)
+        daemon.tick # リトライ: fetch なしで打刻成功
+
+        expect(calendar_client).to have_received(:events).twice
+        expect(in_calls).to eq 3
+        expect(notifier).not_to have_received(:notify)
+      end
+
+      it "カレンダー連動 OFF のときは出勤の due で再取得しない" do
+        d = build_daemon(config: config_for(calendar: { "enabled" => false }))
+        expect(calendar_client).not_to receive(:events)
+        allow(stamper).to receive(:punch)
+
+        clock_time[:now] = t("08:00")
+        d.tick # 計画作成（fetch なし・所定 09:30）
+        clock_time[:now] = t("09:30", 5)
+        d.tick # 出勤 due → 最終チェックなしで打刻
+
+        expect(stamper).to have_received(:punch).with(**punch_args(:in))
+        expect(logger).not_to have_received(:warn).with(/出勤直前チェック/)
+      end
     end
   end
 
@@ -1680,7 +1820,7 @@ RSpec.describe Ak4Punch::Daemon do
     end
   end
 
-  # POST 直前の休暇ゲートは出勤・退勤で対称に効く（退勤側の詳細は「退勤直前の最終チェック」を参照）。
+  # POST 直前の休暇ゲートは出勤・退勤で対称に効く（退勤側の詳細は「打刻直前の最終チェック（出勤・退勤）」を参照）。
   # ここでは出勤側と、打刻済みだった場合の通知抑止を検証する。
   describe "休暇ゲート（出勤側）" do
     it "全休日に recheck の取得が失敗して所定の計画に戻っても、出勤打刻をゲートで止める" do
@@ -2042,7 +2182,7 @@ RSpec.describe Ak4Punch::Daemon do
       build_daemon(config: config_for(calendar: { "enabled" => false }, daemon: { "manage_wake" => false }))
     end
 
-    # 連動OFFでは sukesan を一切叩かない（当日計画・定期再取得・退勤直前の最終チェックのいずれでも）。
+    # 連動OFFでは sukesan を一切叩かない（当日計画・定期再取得・出勤/退勤の打刻直前の最終チェックのいずれでも）。
     # 休暇の判定もできないため、出勤・退勤とも所定時刻で打刻する。
     it "sukesan へ一切アクセスせず、出勤・退勤とも所定時刻で打刻する（最終チェックも走らない）" do
       expect(calendar_client).not_to receive(:events)
@@ -2060,7 +2200,7 @@ RSpec.describe Ak4Punch::Daemon do
       disabled_daemon.tick
       expect(stamper).to have_received(:punch).with(**punch_args(:in))
 
-      # 退勤は所定 18:00。due の直前に最終チェックの再取得が走らないことも上の expect が保証する
+      # 退勤は所定 18:00。出勤・退勤とも due の直前に最終チェックの再取得が走らないことも冒頭の expect が保証する
       clock_time[:now] = t("18:00", 5)
       disabled_daemon.tick
       expect(stamper).to have_received(:punch).with(**punch_args(:out))
