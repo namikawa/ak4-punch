@@ -15,7 +15,7 @@ sukesan を使わず、設定した所定時刻だけで打刻することもで
 - Ruby 3.2+（開発は 3.4.11 で確認。`.ruby-version` 参照）、Bundler
 - AKASHI 側で「公開API利用可否」を「利用する」に設定し、マイページでアクセストークンを発行
 - カレンダー連動を使う場合: カレンダーAPI [sukesan](https://github.com/namikawa/sukesan) が同一マシンで稼働していること（127.0.0.1 限定）
-  - sukesan v1.0.0 で動作確認しています。sukesan を更新するときは、その CHANGELOG の「変更」を確認してください（API の互換性のない変更は先頭に書かれます）。
+  - sukesan v1.0.2 で動作確認しています。sukesan を更新するときは、その CHANGELOG の「変更」を確認してください（API の互換性のない変更は先頭に書かれます）。
   - APIキーは `read` 権限で足ります（本ツールはイベント一覧の取得しか行いません）。
 - Mac（launchd で常駐・pmset で自動起床）。電源接続での運用を推奨
 

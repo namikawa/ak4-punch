@@ -1,6 +1,6 @@
 # 変更履歴
 
-## [未リリース]
+## [1.0.4] - 2026-10-15
 
 ### 修正
 
@@ -14,6 +14,11 @@
   不具合を修正した。YAML は引用符なしの日付を Date として読むが、読み込みで Date を許可していなかった
   （設定の読み込みは Slack 通知の準備より前なので、通知も出ないまま打刻が止まる）。Date だけを許可し、
   それ以外の型は従来どおり拒否する。
+
+### 変更
+
+- sukesan v1.0.2 で動作確認した（README の必要要件を更新）。v1.0.1・v1.0.2 の変更はイベント一覧の API に
+  影響しないため、設定の変更は不要。
 
 ## [1.0.3] - 2026-09-26
 
@@ -289,6 +294,7 @@
 - macOS（launchd 常駐 / pmset 自動起床）、Ruby 3.2+
 - 同一マシンで稼働するカレンダーAPI sukesan
 
+[1.0.4]: https://github.com/namikawa/ak4-punch/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/namikawa/ak4-punch/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/namikawa/ak4-punch/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/namikawa/ak4-punch/compare/v1.0.0...v1.0.1
