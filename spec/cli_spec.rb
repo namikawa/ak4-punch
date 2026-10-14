@@ -4,12 +4,70 @@ require "spec_helper"
 # plist が XML として妥当かを確かめるためだけに使う（テスト専用。Ruby 3.4 では bundled gem
 # なので Gemfile の development/test グループで明示している）。
 require "rexml/document"
+require "shellwords"
+require "stringio"
 
 RSpec.describe Ak4Punch::CLI do
-  describe "LaunchAgent plist の生成" do
-    subject(:cli) { described_class.new }
+  def launchd_output(root, plist_only: false)
+    previous_stdout = $stdout
+    expect(Ak4Punch::Config).not_to receive(:load)
+    expect(Ak4Punch::EnvFile).not_to receive(:load)
+    cli = described_class.new([], { plist_only: plist_only })
+    allow(cli).to receive(:project_root).and_return(root)
+    captured = StringIO.new
+    $stdout = captured
+    cli.launchd
+    captured.string
+  ensure
+    $stdout = previous_stdout
+  end
 
-    def plist_for(root) = cli.send(:build_launchd_plist, root)
+  def guide_commands(output)
+    output.lines.select { |line| line.include?("/bin/daemonctl") || line.include?(" --plist-only") }
+          .map { |line| Shellwords.split(line) }
+  end
+
+  describe "launchd の通常ガイド" do
+    let(:root) { "/Users/tester/src/ak4-punch" }
+
+    it "daemonctlの標準操作とplist-onlyの取得を設定なしで案内する" do
+      commands = guide_commands(launchd_output(root))
+
+      %w[install status restart stop start log].each do |operation|
+        expect(commands).to include(["#{root}/bin/daemonctl", operation])
+      end
+      expect(commands).to include(["#{root}/bin/punch", "launchd", "--plist-only"])
+    end
+
+    it "旧launchctl load/unloadやXMLの直接上書き手順を含めない" do
+      output = launchd_output(root)
+
+      expect(output).not_to match(/launchctl (?:load|unload)/)
+      expect(output).not_to include("cat >", "<<'PLIST'", "<plist")
+    end
+
+    it "空白・引用符・&・コマンド置換風のパスをshell引数としてそのまま復元できる" do
+      ["/Users/tester/project with spaces", %q(/Users/tester/quo'te" & $(not-executed))].each do |path|
+        commands = guide_commands(launchd_output(path))
+
+        expect(commands).to contain_exactly(
+          *%w[install status restart stop start log].map { |operation| ["#{path}/bin/daemonctl", operation] },
+          ["#{path}/bin/punch", "launchd", "--plist-only"],
+        )
+      end
+    end
+  end
+
+  describe "LaunchAgent plist の生成" do
+    def plist_for(root) = launchd_output(root, plist_only: true)
+
+    it "plist-onlyはガイドを含まずXMLだけを設定なしで出力する" do
+      output = plist_for("/Users/tester/src/ak4-punch")
+
+      expect(output).to start_with('<?xml version="1.0" encoding="UTF-8"?>')
+      expect(output).not_to include("/bin/daemonctl", "--plist-only", "launchctl")
+      expect(REXML::Document.new(output).root.name).to eq "plist"
+    end
 
     # plist の dict は <key> の直後の要素が値になる。key 名で値の要素を引く。
     def value_element(xml, key)

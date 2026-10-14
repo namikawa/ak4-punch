@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "open3"
 
 RSpec.describe Ak4Punch::WakeScheduler do
   let(:logger) { instance_double(Logger, info: nil, warn: nil, error: nil) }
@@ -71,6 +72,84 @@ RSpec.describe Ak4Punch::WakeScheduler do
 
   # --- add-only 突き合わせ -------------------------------------------
   describe "#reschedule" do
+    context "既定の読み取り器・書き込み実行器を使うとき" do
+      let(:runner) { nil }
+      let(:reader) { nil }
+      let(:read_cmd) { ["/usr/bin/pmset", "-g", "sched"] }
+      let(:success_status) { instance_double(Process::Status, success?: true) }
+      let(:failure_status) { instance_double(Process::Status, success?: false) }
+
+      before do
+        allow(Open3).to receive(:capture2e).with(*read_cmd).and_return(["", success_status])
+      end
+
+      it "sudo なしで予約を読み、owner 付きの書き込みを複数引数で実行する" do
+        expect(Open3).to receive(:capture2e).with(*read_cmd).ordered.and_return(["", success_status])
+        expect(Open3).to receive(:capture2e).with(*wake_cmd("09:29")).ordered.and_return(["", success_status])
+        expect(logger).to receive(:info).with(/起床予約を追加: 07\/10\/2026 09:29:00/)
+
+        scheduler.reschedule([t("09:30")])
+
+        expect(scheduler.disabled?).to be false
+      end
+
+      it "読み取りの非zero終了では書き込まず、無効化せず次回に再試行する" do
+        expect(Open3).to receive(:capture2e).with(*read_cmd).ordered.and_return(["read failed", failure_status])
+        expect(Open3).to receive(:capture2e).with(*read_cmd).ordered.and_return(["", success_status])
+        expect(Open3).to receive(:capture2e).with(*wake_cmd("09:29")).ordered.and_return(["", success_status])
+        expect(logger).to receive(:warn).with(/読み取りに失敗.*read failed/)
+
+        scheduler.reschedule([t("09:30")])
+        expect(scheduler.disabled?).to be false
+
+        scheduler.reschedule([t("09:30")])
+        expect(scheduler.disabled?).to be false
+      end
+
+      it "読み取りの起動例外を警告へ変換し、書き込みも当日無効化もしない" do
+        expect(Open3).to receive(:capture2e).with(*read_cmd).and_raise(Errno::ENOENT, "read unavailable")
+        expect(Open3).not_to receive(:capture2e).with(*wake_cmd("09:29"))
+        expect(logger).to receive(:warn).with(/読み取りに失敗.*Errno::ENOENT: .*read unavailable/)
+
+        expect { scheduler.reschedule([t("09:30")]) }.not_to raise_error
+
+        expect(scheduler.disabled?).to be false
+      end
+
+      it "書き込みの非zero終了で当日無効化し、以降の予約追加を中断する" do
+        expect(Open3).to receive(:capture2e).with(*wake_cmd("09:29")).and_return(["write failed", failure_status])
+        expect(Open3).not_to receive(:capture2e).with(*wake_cmd("18:29"))
+        expect(logger).to receive(:warn).with(/sudoers/)
+
+        scheduler.reschedule([t("09:30"), t("18:30")])
+
+        expect(scheduler.disabled?).to be true
+      end
+
+      it "書き込みの起動例外を失敗へ変換し、当日無効化する" do
+        expect(Open3).to receive(:capture2e).with(*wake_cmd("09:29")).and_raise(Errno::ENOENT, "write unavailable")
+        expect(logger).to receive(:warn).with(/sudoers/)
+
+        expect { scheduler.reschedule([t("09:30")]) }.not_to raise_error
+
+        expect(scheduler.disabled?).to be true
+      end
+
+      context "書き込み実行器だけを注入したとき" do
+        let(:runner) { ->(cmd) { calls << cmd; ["", true] } }
+
+        it "既定の読み取りは Open3 を使い、注入した実行器には書き込みだけを渡す" do
+          expect(Open3).to receive(:capture2e).with(*read_cmd).and_return(["", success_status])
+          expect(Open3).not_to receive(:capture2e).with(*wake_cmd("09:29"))
+
+          scheduler.reschedule([t("09:30")])
+
+          expect(calls).to eq [wake_cmd("09:29")]
+          expect(scheduler.disabled?).to be false
+        end
+      end
+    end
+
     it "必要な wake が全て予約済みなら何もしない（コマンド0件・ログなし）" do
       state[:sched] = sched_output("09:29") # 09:30 の 1 分前は既に予約済み
       expect(logger).not_to receive(:info)

@@ -65,15 +65,16 @@ module Ak4Punch
       EnvFile.load(File.join(root, ".env"))
       # 引用符なしの日付（schedule.exclude_dates の `- 2026-12-29` など）は YAML が Date として読むため、
       # Date だけを許可する（許可しないと Psych::DisallowedClass で起動に失敗する）。Time などは拒否のまま。
-      data = File.exist?(config_path) ? (YAML.safe_load_file(config_path, permitted_classes: [Date]) || {}) : {}
+      data = File.exist?(config_path) ? YAML.safe_load_file(config_path, permitted_classes: [Date]) : {}
       new(data: data, root: root)
     end
 
     def initialize(data:, root:)
+      data = hash_setting!("設定ルート", data)
       @base_url   = env_or(data, "AK4_BASE_URL", "base_url") || "https://atnd.ak4.jp/api/cooperation"
       @company_id = env_or(data, "AK4_COMPANY_ID", "company_id")
 
-      work = data["work"] || {}
+      work = hash_setting!("work", data["work"])
       @clock_in_time  = work["clock_in"]  || "09:30"
       @clock_out_time = work["clock_out"] || "18:00"
 
@@ -83,16 +84,16 @@ module Ak4Punch
       @clock_in_window  = clamp_window(work.fetch("clock_in_window",  shared_window))
       @clock_out_window = clamp_window(work.fetch("clock_out_window", shared_window))
 
-      sched = data["schedule"] || {}
-      @weekdays_only          = sched.fetch("weekdays_only", true)
-      @skip_japanese_holidays = sched.fetch("skip_japanese_holidays", true)
+      sched = hash_setting!("schedule", data["schedule"])
+      @weekdays_only          = boolean_setting!("schedule.weekdays_only", sched.fetch("weekdays_only", true))
+      @skip_japanese_holidays = boolean_setting!("schedule.skip_japanese_holidays", sched.fetch("skip_japanese_holidays", true))
       @exclude_dates  = Array(sched["exclude_dates"]).map  { |d| to_date(d) }
       @extra_workdays = Array(sched["extra_workdays"]).map { |d| to_date(d) }
 
-      idem = data["idempotency"] || {}
-      @check_existing = idem.fetch("check_existing", true)
+      idem = hash_setting!("idempotency", data["idempotency"])
+      @check_existing = boolean_setting!("idempotency.check_existing", idem.fetch("check_existing", true))
 
-      tok = data["token"] || {}
+      tok = hash_setting!("token", data["token"])
       @token_path = File.expand_path(tok["path"] || "config/token.json", root)
       @token_refresh_threshold_days =
         threshold_days!(tok.fetch("refresh_threshold_days", DEFAULT_TOKEN_REFRESH_THRESHOLD_DAYS))
@@ -107,8 +108,8 @@ module Ak4Punch
       @slack_mention = ENV["SLACK_MENTION"]
 
       # カレンダー連動（出勤・退勤時刻の動的決定）の振る舞い。
-      cal = data["calendar"] || {}
-      @calendar_enabled = cal.fetch("enabled", false)
+      cal = hash_setting!("calendar", data["calendar"])
+      @calendar_enabled = boolean_setting!("calendar.enabled", cal.fetch("enabled", false))
       kw = cal["exclude_keywords"]
       @calendar_exclude_keywords = kw.nil? ? DEFAULT_EXCLUDE_KEYWORDS.dup : Array(kw).map(&:to_s)
       # 出勤側は「朝の先頭から飛ばすイベント」の判定に使う（移動・私用など、出社前の予定）。
@@ -130,10 +131,10 @@ module Ak4Punch
       @calendar_leave_keywords = lkw.nil? ? DEFAULT_LEAVE_KEYWORDS.dup : Array(lkw).map(&:to_s)
 
       # 常駐デーモンの振る舞い。
-      dae = data["daemon"] || {}
+      dae = hash_setting!("daemon", data["daemon"])
       @daemon_tick_seconds       = positive_int(dae.fetch("tick_seconds", DEFAULT_TICK_SECONDS), DEFAULT_TICK_SECONDS)
       @daemon_wake_lead_minutes  = dae.fetch("wake_lead_minutes", DEFAULT_WAKE_LEAD_MINUTES).to_i.clamp(0, 60)
-      @daemon_manage_wake        = dae.fetch("manage_wake", true)
+      @daemon_manage_wake        = boolean_setting!("daemon.manage_wake", dae.fetch("manage_wake", true))
       @daemon_late_grace_minutes = positive_int(dae.fetch("late_grace_minutes", DEFAULT_LATE_GRACE_MINUTES),
                                                 DEFAULT_LATE_GRACE_MINUTES)
       # 翌営業日に Mac を起こす時刻("HH:MM")。出勤アンカーの下限（この時刻より前に始まる予定は
@@ -148,6 +149,19 @@ module Ak4Punch
     def token_seed = ENV["AK4_TOKEN"]
 
     private
+
+    def hash_setting!(key, value)
+      return {} if value.nil?
+      return value if value.is_a?(Hash)
+
+      raise Error, "#{key} は設定項目のまとまり（マッピング）で指定してください。"
+    end
+
+    def boolean_setting!(key, value)
+      return value if value.nil? || value == true || value == false
+
+      raise Error, "#{key} は true / false / null で指定してください（文字列は不可）。"
+    end
 
     def env_or(data, env_key, data_key)
       v = ENV[env_key]
@@ -244,7 +258,7 @@ module Ak4Punch
     # ② 出勤の打刻締切（clock_in + clock_in_window）が退勤時刻以降になる設定を拒否する。
     #    実測では clock_in 17:50 / clock_out 18:00 / window 30 で出勤目標 18:14・退勤目標 18:10
     #    となり、先に来た退勤が「未出勤」で冪等スキップされ、出勤だけが記録される状態になった。
-    #    なお休暇による全休判定（Daemon#full_leave?）が休暇イベントの有無を条件にしているのは、
+    #    なお休暇による全休判定（DayPlanner::DayPlan#full_leave?）が休暇イベントの有無を条件にしているのは、
     #    この種の設定ミスを「全休」として黙って打刻停止しないため。こちらは起動時に弾く役割を持つ。
     def validate_punch_windows!
       in_deadline = minutes_of_day(@clock_in_time) + @clock_in_window

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "tmpdir"
 require "timeout" # 起床予約のワーカーの spec で、tick が戻らない退行を hang ではなく失敗にする
 
 RSpec.describe Ak4Punch::Daemon do
@@ -103,6 +104,82 @@ RSpec.describe Ak4Punch::Daemon do
       daemon.tick
       clock_time[:now] = t("09:30", 1)
       daemon.tick
+    end
+  end
+
+  describe "再発行したトークンの保存再試行" do
+    let(:token_store) { Ak4Punch::TokenStore.new(path: @token_path, token: "seed", expired_at: nil) }
+    let(:client) { Ak4Punch::Client.new(base_url: "https://example.invalid", company_id: "x", token: "seed") }
+    let(:stamper) { Ak4Punch::Stamper.new(config: config, client: client, calendar: calendar, logger: logger, clock: clock) }
+    let(:expired_at) { t("09:30") + (30 * 86_400) }
+
+    around do |example|
+      Dir.mktmpdir do |dir|
+        @token_path = File.join(dir, "token.json")
+        example.run
+      end
+    end
+
+    before do
+      allow(token_store).to receive(:needs_refresh?).and_call_original
+      allow(calendar_client).to receive(:events).and_return([])
+      allow(client).to receive(:reissue_token).and_return({ token: "new", expired_at: expired_at })
+      allow(client).to receive(:latest_stamp_type).and_return(nil)
+      allow(client).to receive(:post_stamp).and_return({ stamped_at: nil })
+      allow(File).to receive(:rename).and_raise(Errno::EIO)
+    end
+
+    def fail_token_save
+      daemon.tick
+      clock_time[:now] = t("09:30", 5)
+      daemon.tick
+      expect(client).not_to have_received(:post_stamp)
+      expect(client.token).to eq "new"
+      expect(File.exist?(@token_path)).to be false
+    end
+
+    it "初tickの保存失敗では打刻せず、次tickで同じ新tokenを保存して打刻する" do
+      fail_token_save
+      allow(File).to receive(:rename).and_call_original
+      clock_time[:now] = t("09:30", 35)
+      daemon.tick
+
+      expect(File.exist?(@token_path)).to be true
+      loaded = Ak4Punch::TokenStore.load(path: @token_path, seed_token: "seed")
+      expect(loaded.token).to eq "new"
+      expect(loaded.expired_at).to eq expired_at
+      expect(client).to have_received(:reissue_token).once
+      expect(client).to have_received(:post_stamp).with(type: 11, deadline: t("09:40")).once
+      expect(token_store.needs_refresh?(now: clock_time[:now])).to be false
+      expect(notifier).to have_received(:notify).with(/トークン.*失敗/).once
+    end
+
+    it "grace 超過後は保存やPOSTを行わず、保存待ちは次の打刻機会まで保持する" do
+      fail_token_save
+      allow(File).to receive(:rename).and_call_original
+      clock_time[:now] = t("09:41")
+      daemon.tick
+
+      expect(File.exist?(@token_path)).to be false
+      expect(client).not_to have_received(:post_stamp)
+      expect(token_store.needs_refresh?(now: clock_time[:now])).to be true
+      expect(client).to have_received(:reissue_token).once
+    end
+
+    it "保存再試行中にgraceを過ぎてもPOSTせず、打刻期限を延長しない" do
+      fail_token_save
+      allow(File).to receive(:rename).and_wrap_original do |rename, src, dst|
+        rename.call(src, dst)
+        clock_time[:now] = t("09:41")
+      end
+      clock_time[:now] = t("09:39", 59)
+      daemon.tick
+
+      expect(File.exist?(@token_path)).to be true
+      expect(client).to have_received(:reissue_token).once
+      expect(client).not_to have_received(:post_stamp)
+      expect(token_store.needs_refresh?(now: clock_time[:now])).to be false
+      expect(logger).to have_received(:error).with(/打刻期限を超過.*期限 09:40:00/)
     end
   end
 
@@ -940,7 +1017,7 @@ RSpec.describe Ak4Punch::Daemon do
 
       expect(token_store).to have_received(:refresh!).twice
       expect(notifier).to have_received(:notify)
-        .with(/トークンの再発行に失敗しました.*トークン失効.*マイページでの再発行/).once
+        .with(/トークンの更新・保存に失敗しました.*トークン失効.*保存先や接続状態/).once
     end
 
     it "sukesan フォールバック通知は同日1回だけ（再取得の失敗で連打しない）" do

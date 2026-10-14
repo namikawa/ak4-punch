@@ -16,8 +16,8 @@ jobs:
           bundler-cache: true
       - run: bundle exec rspec
 
-  # macOS でしか確認できない箇所のスモーク。bin/daemonctl（bash スクリプト）と plist の生成には
-  # spec がなく、どちらも実際にバグを出しているため最小限の実行確認を置く。
+  # macOS でしか確認できない箇所のスモーク。bin/daemonctl の操作は fake コマンドで RSpec が確認し、
+  # ここでは macOS 既定の bash と実際の plutil による plist の検証を行う。
   # いずれも .env / config/config.yml / ネットワークを必要としないコマンドだけを使う。
   macos-smoke:
     runs-on: macos-latest

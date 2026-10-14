@@ -12,7 +12,7 @@ sukesan を使わず、設定した所定時刻だけで打刻することもで
 
 ## 必要要件
 
-- Ruby 3.2+（開発は 3.4.11 で確認。`.ruby-version` 参照）、Bundler
+- Ruby 3.3以上（開発・CI は 3.4.11 で確認。`.ruby-version` 参照）、Bundler
 - AKASHI 側で「公開API利用可否」を「利用する」に設定し、マイページでアクセストークンを発行
 - カレンダー連動を使う場合: カレンダーAPI [sukesan](https://github.com/namikawa/sukesan) が同一マシンで稼働していること（127.0.0.1 限定）
   - sukesan v1.0.2 で動作確認しています。sukesan を更新するときは、その CHANGELOG の「変更」を確認してください（API の互換性のない変更は先頭に書かれます）。
@@ -52,6 +52,14 @@ bin/daemonctl install
 > `.env` にはアクセストークン・APIキー・Webhook URL が入るため、他ユーザーが読めない権限（600）で作成してください（`config/token.json` は本ツールが 600 で作成します）。
 > ログ（`punch.log`）にはカレンダーの予定タイトルが出るため、デーモンが作るファイルも本人だけが読める権限になります（plist の `Umask`）。既に別の権限で作られている場合は `chmod 600 punch.log` で揃えてください。
 
+設定のルートと `work` / `schedule` / `idempotency` / `token` / `calendar` / `daemon` は、
+項目名と値を並べる YAML のマッピングで指定してください。配列や文字列などは起動時にエラーになります。
+空の設定や `null` のセクションは、既定値を使います。
+
+`schedule.weekdays_only` / `schedule.skip_japanese_holidays`、`idempotency.check_existing`、`calendar.enabled`、
+`daemon.manage_wake` は YAML の `true` / `false` で指定してください。引用した文字列（`"false"` など）は
+エラーになります。明示的な `null` は無効扱い、省略時は各項目の既定値を使います。
+
 ## 日常運用
 
 ```bash
@@ -60,6 +68,8 @@ bundle exec bin/punch status    # 打刻状況を表示（--date=YYYY-MM-DD）
 bundle exec bin/punch recheck   # 稼働中デーモンに当日計画の再チェックを要求（SIGUSR1）
 bin/daemonctl status            # デーモンの稼働状態・ログ末尾・起床予約を表示
 bin/daemonctl restart           # デーモンを再起動（start/stop/log もあり）
+bundle exec bin/punch launchd   # daemonctlを使う設置・操作案内を表示
+bundle exec bin/punch launchd --plist-only  # plistのXMLだけを出力
 ```
 
 - 設定変更の反映: `.env` / `config/config.yml` を変更したら `bin/daemonctl restart`。デーモンは起動時に一度だけ設定を読むため、`punch recheck` は当日計画を作り直すだけで設定は再読込しません。
@@ -103,7 +113,7 @@ bin/daemonctl restart           # デーモンを再起動（start/stop/log も�
 ## 通知（任意）
 
 `.env` に `SLACK_WEBHOOK_URL`（Slack Incoming Webhook）を設定すると、異常時のみ通知します
-（打刻の寝過ごしスキップ / リトライ失敗 / トークン再発行失敗 / sukesan 障害フォールバック / 休暇の時間帯に入ったための打刻中止（出勤・退勤とも）/ 日中の再取得・打刻直前チェックで全休へ切り替わったための以降の打刻中止 / 本日の打刻計画の作成に失敗 / 起床予約の処理（pmset）が戻らない）。未設定なら無効です。
+（打刻の寝過ごしスキップ / リトライ失敗 / トークン更新・保存失敗 / sukesan 障害フォールバック / 休暇の時間帯に入ったための打刻中止（出勤・退勤とも）/ 日中の再取得・打刻直前チェックで全休へ切り替わったための以降の打刻中止 / 本日の打刻計画の作成に失敗 / 起床予約の処理（pmset）が戻らない）。未設定なら無効です。
 `SLACK_MENTION`（例: `<@U04XXXXXX>`）を設定すると通知の先頭にメンションを付けます（任意）。
 
 送信に失敗した通知は同一プロセスのメモリに保持し、以降の tick で自動再送します（スリープ明け直後で Wi-Fi 未接続でも、復旧すれば送られます）。
@@ -129,6 +139,11 @@ bundle exec bin/punch clock_out --window 5  # 0〜5分のランダム待機後�
 ## トークン
 
 - 有効期限は「1ヶ月と1日」。期限が近づく（既定7日以内）と自動で再発行し `config/token.json` を更新します。
+- 再発行後の保存に失敗した場合、同じプロセスの次の打刻実行機会で保存を再試行します。保存だけのために
+  トークンを再発行し直すことはありません。打刻期限は延長しません。
+- 保存ファイルが未作成なら `.env` のトークンから初期化します。既存ファイルを読めない場合や
+  JSON・保存項目が不正な場合は、古いトークンへ戻らず起動を停止します。権限を修正するか、不正な
+  ファイルを退避し、有効な `.env` のトークンで `bundle exec bin/punch refresh_token` を実行してください。
 - 長期間実行しないと失効し、自動再発行もできなくなります。その場合はマイページで再発行 → `.env` を更新 → `config/token.json` を削除 → `bundle exec bin/punch refresh_token`。
 
 ## テスト

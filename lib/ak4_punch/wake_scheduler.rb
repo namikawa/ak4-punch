@@ -137,11 +137,7 @@ module Ak4Punch
 
     # 予約状態の読み取りは特権不要（sudo を付けない）。
     def default_reader
-      require "open3"
-      out, status = Open3.capture2e(PMSET, "-g", "sched")
-      [out, status.success?]
-    rescue StandardError => e
-      ["#{e.class}: #{e.message}", false]
+      default_runner([PMSET, "-g", "sched"])
     end
   end
 end

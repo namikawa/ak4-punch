@@ -13,7 +13,7 @@ module Ak4Punch
   #     due 到達時点で既に grace 超過（寝過ごし）なら打刻せず警告＋通知（誤時刻打刻ガード）。
   #   - 全休（休暇で勤務時間ゼロ）の日は打刻しない。休暇の時間帯に入っている打刻も中止する
   #     （AKASHI は休暇申請日でも打刻を受理するため、この判定が誤打刻を防ぐ主手段）。
-  #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン再発行失敗/sukesan障害/休暇中のため打刻中止/
+  #   - 異常時（寝過ごしスキップ/リトライ枯渇/トークン更新・保存失敗/sukesan障害/休暇中のため打刻中止/
   #     日中に全休へ切り替わって以降の打刻を中止/当日計画の作成失敗/未打刻のまま日付変更/
   #     起床予約の処理が戻らない）のみ
   #     Slack に通知する。成功・目標変更・計画時点で全休の日は通知しない
@@ -133,7 +133,7 @@ module Ak4Punch
     end
 
     # 1 tick 分の処理（テストから直接呼べる）:
-    #   再チェック要求 → 日付変化 → 計画作成 / refresh 間隔 → 退勤再計算 / due 判定 → 打刻
+    #   再チェック要求 → 日付変化 → 計画作成 / refresh 間隔 → 出勤・退勤再計算 / due 判定 → 打刻
     #   → 起床予約の突き合わせ。
     def tick
       now = @clock.call
@@ -169,8 +169,8 @@ module Ak4Punch
       Signal.trap("USR1") { request_recheck! }
     end
 
-    # SIGUSR1 のフラグを検知したら当日の計画を破棄して完全再計画する
-    # （休暇状態も打刻計画も破棄 → カレンダー再取得 → 再判定）。
+    # SIGUSR1 のフラグを検知したら当日の打刻計画を破棄して完全再計画する。
+    # 当日最後に取得した休暇情報は、カレンダー再取得が成功するまで保持する。
     # 打刻済み・断念済みの分まで作り直すが、実際の二重打刻は Stamper の冪等チェックが、
     # 断念時の誤通知は give_up_punch 前の AKASHI 確認（already_stamped?）が防ぐ。
     # 逆に状態を引き継ぐと、grace 超過で断念（done）した退勤をカレンダー修正＋recheck で
@@ -741,15 +741,15 @@ module Ak4Punch
     # 成功には「打刻済みで冪等スキップ」も含む。失敗（例外）は呼び出し側がリトライする。
     def execute_punch(kind, now, deadline:)
       if @token_store.needs_refresh?(now: now)
-        @logger.info("トークンの有効期限が近いため再発行します")
+        @logger.info("トークンを更新します")
         begin
           @token_store.refresh!(@client)
         rescue StandardError => e
-          message = "トークン再発行失敗: #{e.class}: #{e.message}"
+          message = "トークン更新失敗: #{e.class}: #{e.message}"
           @logger.error("#{message}。次の tick で再試行します。")
           # リトライ毎に鳴らさないよう同日1回だけ通知する。
           notify_once(:token_refresh_failed,
-                      "トークンの再発行に失敗しました（#{e.message}）。マイページでの再発行が必要かもしれません")
+                      "トークンの更新・保存に失敗しました（#{e.message}）。保存先や接続状態を確認してください")
           return [false, message]
         end
       end

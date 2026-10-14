@@ -4,6 +4,132 @@ require "spec_helper"
 require "tmpdir"
 
 RSpec.describe Ak4Punch::Config do
+  describe "設定の構造とbooleanの入力契約" do
+    let(:sections) { %w[work schedule idempotency token calendar daemon] }
+    let(:booleans) do
+      [
+        ["schedule", "weekdays_only", :weekdays_only, true],
+        ["schedule", "skip_japanese_holidays", :skip_japanese_holidays, true],
+        ["idempotency", "check_existing", :check_existing, true],
+        ["calendar", "enabled", :calendar_enabled, false],
+        ["daemon", "manage_wake", :daemon_manage_wake, true],
+      ]
+    end
+
+    around do |example|
+      Dir.mktmpdir do |dir|
+        @config_root = dir
+        example.run
+      end
+    end
+
+    before do
+      allow(ENV).to receive(:[]).with("AK4_COMPANY_ID").and_return("x")
+      %w[AK4_BASE_URL SUKESAN_BASE_URL SUKESAN_API_KEY SLACK_WEBHOOK_URL SLACK_MENTION].each do |key|
+        allow(ENV).to receive(:[]).with(key).and_return(nil)
+      end
+    end
+
+    def cfg_from(data)
+      described_class.new(data: data, root: @config_root)
+    end
+
+    def cfg_from_yaml(yaml)
+      path = File.join(@config_root, "config.yml")
+      File.write(path, yaml)
+      described_class.load(config_path: path, root: @config_root)
+    end
+
+    def expect_config_input_error(key)
+      expect { yield }.to raise_error(StandardError) do |error|
+        expect(error.class).to eq described_class::Error
+        expect(error.message).to include(key)
+        expect(error.message).not_to include("dummy-secret", "secret_marker")
+        expect(error.full_message).not_to include("dummy-secret", "secret_marker")
+      end
+    end
+
+    it "nil・空Hashのrootと、nil・空Hashの全sectionを空設定として受理する" do
+      aggregate_failures do
+        [nil, {}, sections.to_h { |key| [key, nil] }, sections.to_h { |key| [key, {}] }].each do |data|
+          cfg = cfg_from(data)
+          expect(cfg.clock_in_time).to eq "09:30"
+          booleans.each { |_section, _key, reader, default| expect(cfg.public_send(reader)).to eq default }
+        end
+      end
+    end
+
+    it "false・String・Array・数値のrootをConfig::Errorで拒否する" do
+      aggregate_failures do
+        [false, "dummy-secret", ["dummy-secret"], 42].each do |data|
+          expect_config_input_error("設定ルート") { cfg_from(data) }
+        end
+      end
+    end
+
+    it "全6sectionのfalse・String・Array・数値を値を表示せず拒否する" do
+      aggregate_failures do
+        sections.each do |section|
+          [false, "dummy-secret", ["dummy-secret"], 42].each do |value|
+            expect_config_input_error(section) { cfg_from(section => value, "secret_marker" => "dummy-secret") }
+          end
+        end
+      end
+    end
+
+    it "全5booleanはtrue・false・nilをそのまま保持し、省略時は各既定値を使う" do
+      aggregate_failures do
+        booleans.each do |section, key, reader, default|
+          [true, false, nil].each do |value|
+            expect(cfg_from(section => { key => value }).public_send(reader)).to equal value
+          end
+          expect(cfg_from(section => {}).public_send(reader)).to eq default
+        end
+      end
+    end
+
+    it "全5booleanの引用true/false・空白String・数値・Array・Hashを項目名だけで拒否する" do
+      aggregate_failures do
+        booleans.each do |section, key, _reader, _default|
+          ["false", "true", "  ", 0, 1, ["dummy-secret"], { "secret_marker" => "dummy-secret" }].each do |value|
+            expect_config_input_error("#{section}.#{key}") { cfg_from(section => { key => value }) }
+          end
+        end
+      end
+    end
+
+    it "YAMLの空・nullは既定設定、falseは型不正として区別する" do
+      expect(cfg_from_yaml("").clock_in_time).to eq "09:30"
+      expect(cfg_from_yaml("null\n").clock_in_time).to eq "09:30"
+      expect_config_input_error("設定ルート") { cfg_from_yaml("false\n") }
+    end
+
+    it "YAMLの引用falseを拒否し、falseとnullは無効のまま保持する" do
+      expect_config_input_error("calendar.enabled") { cfg_from_yaml("calendar:\n  enabled: \"false\"\n") }
+      expect(cfg_from_yaml("calendar:\n  enabled: false\n").calendar_enabled).to be false
+      expect(cfg_from_yaml("calendar:\n  enabled: null\n").calendar_enabled).to be_nil
+    end
+
+    it "正常なdataを変更せず、nilのsectionとDate・boolean設定を受理する" do
+      data = {
+        "work" => nil, "token" => {}, "calendar" => { "enabled" => false },
+        "daemon" => { "manage_wake" => nil }, "idempotency" => { "check_existing" => true },
+        "schedule" => { "weekdays_only" => false, "exclude_dates" => [Date.new(2026, 12, 29)] },
+      }
+      before_data = Marshal.load(Marshal.dump(data))
+      data.each_value { |value| value.freeze if value.is_a?(Hash) }
+      data.freeze
+
+      cfg = cfg_from(data)
+
+      expect(data).to eq before_data
+      expect(data["work"]).to be_nil
+      expect(cfg.exclude_dates).to eq [Date.new(2026, 12, 29)]
+      expect(cfg.calendar_enabled).to be false
+      expect(cfg.daemon_manage_wake).to be_nil
+    end
+  end
+
   # 既定値（未設定時）の一覧。同時に「既定値だけで validate! を通る」ことの検証も兼ねる
   # （所定時刻の書式・出勤締切 < 退勤・翌日跨ぎのいずれにも掛からない）。
   it "既定値を持つ" do

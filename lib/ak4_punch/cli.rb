@@ -5,6 +5,7 @@ require "logger"
 require "date"
 require "rbconfig"
 require "etc"
+require "shellwords"
 
 module Ak4Punch
   class CLI < Thor
@@ -53,11 +54,11 @@ module Ak4Punch
       abort "エラー: #{e.message}"
     end
 
-    desc "refresh_token", "アクセストークンを再発行して保存する"
+    desc "refresh_token", "アクセストークンを更新して保存する"
     def refresh_token
       app = build
       app[:store].refresh!(app[:client])
-      puts "トークンを再発行しました。有効期限: #{Ak4Punch.format_akashi_time(app[:store].expired_at)}"
+      puts "トークンを更新して保存しました。有効期限: #{Ak4Punch.format_akashi_time(app[:store].expired_at)}"
     rescue StandardError => e
       abort "エラー: #{e.message}"
     end
@@ -94,38 +95,39 @@ module Ak4Punch
       abort "エラー: #{e.message}"
     end
 
-    desc "launchd", "LaunchAgent plist と設置手順を出力（bin/daemonctl install が利用）"
+    desc "launchd", "LaunchAgent の設置・操作手順を出力（--plist-only で XML のみ）"
     method_option :plist_only, type: :boolean, default: false,
                                desc: "plist XML のみを出力（ガイド文なし。daemonctl install 用）"
     def launchd
       root = project_root
-      plist = build_launchd_plist(root)
 
       # --plist-only は plist XML だけを出力する（bin/daemonctl install がリダイレクトで使う）。
       if options[:plist_only]
-        puts plist
+        puts build_launchd_plist(root)
         return
       end
 
+      daemonctl = Shellwords.escape(File.join(root, "bin", "daemonctl"))
+      punch = Shellwords.escape(File.join(root, "bin", "punch"))
       puts <<~GUIDE
         # ===== LaunchAgent（推奨・常駐デーモン）=====
-        # 1) 下記 plist を ~/Library/LaunchAgents/com.ak4punch.daemon.plist に保存:
-        mkdir -p ~/Library/LaunchAgents
-        cat > ~/Library/LaunchAgents/com.ak4punch.daemon.plist <<'PLIST'
-        #{plist.chomp}
-        PLIST
+        # plist の設置・登録・起動（plist の変更を反映）:
+        #{daemonctl} install
 
-        # 2) 読み込み（登録＋起動）:
-        launchctl load -w ~/Library/LaunchAgents/com.ak4punch.daemon.plist
+        # 稼働状態・ログ末尾・起床予約の確認:
+        #{daemonctl} status
 
-        # 3) 動作確認:
-        launchctl list | grep com.ak4punch.daemon   # PID が付いていれば起動中
-        tail -f #{root}/punch.log                     # ログ確認
+        # 設定変更後のプロセス再起動（.env / config.yml を再読込）:
+        #{daemonctl} restart
 
-        # 停止/再読込:
-        #   launchctl unload ~/Library/LaunchAgents/com.ak4punch.daemon.plist
-        #   launchctl load -w ~/Library/LaunchAgents/com.ak4punch.daemon.plist
-        #
+        # 停止 / 再開 / ログ追尾:
+        #{daemonctl} stop
+        #{daemonctl} start
+        #{daemonctl} log
+
+        # plist XML だけが必要な場合:
+        #{punch} launchd --plist-only
+
         # ※ 自動起床（pmset）を使う場合は先に `punch sudoers` を設定してください。
       GUIDE
     end
@@ -193,9 +195,9 @@ module Ak4Punch
     def run_punch(kind)
       app = build
 
-      # トークンの有効期限が近ければ自動再発行（dry-run 時は行わない）
+      # トークンの更新・保存が必要なら実行する（dry-run 時は行わない）
       if !options[:dry_run] && app[:store].needs_refresh?
-        app[:logger].info("トークンの有効期限が近いため再発行します")
+        app[:logger].info("トークンを更新します")
         app[:store].refresh!(app[:client])
       end
 
