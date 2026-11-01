@@ -1,6 +1,6 @@
 # 変更履歴
 
-## [未リリース]
+## [1.0.5] - 2026-11-01
 
 ### 修正
 
@@ -14,6 +14,8 @@
 
 ### 変更
 
+- sukesan v1.0.3 で動作確認した（README の必要要件を更新）。v1.0.3 の変更はイベント一覧の API に
+  影響しないため、設定の変更は不要。
 - `bin/daemonctl` の plist 保護・登録解除待ち・起動／再起動／停止を、隔離した fake コマンドで検証する
   RSpec を追加した。本番の launchd や起床予約は操作しない。
 - `punch launchd` の通常出力を `bin/daemonctl` の設置・操作ガイドへ統一した。`--plist-only` の XML 出力は維持する。
@@ -313,7 +315,7 @@
 - macOS（launchd 常駐 / pmset 自動起床）、Ruby 3.2+
 - 同一マシンで稼働するカレンダーAPI sukesan
 
-[未リリース]: https://github.com/namikawa/ak4-punch/compare/v1.0.4...HEAD
+[1.0.5]: https://github.com/namikawa/ak4-punch/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/namikawa/ak4-punch/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/namikawa/ak4-punch/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/namikawa/ak4-punch/compare/v1.0.1...v1.0.2
