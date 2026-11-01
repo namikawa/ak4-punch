@@ -2,7 +2,7 @@
 
 source "https://rubygems.org"
 
-# セキュリティ保守中の Ruby 3.3 を下限とする。開発・CI は .ruby-version（3.4.11）で確認。
+# セキュリティ保守中の Ruby 3.3 を下限とする。開発・CI は .ruby-version（3.4.12）で確認。
 ruby ">= 3.3"
 
 gem "holiday_jp", "~> 0.8" # 日本の祝日判定
