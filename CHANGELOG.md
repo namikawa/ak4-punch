@@ -1,6 +1,6 @@
 # 変更履歴
 
-## [未リリース]
+## [1.0.6] - 2026-11-23
 
 ### 修正
 
@@ -330,7 +330,7 @@
 - macOS（launchd 常駐 / pmset 自動起床）、Ruby 3.2+
 - 同一マシンで稼働するカレンダーAPI sukesan
 
-[未リリース]: https://github.com/namikawa/ak4-punch/compare/v1.0.5...HEAD
+[1.0.6]: https://github.com/namikawa/ak4-punch/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/namikawa/ak4-punch/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/namikawa/ak4-punch/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/namikawa/ak4-punch/compare/v1.0.2...v1.0.3
