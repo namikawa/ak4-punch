@@ -1,5 +1,20 @@
 # 変更履歴
 
+## [未リリース]
+
+### 修正
+
+- Slack 通知の本文に入る休暇の予定のタイトルに `<`・`>`・`&` が含まれると、Slack の記法として解釈され、
+  チャンネル全員へのメンションや、表示と行き先の異なるリンクになり得た問題を修正した。送信の直前に本文の
+  この3文字を文字参照に置き換えて書かれたとおりに表示し、`SLACK_MENTION` のメンションだけを記法のまま
+  先頭に付ける。
+
+### 変更
+
+- sukesan v1.0.6 で動作確認した（README の必要要件を更新）。v1.0.4〜v1.0.6 の変更はイベント一覧の API に
+  影響しないため、設定の変更は不要。
+- CI の `GITHUB_TOKEN` をワークフローで読み取りのみに固定した（リポジトリの Actions の設定に依存させない）。
+
 ## [1.0.5] - 2026-11-01
 
 ### 修正
@@ -315,6 +330,7 @@
 - macOS（launchd 常駐 / pmset 自動起床）、Ruby 3.2+
 - 同一マシンで稼働するカレンダーAPI sukesan
 
+[未リリース]: https://github.com/namikawa/ak4-punch/compare/v1.0.5...HEAD
 [1.0.5]: https://github.com/namikawa/ak4-punch/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/namikawa/ak4-punch/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/namikawa/ak4-punch/compare/v1.0.2...v1.0.3

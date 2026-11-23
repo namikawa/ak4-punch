@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# GITHUB_TOKEN を読み取りのみに固定する（リポジトリの Actions の設定に依存させない）。
+permissions:
+  contents: read
+
 jobs:
   rspec:
     runs-on: ubuntu-latest
