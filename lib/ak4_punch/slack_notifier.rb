@@ -19,6 +19,10 @@ module Ak4Punch
     PREFIX = "[ak4-punch]"
     # pending キューの上限。超過時は古いものから捨てる（無制限にメモリを食わないため）。
     MAX_PENDING = 10
+    # Slack が記法の目印として扱う3文字と、その文字参照。通知の本文にはカレンダーの予定のタイトルや
+    # 例外のメッセージなど外から来る文字列が入るため、本文はすべて置き換えて書かれたとおりに表示させ、
+    # `<!channel>` やリンクなどの記法として解釈させない。メンション（mention）は設定値なので置き換えない。
+    SLACK_ESCAPES = { "&" => "&amp;", "<" => "&lt;", ">" => "&gt;" }.freeze
 
     # mention: 通知の先頭に付けるメンション（例: "<@U04XXXXXX>"）。nil/空なら付けない。
     # プライベートチャンネル運用でも確実にプッシュ通知を飛ばすためのオプション。
@@ -69,7 +73,8 @@ module Ak4Punch
 
       req = Net::HTTP::Post.new(uri)
       req["Content-Type"] = "application/json"
-      text = [@mention, PREFIX, message].compact.join(" ")
+      # pending には元の文面を保持し、送るたびにここで1回だけ置き換える（再送で二重に置き換えない）。
+      text = [@mention, PREFIX, escape_markup(message)].compact.join(" ")
       req.body = JSON.generate(text: text)
 
       res = http.request(req)
@@ -85,6 +90,9 @@ module Ak4Punch
       end
       false
     end
+
+    # 本文の & < > を文字参照に置き換える（理由は SLACK_ESCAPES）。
+    def escape_markup(message) = message.to_s.gsub(/[&<>]/, SLACK_ESCAPES)
 
     # pending キューへ追加する。上限超過時は先頭（最古）から捨てて警告する。
     def enqueue_pending(message)

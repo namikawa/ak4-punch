@@ -195,4 +195,39 @@ RSpec.describe Ak4Punch::SlackNotifier do
       expect(stub).to have_been_requested
     end
   end
+
+  describe "本文の記法の無害化" do
+    it "本文の & < > を文字参照に置き換え、メンションやリンクの記法として解釈させない" do
+      stub = stub_request(:post, url)
+             .with(body: { text: "[ak4-punch] 休暇イベント『&lt;!channel&gt; &lt;https://example.com|AKASHI&gt; A&amp;B』" }.to_json)
+             .to_return(status: 200, body: "ok")
+
+      notifier.notify("休暇イベント『<!channel> <https://example.com|AKASHI> A&B』")
+      expect(stub).to have_been_requested
+    end
+
+    it "mention は記法のまま先頭に付け、本文だけを置き換える" do
+      stub = stub_request(:post, url)
+             .with(body: { text: "<@U04XXXXXX> [ak4-punch] &lt;!here&gt;" }.to_json)
+             .to_return(status: 200, body: "ok")
+
+      described_class.new(webhook_url: url, mention: "<@U04XXXXXX>", logger: logger).notify("<!here>")
+      expect(stub).to have_been_requested
+    end
+
+    it "再送でも置き換えは1回だけ（文字参照を二重に置き換えない）" do
+      logger2 = instance_double(Logger, warn: nil, info: nil)
+      n = described_class.new(webhook_url: url, logger: logger2)
+
+      stub_request(:post, url).to_return(status: 500) # notify 時は失敗して保持される
+      n.notify("A&B")
+
+      WebMock.reset!
+      ok = stub_request(:post, url)
+           .with(body: { text: "[ak4-punch] A&amp;B" }.to_json)
+           .to_return(status: 200, body: "ok")
+      n.retry_pending
+      expect(ok).to have_been_requested
+    end
+  end
 end
